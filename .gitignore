@@ -1,0 +1,7 @@
+venv/
+*.xlsx
+.env
+__pycache__/
+app_glowup_backup.py
+app_glowup_backup_funzionante.py
+test_*.py
