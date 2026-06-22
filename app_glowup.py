@@ -47,11 +47,14 @@ def safe_call(func, *args, retries=3, wait=2):
 
 
 def load_env():
-    with open(".env", "r") as f:
-        for line in f:
-            if "=" in line:
-                key, value = line.strip().split("=", 1)
-                os.environ[key] = value
+    try:
+        with open(".env", "r") as f:
+            for line in f:
+                if "=" in line:
+                    key, value = line.strip().split("=", 1)
+                    os.environ[key] = value
+    except FileNotFoundError:
+        pass
 
 
 def get_access_token():
