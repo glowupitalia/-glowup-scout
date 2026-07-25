@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 import urllib.parse
@@ -6,21 +7,21 @@ import streamlit as st
 from PIL import Image
 import pandas as pd
 
+from batch_analysis import (
+    analyze_products,
+    decision_from_score,
+    opportunity_score,
+    summarize_results,
+    write_results_excel,
+)
 
-def decision_from_score(score):
-    try:
-        score = int(score)
-    except Exception:
-        return "Da verificare"
 
-    if score >= 85:
-        return "Compra"
-    elif score >= 65:
-        return "Valuta bene"
-    elif score >= 45:
-        return "Monitorare"
-    else:
-        return "Evita"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 
@@ -55,6 +56,19 @@ def load_env():
                     os.environ[key] = value
     except FileNotFoundError:
         pass
+
+
+def read_input_excel(uploaded_file):
+    source_file = getattr(uploaded_file, "name", "<uploaded file>")
+    logger.info("READING EXCEL | file=%s", source_file)
+    try:
+        return pd.read_excel(uploaded_file, dtype={"EAN": str})
+    except Exception:
+        logger.exception(
+            "INPUT EXCEL READ FAILED | phase=READING EXCEL file=%s",
+            source_file,
+        )
+        raise
 
 
 def get_access_token():
@@ -225,85 +239,6 @@ def search_pricing(asin, token):
         "Offerte": offer_rows,
     }
 
-
-
-def to_int(value):
-    try:
-        if value in ["", None, "None"]:
-            return None
-        return int(float(str(value).replace(",", ".")))
-    except Exception:
-        return None
-
-
-def to_int(value):
-    try:
-        if value in ["", None, "None"]:
-            return None
-        return int(float(str(value).replace(",", ".")))
-    except Exception:
-        return None
-
-
-def opportunity_score(bsr_beauty, venditori_totali):
-    score = 0
-
-    bsr = to_int(bsr_beauty)
-    sellers = to_int(venditori_totali)
-
-    # 70% velocità di vendita
-    if bsr is not None:
-        if bsr <= 1000:
-            score += 70
-        elif bsr <= 5000:
-            score += 60
-        elif bsr <= 10000:
-            score += 50
-        elif bsr <= 25000:
-            score += 35
-        elif bsr <= 50000:
-            score += 20
-        else:
-            score += 10
-
-    # 30% concorrenza
-    if sellers is not None:
-        if sellers <= 3:
-            score += 30
-        elif sellers <= 6:
-            score += 20
-        elif sellers <= 10:
-            score += 10
-
-    if score >= 85:
-        return score, "🟢 Eccellente"
-    elif score >= 65:
-        return score, "🟢 Ottima"
-    elif score >= 45:
-        return score, "🟡 Interessante"
-    elif score >= 25:
-        return score, "🟠 Da valutare"
-    else:
-        return score, "🔴 Debole"
-
-
-
-def decision_from_score(score):
-    try:
-        score = int(score)
-    except Exception:
-        return "Da verificare"
-
-    if score >= 85:
-        return "Compra"
-    elif score >= 65:
-        return "Valuta bene"
-    elif score >= 45:
-        return "Monitorare"
-    else:
-        return "Evita"
-
-
 load_env()
 
 st.set_page_config(page_title="GlowUp Product Scout", layout="wide")
@@ -381,6 +316,11 @@ if st.button("Analizza EAN"):
                     st.dataframe([summary], width="stretch")
 
             except Exception as e:
+                logger.exception(
+                    "SINGLE PRODUCT ANALYSIS FAILED | "
+                    "phase=PROCESSING PRODUCT ean=%s",
+                    ean.strip(),
+                )
                 st.error(f"Errore: {e}")
 
 # --- ANALISI EXCEL MULTIPLA ---
@@ -391,7 +331,7 @@ st.header("📊 Analisi multipla da Excel")
 uploaded_file = st.file_uploader("Carica un file Excel con colonna EAN", type=["xlsx"])
 
 if uploaded_file:
-    df_input = pd.read_excel(uploaded_file, dtype={"EAN": str})
+    df_input = read_input_excel(uploaded_file)
 
     if "EAN" not in df_input.columns:
         st.error("Il file deve contenere una colonna chiamata EAN.")
@@ -404,118 +344,110 @@ if uploaded_file:
         st.write(f"EAN trovati: {len(df_input)}")
 
         if st.button("Analizza Excel"):
-            results = []
-            progress = st.progress(0)
-            token = get_access_token()
-
-            for i, row in df_input.iterrows():
-                ean_value = str(row["EAN"]).strip()
-                costo_value = ""
-                if costo_col:
-                    costo_value = row[costo_col]
-
-                try:
-                    catalog = safe_call(search_catalog, ean_value, token)
-
-                    if catalog:
-                        pricing = safe_call(search_pricing, catalog["ASIN"], token)
-
-                        results.append({
-                            "EAN": ean_value,
-                            "Costo": costo_value,
-                            "ASIN": catalog["ASIN"],
-                            "Titolo": catalog["Titolo"],
-                            "Brand": catalog["Brand"],
-                            "Categoria": catalog["Categoria"],
-                            "BSR Beauty": catalog["BSR Beauty"],
-                            "Buy Box": pricing["Buy Box"],
-                            "Venditori totali": pricing["Venditori totali"],
-                            "Venditori FBA": pricing["Venditori FBA"],
-                            "Venditori FBM": pricing["Venditori FBM"],
-                            "Prezzo minimo FBA": pricing["Prezzo minimo FBA"],
-                            "Prezzo minimo FBM": pricing["Prezzo minimo FBM"],
-                            "Score": opportunity_score(catalog["BSR Beauty"], pricing["Venditori totali"])[0],
-                            "Opportunità": opportunity_score(catalog["BSR Beauty"], pricing["Venditori totali"])[1],
-                            "Decisione": decision_from_score(opportunity_score(catalog["BSR Beauty"], pricing["Venditori totali"])[0]),
-                            "Link Amazon": f"https://www.amazon.it/dp/{catalog['ASIN']}",
-                            "Link Offerte": f"https://www.amazon.it/gp/offer-listing/{catalog['ASIN']}",
-                            "Stato": "TROVATO",
-                            "Errore": ""
-                        })
-                    else:
-                        results.append({"EAN": ean_value, "Costo": costo_value, "Stato": "NON TROVATO SU AMAZON", "Stato": "TROVATO",
-                            "Errore": ""})
-
-                except Exception as e:
-                    results.append({
-                        "EAN": ean_value,
-                        "Costo": costo_value,
-                        "Stato": "ERRORE API / LIMITE AMAZON",
-                        "Errore": str(e)
-                    })
-
-                progress.progress((i + 1) / len(df_input))
-                time.sleep(0.7)
-
-            df_results = pd.DataFrame(results)
-
-            if "Venditori totali" in df_results.columns:
-                for idx in df_results.index:
-
-                    asin = str(df_results.at[idx, "ASIN"]) if "ASIN" in df_results.columns else ""
-                    venditori = df_results.at[idx, "Venditori totali"]
-
-                    if asin in ["", "None", "nan"]:
-                        df_results.at[idx, "Stato"] = "NON TROVATO SU AMAZON"
-
-                    elif pd.isna(venditori) or venditori == 0:
-                        df_results.at[idx, "Stato"] = "TROVATO SENZA OFFERTE"
-
-                    else:
-                        df_results.at[idx, "Stato"] = "TROVATO CON OFFERTE"
-            if "Score" in df_results.columns:
-                df_results["Score"] = pd.to_numeric(df_results["Score"], errors="coerce").fillna(0)
-                df_results["BSR Beauty"] = pd.to_numeric(df_results["BSR Beauty"], errors="coerce")
-                df_results = df_results.sort_values(
-                    by=["Score", "BSR Beauty"],
-                    ascending=[False, True],
-                    na_position="last"
-                )
-
-            st.success("Analisi completata!")
-            st.dataframe(df_results, width="stretch")
-
+            source_file = getattr(uploaded_file, "name", "<uploaded file>")
             output_file = "glowup_scout_output.xlsx"
+            started_at = time.monotonic()
+            phase = "START ANALYSIS"
+            logger.info(
+                "START ANALYSIS | products=%s file=%s",
+                len(df_input),
+                source_file,
+            )
 
-            with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-                df_results.to_excel(writer, index=False, sheet_name="Risultati")
-
-                ws = writer.sheets["Risultati"]
-
-                headers = {}
-                for col in range(1, ws.max_column + 1):
-                    headers[ws.cell(row=1, column=col).value] = col
-
-                amazon_col = headers.get("Link Amazon")
-                offerte_col = headers.get("Link Offerte")
-
-                for row in range(2, ws.max_row + 1):
-                    if amazon_col:
-                        cell = ws.cell(row=row, column=amazon_col)
-                        if cell.value:
-                            cell.hyperlink = cell.value
-                            cell.style = "Hyperlink"
-
-                    if offerte_col:
-                        cell = ws.cell(row=row, column=offerte_col)
-                        if cell.value:
-                            cell.hyperlink = cell.value
-                            cell.style = "Hyperlink"
-
-            with open(output_file, "rb") as f:
-                st.download_button(
-                    label="📥 Scarica risultato Excel",
-                    data=f,
-                    file_name="glowup_scout_output.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            progress_widget = None
+            progress_callback = None
+            try:
+                progress_widget = st.progress(0)
+                progress_callback = progress_widget.progress
+            except Exception:
+                logger.exception(
+                    "PROGRESS INITIALIZATION FAILED | phase=START ANALYSIS "
+                    "file=%s; continuing without UI progress",
+                    source_file,
                 )
+
+            try:
+                token = get_access_token()
+                phase = "PROCESSING PRODUCTS"
+                df_results = analyze_products(
+                    df_input=df_input,
+                    costo_col=costo_col,
+                    token=token,
+                    search_catalog=search_catalog,
+                    search_pricing=search_pricing,
+                    safe_call=safe_call,
+                    progress_callback=progress_callback,
+                    source_file=source_file,
+                )
+
+                phase = "ANALYSIS COMPLETED"
+                logger.info(
+                    "ANALYSIS COMPLETED | products=%s file=%s",
+                    len(df_results),
+                    source_file,
+                )
+
+                phase = "WRITING EXCEL"
+                generated_file = write_results_excel(df_results, output_file)
+                duration_seconds = time.monotonic() - started_at
+                result_summary = summarize_results(df_results)
+
+                phase = "READY FOR DOWNLOAD"
+                logger.info(
+                    "READY FOR DOWNLOAD | file=%s duration_seconds=%.2f",
+                    generated_file,
+                    duration_seconds,
+                )
+            except Exception:
+                logger.exception(
+                    "BATCH ANALYSIS FAILED | phase=%s file=%s output_file=%s",
+                    phase,
+                    source_file,
+                    output_file,
+                )
+                st.error(
+                    f"Errore durante la fase '{phase}'. "
+                    "Consulta i log per i dettagli."
+                )
+            else:
+                try:
+                    if progress_widget is not None:
+                        progress_widget.empty()
+                    total_col, eligible_col, not_eligible_col, duration_col = (
+                        st.columns(4)
+                    )
+                    total_col.metric(
+                        "Prodotti analizzati",
+                        result_summary["total"],
+                    )
+                    eligible_col.metric(
+                        "Prodotti idonei",
+                        result_summary["eligible"],
+                    )
+                    not_eligible_col.metric(
+                        "Prodotti non idonei",
+                        result_summary["not_eligible"],
+                    )
+                    duration_col.metric(
+                        "Durata elaborazione",
+                        f"{duration_seconds:.1f} s",
+                    )
+
+                    with open(generated_file, "rb") as output:
+                        st.download_button(
+                            label="📥 Scarica risultato Excel",
+                            data=output,
+                            file_name="glowup_scout_output.xlsx",
+                            mime=(
+                                "application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet"
+                            ),
+                            on_click="ignore",
+                        )
+                except Exception:
+                    logger.exception(
+                        "RESULT UI FAILED | phase=READY FOR DOWNLOAD "
+                        "file=%s output_file=%s",
+                        source_file,
+                        generated_file,
+                    )
