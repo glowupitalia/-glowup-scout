@@ -1,4 +1,5 @@
 import logging
+import html
 import os
 import time
 import urllib.parse
@@ -9,11 +10,34 @@ import pandas as pd
 
 from batch_analysis import (
     analyze_products,
-    decision_from_score,
-    opportunity_score,
+    select_reference_price,
     summarize_results,
     write_results_excel,
 )
+from product_fees import search_product_fees_batch
+from discovery import (
+    DiscoveryCheckpointStore,
+    LEGACY_CHECKPOINT_MESSAGE,
+    default_filters,
+    discovery_funnel_view,
+    normalize_discovery_state,
+    run_discovery,
+)
+from discovery_amazon import (
+    RefreshingTokenProvider,
+    correlate_catalog_items,
+    get_item_offers_batch,
+    parse_item_offers_batch,
+    search_catalog_by_gtins_batch,
+)
+from discovery_excel import write_discovery_excel
+from purchase_scenarios import (
+    recommended_combination,
+    recommended_scenario,
+    scenario_requirement_label,
+    target_price,
+)
+from supplier_preparation import SUPPORTED_SUPPLIERS
 
 
 logging.basicConfig(
@@ -90,6 +114,88 @@ def money(obj):
     return f"{obj.get('Amount', '')} {obj.get('CurrencyCode', '')}"
 
 
+def money_amount(obj):
+    if not isinstance(obj, dict):
+        return None
+    try:
+        amount = float(obj.get("Amount"))
+    except (TypeError, ValueError):
+        return None
+    return amount if amount > 0 else None
+
+
+def _first_marketplace_record(values):
+    if isinstance(values, list):
+        marketplace_id = os.environ.get("MARKETPLACE_ID")
+        return next(
+            (
+                value
+                for value in values
+                if isinstance(value, dict)
+                and value.get("marketplaceId") in (None, marketplace_id)
+            ),
+            next((value for value in values if isinstance(value, dict)), {}),
+        )
+    return values if isinstance(values, dict) else {}
+
+
+def _first_attribute(attributes, *names):
+    if not isinstance(attributes, dict):
+        return None
+    for name in names:
+        value = attributes.get(name)
+        if isinstance(value, list) and value:
+            return value[0]
+        if value not in (None, "", []):
+            return value
+    return None
+
+
+def extract_logistics(item):
+    dimensions_payload = item.get("dimensions") or []
+    dimensions = _first_marketplace_record(dimensions_payload)
+    attributes = item.get("attributes") or {}
+    product_type_record = _first_marketplace_record(item.get("productTypes") or [])
+
+    item_dimensions = dimensions.get("item")
+    package_dimensions = dimensions.get("package")
+    item_weight = (
+        item_dimensions.get("weight")
+        if isinstance(item_dimensions, dict)
+        else None
+    )
+    package_weight = (
+        package_dimensions.get("weight")
+        if isinstance(package_dimensions, dict)
+        else None
+    )
+
+    return {
+        "Peso prodotto": item_weight or _first_attribute(
+            attributes,
+            "item_weight",
+            "item_weight_without_packaging",
+        ),
+        "Peso package": package_weight or _first_attribute(
+            attributes,
+            "item_package_weight",
+            "package_weight",
+        ),
+        "Dimensioni prodotto": item_dimensions or _first_attribute(
+            attributes,
+            "item_dimensions",
+        ),
+        "Dimensioni package": package_dimensions or _first_attribute(
+            attributes,
+            "item_package_dimensions",
+            "package_dimensions",
+        ),
+        "Product Type": product_type_record.get("productType", ""),
+        "_Catalog attributes": attributes,
+        "_Catalog dimensions": dimensions_payload,
+    }
+
+
 def search_catalog(ean, token):
     endpoint = "https://sellingpartnerapi-eu.amazon.com"
     path = "/catalog/2022-04-01/items"
@@ -98,7 +204,9 @@ def search_catalog(ean, token):
         "marketplaceIds": os.environ["MARKETPLACE_ID"],
         "identifiers": ean,
         "identifiersType": "EAN",
-        "includedData": "summaries,salesRanks,images",
+        "includedData": (
+            "summaries,salesRanks,images,dimensions,attributes,productTypes"
+        ),
     }
 
     url = endpoint + path + "?" + urllib.parse.urlencode(params)
@@ -154,6 +262,7 @@ def search_catalog(ean, token):
         "BSR Categoria": bsr_categoria,
         "Categoria BSR": categoria_bsr,
         "Immagine": image_url,
+        **extract_logistics(item),
     }
 
 
@@ -180,20 +289,25 @@ def search_pricing(asin, token):
     offers = payload.get("Offers", [])
 
     buy_box = ""
+    buy_box_amount = None
     buybox_prices = summary.get("BuyBoxPrices", [])
     if buybox_prices:
-        buy_box = money(buybox_prices[0].get("LandedPrice"))
+        landed_price = buybox_prices[0].get("LandedPrice")
+        buy_box = money(landed_price)
+        buy_box_amount = money_amount(landed_price)
 
-    lowest_fba = ""
-    lowest_fbm = ""
+    lowest_fba_amounts = []
+    lowest_fbm_amounts = []
 
     for lp in summary.get("LowestPrices", []):
         channel = lp.get("fulfillmentChannel", "")
-        price = money(lp.get("LandedPrice"))
+        price = money_amount(lp.get("LandedPrice"))
+        if price is None:
+            continue
         if channel == "Amazon":
-            lowest_fba = price
+            lowest_fba_amounts.append(price)
         elif channel == "Merchant":
-            lowest_fbm = price
+            lowest_fbm_amounts.append(price)
 
     fba_count = 0
     fbm_count = 0
@@ -213,8 +327,15 @@ def search_pricing(asin, token):
 
         total_price = ""
         try:
-            total_amount = float(price.get("Amount", 0)) + float(shipping.get("Amount", 0))
+            listing_amount = float(price.get("Amount", 0))
+            shipping_amount = float(shipping.get("Amount", 0))
+            total_amount = listing_amount + shipping_amount
             total_price = f"{round(total_amount, 2)} {price.get('CurrencyCode', '')}"
+            if listing_amount > 0 and shipping_amount >= 0 and total_amount > 0:
+                if is_fba:
+                    lowest_fba_amounts.append(total_amount)
+                else:
+                    lowest_fbm_amounts.append(total_amount)
         except Exception:
             total_price = ""
 
@@ -229,144 +350,602 @@ def search_pricing(asin, token):
             "Prime": "SI" if offer.get("PrimeInformation", {}).get("IsPrime") else "NO",
         })
 
+    lowest_fba_amount = min(lowest_fba_amounts, default=None)
+    lowest_fbm_amount = min(lowest_fbm_amounts, default=None)
+
     return {
         "Buy Box": buy_box,
-        "Prezzo minimo FBA": lowest_fba,
-        "Prezzo minimo FBM": lowest_fbm,
+        "Buy Box Amount": buy_box_amount,
+        "Prezzo minimo FBA": (
+            f"{lowest_fba_amount} EUR" if lowest_fba_amount is not None else ""
+        ),
+        "Prezzo minimo FBA Amount": lowest_fba_amount,
+        "Prezzo minimo FBM": (
+            f"{lowest_fbm_amount} EUR" if lowest_fbm_amount is not None else ""
+        ),
+        "Prezzo minimo FBM Amount": lowest_fbm_amount,
         "Venditori totali": len(offers),
         "Venditori FBA": fba_count,
         "Venditori FBM": fbm_count,
         "Offerte": offer_rows,
     }
 
-load_env()
 
+def apply_apple_ui():
+    st.markdown("""
+        <style>
+        :root { color-scheme: light; }
+        html, body, [class*="st-"] {
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+                "SF Pro Text", sans-serif;
+        }
+        .stApp { background: #f0f2f7; color: #121419; }
+        .block-container {
+            max-width: 1160px; padding-top: 1.25rem; padding-bottom: 3rem;
+        }
+        [data-testid="stHeader"] { background: transparent; }
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            background: #ffffff; border: .8px solid rgba(0,0,0,.055) !important;
+            border-radius: 26px; box-shadow: 0 5px 12px rgba(0,0,0,.07);
+        }
+        [data-testid="stVerticalBlockBorderWrapper"] > div {
+            padding: .05rem .2rem;
+        }
+        h1, h2, h3 { color: rgba(0,0,0,.90); letter-spacing: -.025em; }
+        h1 {
+            font-size: clamp(1.75rem, 3vw, 2.15rem); font-weight: 720;
+            line-height: 1.08; margin: 0;
+        }
+        h2 { font-size: 1.28rem; font-weight: 700; margin-top: 0; }
+        p { color: rgba(0,0,0,.54); }
+        .gu-header { margin: 0 0 1rem; }
+        .gu-subtitle {
+            color: rgba(0,0,0,.54); font-size: .98rem;
+            font-weight: 550; margin: .3rem 0 0;
+        }
+        .gu-product-brand {
+            color: rgba(0,0,0,.52); font-size: .78rem; font-weight: 650;
+            letter-spacing: .035em; text-transform: uppercase;
+        }
+        .gu-product-title {
+            color: rgba(0,0,0,.88); font-size: 1.28rem; font-weight: 650;
+            line-height: 1.25; margin: .3rem 0 .55rem;
+        }
+        .gu-meta { color: rgba(0,0,0,.50); font-size: .84rem; line-height: 1.55; }
+        .gu-alert {
+            border: 1px solid; border-radius: 12px; font-size: .9rem;
+            margin: .25rem 0 1rem; padding: .7rem .9rem;
+        }
+        .gu-success { background: #f0f9f3; border-color: #ccebd5; color: #246b3d; }
+        .gu-warning { background: #fff9e8; border-color: #f3e4ad; color: #7b5b00; }
+        .gu-error { background: #fff2f1; border-color: #f3cfcb; color: #9f2d25; }
+        [data-testid="stMetric"] {
+            background: rgba(248,249,251,.92);
+            border: 1px solid rgba(0,0,0,.055);
+            border-radius: 16px; padding: .7rem .8rem;
+        }
+        [data-testid="stMetricLabel"] {
+            color: rgba(0,0,0,.50); font-size: .76rem; font-weight: 650;
+        }
+        [data-testid="stMetricValue"] {
+            color: rgba(0,0,0,.88); font-size: 1.22rem; font-weight: 720;
+        }
+        [data-testid="stTextInput"] input {
+            background: #ffffff; border-color: rgba(0,0,0,.13);
+            border-radius: 11px; color: rgba(0,0,0,.88);
+            height: 2.65rem;
+        }
+        [data-testid="stTextInput"] input:focus {
+            border-color: rgba(0,0,0,.62);
+            box-shadow: 0 0 0 1px rgba(0,0,0,.20);
+        }
+        .stButton > button, .stDownloadButton > button,
+        [data-testid="stLinkButton"] a,
+        [data-testid="stFileUploaderDropzone"] button {
+            border-radius: 11px; height: 2.65rem; min-height: 2.65rem;
+            padding: 0 1rem; font-weight: 650;
+            transition: transform .12s ease, background .12s ease;
+        }
+        .stButton > button[kind="primary"],
+        .stDownloadButton > button[kind="primary"],
+        [data-testid="stFileUploaderDropzone"] button {
+            background: rgb(12% 39% 94%);
+            border-color: rgb(12% 39% 94%);
+            color: #ffffff;
+        }
+        .stButton > button[kind="primary"] *,
+        .stDownloadButton > button[kind="primary"] *,
+        [data-testid="stFileUploaderDropzone"] button * {
+            color: #ffffff; font-weight: 650;
+        }
+        [data-testid="stLinkButton"] a {
+            background: rgb(12% 39% 94%);
+            border-color: rgb(12% 39% 94%);
+            color: #ffffff;
+        }
+        [data-testid="stLinkButton"] a * {
+            color: #ffffff; font-weight: 650;
+        }
+        .stButton > button[kind="primary"]:hover,
+        .stDownloadButton > button[kind="primary"]:hover,
+        [data-testid="stFileUploaderDropzone"] button:hover {
+            background: rgb(12% 39% 94%);
+            border-color: rgb(12% 39% 94%);
+            color: #ffffff; filter: brightness(.88);
+        }
+        [data-testid="stLinkButton"] a:hover {
+            background: rgb(12% 39% 94%);
+            border-color: rgb(12% 39% 94%);
+            color: #ffffff; filter: brightness(.88);
+        }
+        [data-testid="stLinkButton"] a:focus-visible {
+            outline: 3px solid rgb(12% 39% 94% / 32%);
+            outline-offset: 2px;
+        }
+        [data-testid="stLinkButton"] a[aria-disabled="true"] {
+            background: rgb(12% 39% 94% / 42%);
+            border-color: transparent; color: rgb(100% 100% 100% / 82%);
+            pointer-events: none;
+        }
+        .stButton > button[kind="primary"]:focus-visible,
+        .stDownloadButton > button[kind="primary"]:focus-visible,
+        [data-testid="stFileUploaderDropzone"] button:focus-visible {
+            outline: 3px solid rgb(12% 39% 94% / 32%);
+            outline-offset: 2px;
+        }
+        .stButton > button[kind="primary"]:disabled,
+        .stDownloadButton > button[kind="primary"]:disabled,
+        [data-testid="stFileUploaderDropzone"] button:disabled {
+            background: rgb(12% 39% 94% / 42%) !important;
+            border-color: transparent !important;
+            color: rgb(100% 100% 100% / 82%) !important; opacity: 1;
+        }
+        .stButton > button:hover, .stDownloadButton > button:hover,
+        [data-testid="stFileUploaderDropzone"] button:hover,
+        [data-testid="stLinkButton"] a:hover { transform: translateY(-1px); }
+        [data-testid="stFileUploaderDropzone"] {
+            background: #f8f9fb; border: 1px dashed rgba(0,0,0,.18);
+            border-radius: 16px; box-sizing: border-box;
+            height: 3.25rem; min-height: 3.25rem;
+            padding: .3rem .4rem .3rem .9rem;
+            gap: .75rem; align-items: center;
+        }
+        [data-testid="stFileUploaderDropzone"] button {
+            width: 10.5rem; min-width: 10.5rem; max-width: 10.5rem;
+            white-space: nowrap; box-sizing: border-box;
+        }
+        .gu-field-label {
+            color: rgba(0,0,0,.78); font-size: .875rem; font-weight: 600;
+            margin: 0 0 .35rem;
+        }
+        .st-key-ean_operation_row {
+            background: #ffffff; border: 1px solid rgba(0,0,0,.13);
+            border-radius: 16px; box-sizing: border-box;
+            height: 3.25rem; min-height: 3.25rem;
+            padding: .3rem .4rem .3rem .9rem;
+        }
+        .st-key-ean_operation_row [data-testid="stHorizontalBlock"] {
+            align-items: center; gap: .75rem; height: 100%;
+        }
+        .st-key-ean_operation_row [data-testid="stTextInput"] {
+            flex: 1 1 auto; min-width: 0;
+        }
+        .st-key-ean_operation_row [data-testid="stTextInput"] > div,
+        .st-key-ean_operation_row [data-baseweb="input"],
+        .st-key-ean_operation_row [data-baseweb="base-input"] {
+            height: 2.65rem; border: 0; background: transparent;
+            background-color: transparent !important;
+            box-shadow: none !important; outline: none !important;
+        }
+        .st-key-ean_operation_row [data-testid="stTextInput"] input {
+            border: 0 !important;
+            background: transparent !important;
+            background-color: transparent !important;
+            box-shadow: none !important; outline: none !important;
+            padding-left: 0;
+        }
+        .st-key-ean_operation_row:focus-within {
+            border-color: rgb(12% 39% 94% / 55%);
+            box-shadow: 0 0 0 2px rgb(12% 39% 94% / 14%);
+        }
+        .st-key-ean_operation_row [data-testid="stButton"] {
+            flex: 0 0 10.5rem; width: 10.5rem;
+            min-width: 10.5rem; max-width: 10.5rem;
+        }
+        .st-key-ean_operation_row [data-testid="stButton"] button {
+            width: 10.5rem; min-width: 10.5rem; max-width: 10.5rem;
+            box-sizing: border-box;
+        }
+        .st-key-product_amazon_actions [data-testid="stHorizontalBlock"] {
+            gap: .75rem; align-items: center;
+        }
+        .st-key-product_amazon_actions [data-testid="stLinkButton"] {
+            flex: 1 1 0; min-width: 0; width: 100%;
+        }
+        .st-key-product_amazon_actions [data-testid="stLinkButton"] a {
+            width: 100%; box-sizing: border-box;
+        }
+        .st-key-back_single_home button,
+        .st-key-back_batch_home button {
+            background: transparent; border: 1px solid rgba(0,0,0,.12);
+            color: rgba(0,0,0,.68); box-shadow: none;
+        }
+        .st-key-back_single_home button *,
+        .st-key-back_batch_home button * {
+            color: rgba(0,0,0,.68); font-weight: 650;
+        }
+        .st-key-back_single_home button:hover,
+        .st-key-back_batch_home button:hover {
+            background: rgba(255,255,255,.72);
+            border-color: rgba(0,0,0,.2); filter: none;
+        }
+        [data-testid="stProgressBar"] > div { background: rgba(0,0,0,.09); }
+        [data-testid="stProgressBar"] > div > div { background: #333840; }
+        a { color: #333840; }
+        [data-testid="stImage"] img { border-radius: 16px; object-fit: contain; }
+        hr { border-color: rgba(0,0,0,.08); }
+        @media (max-width: 700px) {
+            .block-container { padding: .8rem .85rem 2rem; }
+            [data-testid="stVerticalBlockBorderWrapper"] {
+                border-radius: 20px; box-shadow: 0 3px 9px rgba(0,0,0,.055);
+            }
+            .gu-product-title { font-size: 1.15rem; }
+            [data-testid="stMetricValue"] { font-size: 1.1rem; }
+            .stButton > button, .stDownloadButton > button,
+            [data-testid="stLinkButton"] a { width: 100%; }
+            .st-key-ean_operation_row,
+            [data-testid="stFileUploaderDropzone"] {
+                height: 6.5rem; min-height: 6.5rem;
+                padding: .4rem; gap: .4rem;
+            }
+            .st-key-ean_operation_row [data-testid="stHorizontalBlock"],
+            [data-testid="stFileUploaderDropzone"] {
+                flex-direction: column; align-items: stretch;
+            }
+            .st-key-product_amazon_actions [data-testid="stHorizontalBlock"] {
+                flex-direction: column; align-items: stretch; gap: .5rem;
+            }
+            .st-key-ean_operation_row [data-testid="stButton"],
+            .st-key-ean_operation_row [data-testid="stButton"] button,
+            [data-testid="stFileUploaderDropzone"] button {
+                width: 100%; min-width: 100%; max-width: 100%;
+                flex-basis: 2.65rem;
+            }
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+
+def ui_alert(message, kind="success"):
+    safe_message = html.escape(str(message))
+    st.markdown(
+        f'<div class="gu-alert gu-{kind}">{safe_message}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def display_value(value, fallback="—"):
+    return fallback if value in (None, "", "None") else value
+
+
+def single_price_label(price_source):
+    return {
+        "buy_box": "Buy Box",
+        "min_fba": "Prezzo minimo FBA",
+        "min_fbm": "Prezzo minimo FBM",
+        "missing_price": "Prezzo non disponibile",
+    }.get(price_source, "Prezzo non disponibile")
+
+
+load_env()
 st.set_page_config(page_title="GlowUp Product Scout", layout="wide")
+apply_apple_ui()
 
 logo = Image.open("glowup-italia-signature-transparent.png")
+header_logo, header_copy = st.columns([1, 5], vertical_alignment="center")
+with header_logo:
+    st.image(logo, width=145)
+with header_copy:
+    st.markdown("""
+        <div class="gu-header">
+            <h1>Product Scout</h1>
+            <p class="gu-subtitle">Trova e valuta nuove opportunità su Amazon</p>
+        </div>
+    """, unsafe_allow_html=True)
 
-st.image(logo, width=350)
 
-st.title("Product Scout")
-st.write("Analisi prodotto Amazon da EAN: BSR, immagine, Buy Box e offerte venditori.")
+def return_to_home():
+    st.session_state["ui_state"] = "home"
+    st.session_state.pop("single_product_result", None)
+    st.session_state.pop("single_status", None)
+    st.session_state.pop("single_message", None)
+    st.session_state.pop("batch_result", None)
+    st.session_state.pop("batch_error", None)
+    st.session_state.pop("discovery_result", None)
+    st.session_state.pop("discovery_error", None)
 
-ean = st.text_input("Inserisci EAN prodotto")
 
-if st.button("Analizza EAN"):
-    if not ean:
-        st.warning("Inserisci prima un EAN.")
-    else:
-        with st.spinner("Analisi Amazon in corso..."):
+def discovery_filter_error(filters, selected_suppliers):
+    if not selected_suppliers:
+        return "Seleziona almeno un fornitore."
+    if int(filters["bsr_min"]) < 0:
+        return "Il BSR minimo non può essere negativo."
+    if int(filters["bsr_max"]) <= int(filters["bsr_min"]):
+        return "Il BSR massimo deve essere maggiore del BSR minimo."
+    if int(filters["max_fba_sellers"]) < 0 or int(filters["max_total_sellers"]) < 0:
+        return "Il numero massimo di venditori non può essere negativo."
+    if not 0 <= int(filters["minimum_margin"]) <= 100:
+        return "Il margine minimo deve essere compreso tra 0% e 100%."
+    return None
+
+
+def _toggle_all_discovery_suppliers():
+    value = bool(st.session_state.get("discovery_supplier_all"))
+    for supplier in SUPPORTED_SUPPLIERS:
+        st.session_state[f"discovery_supplier_{supplier}"] = value
+
+
+def _sync_all_discovery_suppliers():
+    st.session_state["discovery_supplier_all"] = all(
+        st.session_state.get(f"discovery_supplier_{supplier}", False)
+        for supplier in SUPPORTED_SUPPLIERS
+    )
+
+
+def new_discovery_search():
+    st.session_state["ui_state"] = "discovery"
+    st.session_state.pop("discovery_result", None)
+    st.session_state.pop("discovery_error", None)
+
+
+if "ui_state" not in st.session_state:
+    st.session_state["ui_state"] = (
+        "single_result"
+        if st.session_state.get("single_product_result")
+        else "home"
+    )
+
+ui_state = st.session_state["ui_state"]
+
+if ui_state == "home":
+    with st.container(border=True):
+        st.subheader("Ricerca singola")
+        st.markdown(
+            '<div class="gu-field-label">EAN prodotto</div>',
+            unsafe_allow_html=True,
+        )
+        with st.container(
+            key="ean_operation_row",
+            horizontal=True,
+            vertical_alignment="center",
+            gap="small",
+        ):
+            ean = st.text_input(
+                "EAN prodotto",
+                key="ean_input",
+                placeholder="Inserisci il codice EAN",
+                label_visibility="collapsed",
+                width="stretch",
+            )
+            analyze_ean = st.button("Analizza EAN", type="primary", width=168)
+        if analyze_ean:
+            if not ean:
+                ui_alert("Inserisci prima un EAN.", "warning")
+            else:
+                st.session_state.pop("single_product_result", None)
+                st.session_state["single_status"] = "pending"
+                st.session_state["single_ean"] = ean.strip()
+                st.session_state["ui_state"] = "single_result"
+                st.rerun()
+
+    st.markdown("<div style='height:.55rem'></div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        st.subheader("Analisi multipla")
+        st.caption("Carica un file Excel con colonne EAN e COSTO")
+        uploaded_file = st.file_uploader(
+            "File Excel", type=["xlsx"], label_visibility="collapsed",
+        )
+        if uploaded_file:
+            df_input = read_input_excel(uploaded_file)
+            if "EAN" not in df_input.columns:
+                ui_alert(
+                    "Il file deve contenere una colonna chiamata EAN.", "error"
+                )
+            else:
+                costo_col = next(
+                    (
+                        col for col in df_input.columns
+                        if str(col).strip().lower() == "costo"
+                    ),
+                    None,
+                )
+                st.caption(f"{len(df_input)} prodotti pronti per l’analisi")
+                if st.button(
+                    "Analizza Excel", type="primary", use_container_width=True
+                ):
+                    st.session_state["batch_input"] = df_input
+                    st.session_state["batch_cost_column"] = costo_col
+                    st.session_state["batch_source_file"] = getattr(
+                        uploaded_file, "name", "<uploaded file>"
+                    )
+                    st.session_state["batch_status"] = "ready"
+                    st.session_state["ui_state"] = "batch_running"
+                    st.rerun()
+
+    st.markdown("<div style='height:.55rem'></div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        st.subheader("Scopri opportunità")
+        st.caption(
+            "Trova automaticamente i prodotti più interessanti da acquistare "
+            "e vendere su Amazon"
+        )
+        if st.button(
+            "Apri Discovery",
+            key="open_discovery",
+            type="primary",
+            use_container_width=True,
+        ):
+            st.session_state["ui_state"] = "discovery"
+            st.rerun()
+
+elif ui_state == "single_result":
+    st.button(
+        "← Torna alla ricerca",
+        key="back_single_home",
+        type="secondary",
+        on_click=return_to_home,
+    )
+    if st.session_state.get("single_status") == "pending":
+        ean = st.session_state.get("single_ean", "")
+        with st.spinner("Analisi Amazon in corso…"):
             try:
                 token = get_access_token()
-                catalog = search_catalog(ean.strip(), token)
-
+                catalog = search_catalog(ean, token)
                 if catalog is None:
-                    st.error("Nessun prodotto trovato.")
+                    st.session_state["single_status"] = "not_found"
+                    st.session_state["single_message"] = "Nessun prodotto trovato."
                 else:
                     pricing = safe_call(search_pricing, catalog["ASIN"], token)
-
-                    st.success("Prodotto trovato!")
-
-                    left, right = st.columns([1, 2])
-
-                    with left:
-                        if catalog["Immagine"]:
-                            st.image(catalog["Immagine"], width=280)
-                        st.metric("ASIN", catalog["ASIN"])
-                        st.metric("Brand", catalog["Brand"])
-
-                        asin = catalog["ASIN"]
-                        st.link_button("🔗 Apri scheda Amazon", f"https://www.amazon.it/dp/{asin}")
-                        st.link_button("🛒 Apri offerte venditori", f"https://www.amazon.it/gp/offer-listing/{asin}")
-
-                    with right:
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("BSR Beauty", catalog["BSR Beauty"])
-                        c2.metric("Venditori FBA", pricing["Venditori FBA"])
-                        c3.metric("Buy Box", pricing["Buy Box"])
-
-                        c4, c5, c6 = st.columns(3)
-                        c4.metric("Venditori totali", pricing["Venditori totali"])
-                        c5.metric("Venditori FBA", pricing["Venditori FBA"])
-                        c6.metric("Venditori FBM", pricing["Venditori FBM"])
-
-                        c7, c8, c9 = st.columns(3)
-                        c7.metric("Prezzo min FBA", pricing["Prezzo minimo FBA"])
-                        c8.metric("Prezzo min FBM", pricing["Prezzo minimo FBM"])
-                        c9.metric("Categoria", catalog["Categoria"])
-
-                    st.subheader("Titolo prodotto")
-                    st.write(catalog["Titolo"])
-
-                    st.subheader("Categoria")
-                    st.write(catalog["Categoria"])
-
-                    st.subheader("Offerte venditori")
-                    if pricing["Offerte"]:
-                        st.dataframe(pd.DataFrame(pricing["Offerte"]), width="stretch")
-                    else:
-                        st.info("Nessuna offerta disponibile.")
-
-                    st.subheader("Dati riepilogo")
-                    summary = {
-                        **{k: v for k, v in catalog.items() if k != "Immagine"},
-                        **{k: v for k, v in pricing.items() if k != "Offerte"},
+                    reference_price, price_source = select_reference_price(pricing)
+                    st.session_state["single_product_result"] = {
+                        "catalog": catalog,
+                        "pricing": pricing,
+                        "reference_price": reference_price,
+                        "price_source": price_source,
                     }
-                    st.dataframe([summary], width="stretch")
-
-            except Exception as e:
+                    st.session_state["single_status"] = "found"
+            except Exception as error:
                 logger.exception(
                     "SINGLE PRODUCT ANALYSIS FAILED | "
                     "phase=PROCESSING PRODUCT ean=%s",
-                    ean.strip(),
+                    ean,
                 )
-                st.error(f"Errore: {e}")
+                st.session_state["single_status"] = "error"
+                st.session_state["single_message"] = f"Errore: {error}"
+        st.rerun()
 
-# --- ANALISI EXCEL MULTIPLA ---
+    single_status = st.session_state.get("single_status")
+    if single_status in ("not_found", "error"):
+        ui_alert(
+            st.session_state.get("single_message", "Prodotto non disponibile."),
+            "error",
+        )
+    elif st.session_state.get("single_product_result"):
+        single_product_result = st.session_state["single_product_result"]
+        catalog = single_product_result["catalog"]
+        pricing = single_product_result["pricing"]
+        reference_price = single_product_result["reference_price"]
+        price_source = single_product_result["price_source"]
+        ui_alert("Prodotto trovato.")
+        with st.container(border=True):
+            product, kpis = st.columns([1.05, 2.25], vertical_alignment="top")
+            with product:
+                if catalog["Immagine"]:
+                    st.image(catalog["Immagine"], width="stretch")
+                st.markdown(
+                    '<div class="gu-product-brand">'
+                    f'{html.escape(str(display_value(catalog["Brand"])))}'
+                    '</div><div class="gu-product-title">'
+                    f'{html.escape(str(display_value(catalog["Titolo"])))}'
+                    '</div><div class="gu-meta">'
+                    f'ASIN {html.escape(str(catalog["ASIN"]))}<br>'
+                    f'{html.escape(str(display_value(catalog["Categoria"])))}'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+            with kpis:
+                first_row = st.columns(3)
+                first_row[0].metric(
+                    "BSR Beauty", display_value(catalog["BSR Beauty"])
+                )
+                first_row[1].metric(
+                    single_price_label(price_source),
+                    display_value(
+                        f"{float(reference_price):.2f} EUR"
+                        if reference_price is not None else None
+                    ),
+                )
+                first_row[2].metric("Venditori FBA", pricing["Venditori FBA"])
+                secondary_metrics = [
+                    ("Venditori totali", pricing["Venditori totali"]),
+                ]
+                if price_source != "min_fba":
+                    secondary_metrics.append(
+                        ("Prezzo minimo FBA", pricing["Prezzo minimo FBA"])
+                    )
+                if price_source != "min_fbm":
+                    secondary_metrics.append(
+                        ("Prezzo minimo FBM", pricing["Prezzo minimo FBM"])
+                    )
+                second_row = st.columns(len(secondary_metrics))
+                for column, (label, value) in zip(
+                    second_row, secondary_metrics
+                ):
+                    column.metric(label, display_value(value))
+                asin = catalog["ASIN"]
+                with st.container(
+                    key="product_amazon_actions",
+                    horizontal=True,
+                    vertical_alignment="center",
+                    gap="small",
+                ):
+                    st.link_button(
+                        "Vedi offerte Amazon",
+                        f"https://www.amazon.it/gp/offer-listing/{asin}",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                    st.link_button(
+                        "Apri scheda Amazon",
+                        f"https://www.amazon.it/dp/{asin}",
+                        type="primary",
+                        use_container_width=True,
+                    )
 
-st.divider()
-st.header("📊 Analisi multipla da Excel")
+elif ui_state == "batch_running":
+    with st.container(border=True):
+        st.subheader("Analisi multipla")
+        st.caption("Elaborazione prodotti Amazon in corso")
+        progress_status = None
+        progress_widget = None
+        try:
+            progress_status = st.empty()
+            progress_widget = st.progress(0)
+        except Exception:
+            logger.exception(
+                "PROGRESS INITIALIZATION FAILED | phase=START ANALYSIS; "
+                "continuing without UI progress"
+            )
 
-uploaded_file = st.file_uploader("Carica un file Excel con colonna EAN", type=["xlsx"])
-
-if uploaded_file:
-    df_input = read_input_excel(uploaded_file)
-
-    if "EAN" not in df_input.columns:
-        st.error("Il file deve contenere una colonna chiamata EAN.")
-    else:
-        costo_col = None
-        for col in df_input.columns:
-            if str(col).strip().lower() == "costo":
-                costo_col = col
-
-        st.write(f"EAN trovati: {len(df_input)}")
-
-        if st.button("Analizza Excel"):
-            source_file = getattr(uploaded_file, "name", "<uploaded file>")
+        if st.session_state.get("batch_status") == "ready":
+            st.session_state["batch_status"] = "processing"
+            df_input = st.session_state["batch_input"]
+            costo_col = st.session_state["batch_cost_column"]
+            source_file = st.session_state["batch_source_file"]
             output_file = "glowup_scout_output.xlsx"
             started_at = time.monotonic()
             phase = "START ANALYSIS"
             logger.info(
                 "START ANALYSIS | products=%s file=%s",
-                len(df_input),
-                source_file,
+                len(df_input), source_file,
             )
 
-            progress_widget = None
-            progress_callback = None
-            try:
-                progress_widget = st.progress(0)
-                progress_callback = progress_widget.progress
-            except Exception:
-                logger.exception(
-                    "PROGRESS INITIALIZATION FAILED | phase=START ANALYSIS "
-                    "file=%s; continuing without UI progress",
-                    source_file,
+            def update_batch_progress(value):
+                if progress_widget is not None:
+                    progress_widget.progress(value)
+                completed = min(
+                    len(df_input), int((value / 0.8) * len(df_input))
                 )
+                if progress_status is not None:
+                    progress_status.caption(
+                        f"{completed} di {len(df_input)} prodotti completati"
+                    )
 
             try:
+                if progress_status is not None:
+                    progress_status.caption(
+                        f"0 di {len(df_input)} prodotti completati"
+                    )
                 token = get_access_token()
                 phase = "PROCESSING PRODUCTS"
                 df_results = analyze_products(
@@ -375,79 +954,617 @@ if uploaded_file:
                     token=token,
                     search_catalog=search_catalog,
                     search_pricing=search_pricing,
+                    search_fees_batch=search_product_fees_batch,
                     safe_call=safe_call,
-                    progress_callback=progress_callback,
+                    progress_callback=update_batch_progress,
                     source_file=source_file,
                 )
-
                 phase = "ANALYSIS COMPLETED"
                 logger.info(
                     "ANALYSIS COMPLETED | products=%s file=%s",
-                    len(df_results),
-                    source_file,
+                    len(df_results), source_file,
                 )
-
                 phase = "WRITING EXCEL"
                 generated_file = write_results_excel(df_results, output_file)
                 duration_seconds = time.monotonic() - started_at
                 result_summary = summarize_results(df_results)
-
-                phase = "READY FOR DOWNLOAD"
+                with open(generated_file, "rb") as output:
+                    output_bytes = output.read()
+                st.session_state["batch_result"] = {
+                    "summary": result_summary,
+                    "duration_seconds": duration_seconds,
+                    "output_bytes": output_bytes,
+                }
+                st.session_state["batch_status"] = "completed"
+                st.session_state["ui_state"] = "batch_result"
                 logger.info(
                     "READY FOR DOWNLOAD | file=%s duration_seconds=%.2f",
-                    generated_file,
-                    duration_seconds,
+                    generated_file, duration_seconds,
                 )
             except Exception:
                 logger.exception(
                     "BATCH ANALYSIS FAILED | phase=%s file=%s output_file=%s",
-                    phase,
-                    source_file,
-                    output_file,
+                    phase, source_file, output_file,
                 )
-                st.error(
+                st.session_state["batch_status"] = "error"
+                st.session_state["batch_error"] = (
                     f"Errore durante la fase '{phase}'. "
                     "Consulta i log per i dettagli."
                 )
-            else:
-                try:
-                    if progress_widget is not None:
-                        progress_widget.empty()
-                    total_col, eligible_col, not_eligible_col, duration_col = (
-                        st.columns(4)
-                    )
-                    total_col.metric(
-                        "Prodotti analizzati",
-                        result_summary["total"],
-                    )
-                    eligible_col.metric(
-                        "Prodotti idonei",
-                        result_summary["eligible"],
-                    )
-                    not_eligible_col.metric(
-                        "Prodotti non idonei",
-                        result_summary["not_eligible"],
-                    )
-                    duration_col.metric(
-                        "Durata elaborazione",
-                        f"{duration_seconds:.1f} s",
-                    )
+                st.session_state["ui_state"] = "batch_result"
+            st.rerun()
 
-                    with open(generated_file, "rb") as output:
-                        st.download_button(
-                            label="📥 Scarica risultato Excel",
-                            data=output,
-                            file_name="glowup_scout_output.xlsx",
-                            mime=(
-                                "application/vnd.openxmlformats-officedocument."
-                                "spreadsheetml.sheet"
-                            ),
-                            on_click="ignore",
-                        )
-                except Exception:
-                    logger.exception(
-                        "RESULT UI FAILED | phase=READY FOR DOWNLOAD "
-                        "file=%s output_file=%s",
-                        source_file,
-                        generated_file,
+elif ui_state == "batch_result":
+    st.button(
+        "← Torna alla home",
+        key="back_batch_home",
+        type="secondary",
+        on_click=return_to_home,
+    )
+    if st.session_state.get("batch_status") == "error":
+        ui_alert(
+            st.session_state.get("batch_error", "Analisi non completata."),
+            "error",
+        )
+    elif st.session_state.get("batch_result"):
+        batch_result = st.session_state["batch_result"]
+        result_summary = batch_result["summary"]
+        ui_alert("Analisi completata. Il file è pronto.")
+        with st.container(border=True):
+            summary_columns = st.columns(4)
+            summary_columns[0].metric(
+                "Prodotti analizzati", result_summary["total"]
+            )
+            summary_columns[1].metric(
+                "Prodotti idonei", result_summary["eligible"]
+            )
+            summary_columns[2].metric(
+                "Prodotti non idonei", result_summary["not_eligible"]
+            )
+            summary_columns[3].metric(
+                "Durata", f"{batch_result['duration_seconds']:.1f} s"
+            )
+            st.download_button(
+                label="Scarica risultato Excel",
+                data=batch_result["output_bytes"],
+                file_name="glowup_scout_output.xlsx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                on_click="ignore",
+                type="primary",
+                use_container_width=True,
+            )
+
+elif ui_state == "discovery":
+    st.button(
+        "← Torna alla home",
+        key="back_discovery_home",
+        type="secondary",
+        on_click=return_to_home,
+    )
+    with st.container(border=True):
+        st.subheader("Scopri opportunità")
+        st.caption(
+            "Trova automaticamente i prodotti più interessanti da acquistare "
+            "e vendere su Amazon"
+        )
+        st.markdown("**Fornitori**")
+        for supplier in SUPPORTED_SUPPLIERS:
+            st.session_state.setdefault(f"discovery_supplier_{supplier}", True)
+        st.session_state.setdefault("discovery_supplier_all", True)
+        supplier_columns = st.columns(5)
+        supplier_columns[0].checkbox(
+            "Tutti", key="discovery_supplier_all",
+            on_change=_toggle_all_discovery_suppliers,
+        )
+        supplier_labels = {
+            "qogita": "Qogita", "umma": "UMMA", "abw": "ABW", "qudo": "Qudo",
+        }
+        for column, supplier in zip(supplier_columns[1:], SUPPORTED_SUPPLIERS):
+            column.checkbox(
+                supplier_labels[supplier], key=f"discovery_supplier_{supplier}",
+                on_change=_sync_all_discovery_suppliers,
+            )
+        selected_suppliers = [
+            supplier for supplier in SUPPORTED_SUPPLIERS
+            if st.session_state.get(f"discovery_supplier_{supplier}")
+        ]
+        st.markdown("**Filtri**")
+        defaults = default_filters()
+        first = st.columns(3)
+        bsr_min = first[0].number_input(
+            "BSR minimo", min_value=0, value=defaults["bsr_min"], step=100
+        )
+        bsr_max = first[1].number_input(
+            "BSR massimo", min_value=1, value=defaults["bsr_max"], step=100
+        )
+        max_fba = first[2].number_input(
+            "Venditori FBA massimi", min_value=0, value=defaults["max_fba_sellers"], step=1
+        )
+        second = st.columns(2)
+        max_total = second[0].number_input(
+            "Venditori totali massimi", min_value=0, value=defaults["max_total_sellers"], step=1
+        )
+        minimum_margin = second[1].number_input(
+            "Margine minimo %", min_value=0, max_value=100,
+            value=defaults["minimum_margin"], step=1,
+        )
+        filters = {
+            "bsr_min": bsr_min,
+            "bsr_max": bsr_max,
+            "max_fba_sellers": max_fba,
+            "max_total_sellers": max_total,
+            "minimum_margin": minimum_margin,
+            "minimum_qogita_stock": defaults["minimum_qogita_stock"],
+        }
+        validation_error = discovery_filter_error(filters, selected_suppliers)
+        if validation_error:
+            ui_alert(validation_error, "warning")
+        if st.button(
+            "Trova opportunità", key="start_discovery", type="primary",
+            use_container_width=True, disabled=bool(validation_error),
+        ):
+            st.session_state["discovery_filters"] = filters
+            st.session_state["discovery_selected_suppliers"] = selected_suppliers
+            st.session_state["discovery_job_id"] = None
+            st.session_state["discovery_status"] = "ready"
+            st.session_state["ui_state"] = "discovery_running"
+            st.rerun()
+
+        incomplete = DiscoveryCheckpointStore().latest_incomplete()
+        if incomplete and st.button(
+            "Riprendi ultima Discovery incompleta",
+            key="resume_discovery",
+            type="secondary",
+            use_container_width=True,
+        ):
+            st.session_state["discovery_filters"] = incomplete["filters"]
+            st.session_state["discovery_selected_suppliers"] = incomplete.get(
+                "selected_suppliers"
+            ) or ["qogita"]
+            st.session_state["discovery_job_id"] = incomplete["job_id"]
+            st.session_state["discovery_status"] = "ready"
+            st.session_state["ui_state"] = "discovery_running"
+            st.rerun()
+
+elif ui_state == "discovery_running":
+    with st.container(border=True):
+        st.subheader("Scopri opportunità")
+        status_placeholder = st.empty()
+        progress_widget = st.progress(0)
+        if st.session_state.get("discovery_status") in {"ready", "processing"}:
+            st.session_state["discovery_status"] = "processing"
+            store = DiscoveryCheckpointStore()
+            token_provider = RefreshingTokenProvider(get_access_token)
+            phase_progress = {
+                "supplier_preparing": 0.03,
+                "supplier_checking": 0.04,
+                "supplier_refreshing": 0.07,
+                "supplier_ready": 0.10,
+                "supplier_unavailable": 0.10,
+                "supplier_preparation_failed": 0.05,
+                "suppliers_loaded": 0.12,
+                "qogita_checking": 0.03,
+                "qogita_refresh_required": 0.05,
+                "qogita_refreshing": 0.07,
+                "qogita_refresh_failed": 0.07,
+                "qogita_loaded": 0.10,
+                "catalog_complete": 0.35,
+                "bsr_filtered": 0.45,
+                "pricing_complete": 0.65,
+                "competition_filtered": 0.72,
+                "fees_complete": 0.90,
+                "completed": 1.0,
+            }
+
+            def update_discovery_progress(phase, _state):
+                st.session_state["discovery_job_id"] = _state["job_id"]
+                progress_widget.progress(phase_progress.get(phase, 0.0))
+                phase_labels = {
+                    "supplier_preparing": "Preparazione fornitori",
+                    "supplier_checking": "Preparazione fornitori",
+                    "supplier_refreshing": "Aggiornamento catalogo fornitore",
+                    "supplier_ready": "Preparazione fornitori",
+                    "supplier_unavailable": "Fornitore non disponibile",
+                    "supplier_preparation_failed": "Fornitori non disponibili",
+                    "suppliers_loaded": "Ricerca prodotti su Amazon",
+                    "qogita_checking": "Verifica dati Qogita",
+                    "qogita_refresh_required": "Aggiornamento catalogo Qogita",
+                    "qogita_refreshing": "Aggiornamento catalogo Qogita…",
+                    "qogita_refresh_failed": "Aggiornamento Qogita non riuscito",
+                    "qogita_loaded": "Analisi Amazon",
+                    "catalog_complete": "Verifica BSR",
+                    "bsr_filtered": "Analisi prezzi e concorrenza",
+                    "pricing_complete": "Analisi prezzi e concorrenza",
+                    "competition_filtered": "Calcolo costi Amazon",
+                    "fees_complete": "Valutazione opportunità",
+                    "completed": "Preparazione risultati",
+                }
+                label = phase_labels.get(phase, f"Fase: {phase.replace('_', ' ')}")
+                supplier = _state.get("current_supplier")
+                detail = f"{label} · {str(supplier).upper()}" if supplier else label
+                if phase in {"suppliers_loaded", "catalog_complete", "pricing_complete"}:
+                    products = len(_state.get("candidates") or [])
+                    scenarios = sum(
+                        len(row.get("scenarios") or [])
+                        for row in _state.get("candidates") or []
                     )
+                    detail += f" · {products} prodotti · {scenarios} scenari"
+                status_placeholder.caption(detail)
+
+            def catalog_batch(gtins, job_id, products=None):
+                items = search_catalog_by_gtins_batch(
+                    gtins, token_provider,
+                    marketplace_id=os.environ["MARKETPLACE_ID"], job_id=job_id,
+                )
+                return correlate_catalog_items(gtins, items, products)
+
+            def pricing_batch(asins, job_id):
+                entries = get_item_offers_batch(
+                    asins, token_provider,
+                    marketplace_id=os.environ["MARKETPLACE_ID"], job_id=job_id,
+                )
+                return parse_item_offers_batch(entries)
+
+            try:
+                state = run_discovery(
+                    st.session_state["discovery_filters"],
+                    checkpoint_store=store,
+                    catalog_batch=catalog_batch,
+                    pricing_batch=pricing_batch,
+                    fees_batch=search_product_fees_batch,
+                    token_provider=token_provider,
+                    job_id=st.session_state.get("discovery_job_id"),
+                    selected_suppliers=st.session_state.get(
+                        "discovery_selected_suppliers"
+                    ) or list(SUPPORTED_SUPPLIERS),
+                    progress=update_discovery_progress,
+                )
+                if state.get("checkpoint_compatibility") == "legacy_incompatible":
+                    st.session_state["discovery_result"] = {
+                        "state": state, "output_bytes": None,
+                    }
+                    st.session_state["discovery_status"] = "legacy_incompatible"
+                    st.session_state["ui_state"] = "discovery_result"
+                    st.rerun()
+                if state.get("status") == "qogita_refresh_failed":
+                    st.session_state["discovery_result"] = {
+                        "state": state, "output_bytes": None,
+                    }
+                    st.session_state["discovery_status"] = (
+                        "qogita_refresh_failed"
+                    )
+                    st.session_state["discovery_error"] = (
+                        "Aggiornamento Qogita non riuscito. La Discovery non "
+                        "è stata avviata per evitare valutazioni basate su "
+                        "prezzi o stock obsoleti."
+                    )
+                    st.session_state["ui_state"] = "discovery_result"
+                    st.rerun()
+                if state.get("status") == "supplier_preparation_failed":
+                    st.session_state["discovery_result"] = {
+                        "state": state, "output_bytes": None,
+                    }
+                    st.session_state["discovery_status"] = "supplier_preparation_failed"
+                    st.session_state["discovery_error"] = (
+                        "Nessun fornitore selezionato è disponibile. La ricerca "
+                        "Amazon non è stata avviata."
+                    )
+                    st.session_state["ui_state"] = "discovery_result"
+                    st.rerun()
+                output_name = f"glowup_scout_discovery_{state['job_id']}.xlsx"
+                output_path = write_discovery_excel(state, output_name)
+                with open(output_path, "rb") as output:
+                    output_bytes = output.read()
+                state["export_state"] = {
+                    "status": "generated", "file_name": output_name,
+                    "generated_at": state.get("completed_at") or state.get("updated_at"),
+                    "result_products": len(state.get("results") or []),
+                }
+                store.save(state)
+                st.session_state["discovery_result"] = {
+                    "state": state,
+                    "output_bytes": output_bytes,
+                }
+                st.session_state["discovery_status"] = state.get("status") or "completed"
+            except Exception:
+                logger.exception("DISCOVERY UI FAILED")
+                st.session_state["discovery_status"] = "error"
+                st.session_state["discovery_error"] = (
+                    "Discovery interrotta. Il checkpoint è stato conservato."
+                )
+            st.session_state["ui_state"] = "discovery_result"
+            st.rerun()
+
+elif ui_state == "discovery_result":
+    st.button(
+        "← Torna alla home", key="back_discovery_result_home",
+        type="secondary", on_click=return_to_home,
+    )
+    if st.session_state.get("discovery_status") in {
+        "error", "qogita_refresh_failed", "supplier_preparation_failed",
+    }:
+        ui_alert(st.session_state.get("discovery_error"), "error")
+        failed_result = st.session_state.get("discovery_result") or {}
+        failed_state = failed_result.get("state") or {}
+        snapshots = failed_state.get("qogita_snapshot_before") or {}
+        if snapshots:
+            st.caption(
+                "Ultimo aggiornamento Qogita: "
+                + max(str(value) for value in snapshots.values())
+            )
+    elif st.session_state.get("discovery_result"):
+        discovery_result = st.session_state["discovery_result"]
+        state = normalize_discovery_state(discovery_result["state"])
+        if state.get("checkpoint_compatibility") == "legacy_incompatible":
+            ui_alert(LEGACY_CHECKPOINT_MESSAGE, "warning")
+            st.stop()
+        result_count = len(state.get("results") or [])
+        ui_alert(
+            f"{result_count} opportunità trovate" if result_count
+            else "Nessuna opportunità con i filtri utilizzati.",
+            "success" if result_count else "info",
+        )
+        if st.button(
+            "← Nuova ricerca", key="new_discovery_search",
+            type="secondary", on_click=new_discovery_search,
+        ):
+            pass
+        snapshot_set = state.get("supplier_snapshot_set") or {}
+        warnings = state.get("supplier_warnings") or []
+        for warning in warnings:
+            ui_alert(warning, "warning")
+        if snapshot_set:
+            supplier_summary = []
+            for supplier in state.get("selected_suppliers") or []:
+                supplier_state = snapshot_set.get(supplier) or {}
+                if supplier_state.get("availability_status") == "available":
+                    supplier_summary.append(
+                        f"{supplier.upper()} · {supplier_state.get('products_count', 0)} prodotti"
+                    )
+                else:
+                    supplier_summary.append(f"{supplier.upper()} · non disponibile")
+            st.caption("  ·  ".join(supplier_summary))
+        snapshots = state.get("qogita_snapshot_after") or {}
+        refresh_status = state.get("qogita_refresh_status")
+        refresh_label = (
+            "Cache recente" if refresh_status == "cache_fresh"
+            else "Catalogo aggiornato"
+        )
+        if snapshots:
+            st.caption(
+                f"Qogita · {refresh_label} · "
+                f"{max(str(value) for value in snapshots.values())} · "
+                f"refresh {float(state.get('qogita_refresh_duration_seconds') or 0):.1f} s"
+            )
+        with st.container(border=True):
+            st.subheader("Riepilogo")
+            funnel = discovery_funnel_view(state)
+            summary_columns = st.columns(4)
+            summary_columns[0].metric(
+                "Prodotti analizzati", funnel["suppliers"]["supplier_products_total"]
+            )
+            summary_columns[1].metric(
+                "Pagine Amazon valutate", funnel["listings"]["amazon_listings_found"]
+            )
+            summary_columns[2].metric(
+                "Scenari acquisto", funnel["suppliers"]["supplier_scenarios_total"]
+            )
+            summary_columns[3].metric("Opportunità finali", result_count)
+            st.caption("Prodotti")
+            product_labels = [
+                ("Prodotti supplier", "supplier_products_total"),
+                ("Trovati Amazon", "amazon_found"),
+                ("Beauty valida", "beauty_valid"),
+                ("BSR nel range", "bsr_passed"),
+                ("Concorrenza valida", "competition_passed"),
+                ("Fee valide", "fee_valid"),
+                ("Opportunità", "final_opportunities"),
+            ]
+            for start in range(0, len(product_labels), 3):
+                columns = st.columns(3)
+                for column, (label, key) in zip(columns, product_labels[start:start + 3]):
+                    value = (
+                        funnel["suppliers"][key]
+                        if key == "supplier_products_total" else funnel["products"][key]
+                    )
+                    column.metric(label, value)
+            st.caption("Scenari acquisto")
+            scenario_labels = [
+                ("Disponibili", "supplier_scenarios_total"),
+                ("Valutati", "scenarios_evaluated"),
+                ("Margine minimo", "scenarios_margin_passed"),
+                ("Sotto soglia", "scenarios_margin_below_threshold"),
+            ]
+            columns = st.columns(4)
+            for column, (label, key) in zip(columns, scenario_labels):
+                value = (
+                    funnel["suppliers"][key]
+                    if key == "supplier_scenarios_total" else funnel["scenarios"][key]
+                )
+                column.metric(label, value)
+            if any(funnel["listings"].values()):
+                st.caption("Pagine Amazon")
+                listing_labels = [
+                    ("Trovate", "amazon_listings_found"),
+                    ("Compatibili", "compatible_listings"),
+                    ("Beauty", "beauty_listings"),
+                    ("BSR nel range", "bsr_passed_listings"),
+                    ("Concorrenza valida", "competition_passed_listings"),
+                    ("Fee valide", "fee_valid_listings"),
+                ]
+                columns = st.columns(3)
+                for index, (label, key) in enumerate(listing_labels):
+                    columns[index % 3].metric(label, funnel["listings"][key])
+                st.caption(
+                    "Compatibili = pagine Amazon riconosciute come compatibili "
+                    "con il prodotto supplier. Non indica opportunità finali."
+                )
+                st.caption("Combinazioni")
+                columns = st.columns(3)
+                for column, (label, key) in zip(columns, (
+                    ("Valutate", "combinations_evaluated"),
+                    ("Margine minimo", "combinations_margin_passed"),
+                    ("Sotto soglia", "combinations_margin_below_threshold"),
+                )):
+                    column.metric(label, funnel["combinations"][key])
+            st.caption(
+                "I prodotti esclusi dai filtri restano disponibili nell'Excel "
+                "per la verifica manuale."
+            )
+
+        for row in state["results"][:50]:
+            observation = row.get("amazon_observation") or row
+            recommended = recommended_scenario(row)
+            combination = recommended_combination(row)
+            if recommended is None or (
+                row.get("opportunity_combinations") and combination is None
+            ):
+                logger.error(
+                    "DISCOVERY RESULT INCOMPATIBLE | job_id=%s gtin=%s "
+                    "reason=missing_valid_recommended_scenario",
+                    state.get("job_id"), row.get("gtin"),
+                )
+                ui_alert(LEGACY_CHECKPOINT_MESSAGE, "warning")
+                continue
+            with st.container(border=True):
+                identity, metrics = st.columns([1.35, 2.65], vertical_alignment="top")
+                with identity:
+                    image_url = (
+                        row.get("image_url")
+                        or next((
+                            listing.get("main_image")
+                            for listing in row.get("amazon_listings") or []
+                            if listing.get("asin") == row.get("asin")
+                            and listing.get("main_image")
+                        ), None)
+                    )
+                    if image_url:
+                        st.image(image_url, width=120)
+                    st.markdown(
+                        f"**{html.escape(str(row.get('amazon_brand') or row.get('brand') or '—'))}**  \n"
+                        f"{html.escape(str(row.get('amazon_title') or row.get('title') or '—'))}  \n"
+                        f"GTIN {html.escape(str(row.get('gtin')))} · "
+                        f"{html.escape(str(recommended.get('supplier') or '—').upper())}  \n"
+                        f"{html.escape(str(recommended.get('scenario_label') or '—'))} · "
+                        f"{len(row.get('scenarios') or [])} scenari acquisto · "
+                        f"{len(row.get('amazon_listings') or [observation])} pagine Amazon"
+                    )
+                with metrics:
+                    columns = st.columns(4)
+                    columns[0].metric("Costo ivato", f"€ {recommended['cost_gross_unit_eur']:.2f}")
+                    columns[1].metric(
+                        "Requisito", scenario_requirement_label(recommended)
+                    )
+                    columns[2].metric("BSR Beauty", observation["bsr_beauty"])
+                    columns[3].metric("Margine", f"{recommended['margin_percent']:.2f}%")
+                    columns = st.columns(4)
+                    columns[0].metric("Prezzo riferimento", f"€ {observation['reference_price']:.2f}")
+                    columns[1].metric("Venditori FBA", observation["fba_sellers"])
+                    columns[2].metric("Venditori totali", observation["total_sellers"])
+                    columns[3].metric("Score", f"{recommended['score']} · {recommended['opportunity']}")
+                    if combination:
+                        st.caption(f"ASIN consigliato: {combination.get('asin')}")
+                    st.link_button(
+                        "Vedi offerte Amazon", row["amazon_offers_url"],
+                        type="primary", use_container_width=True,
+                    )
+                    detail_key = f"show_scenarios_{row.get('product_key') or row.get('gtin')}"
+                    if st.button(
+                        "Confronta scenari", key=f"toggle_{detail_key}",
+                        type="secondary", use_container_width=True,
+                    ):
+                        st.session_state[detail_key] = not st.session_state.get(detail_key, False)
+                    if st.session_state.get(detail_key, False):
+                        listing_rows = []
+                        for listing in row.get("amazon_listings") or []:
+                            listing_rows.append({
+                                "ASIN": listing.get("asin"),
+                                "Titolo": listing.get("title") or "—",
+                                "BSR Beauty": listing.get("bsr_beauty"),
+                                "Prezzo": listing.get("reference_price"),
+                                "Min FBA": listing.get("min_fba_price"),
+                                "Min FBM": listing.get("min_fbm_price"),
+                                "Venditori FBA": listing.get("fba_sellers"),
+                                "Venditori totali": listing.get("total_sellers"),
+                                "Stato": listing.get("evaluation_status") or listing.get("compatibility_status"),
+                            })
+                        if listing_rows:
+                            st.caption("Pagine Amazon")
+                            st.dataframe(
+                                listing_rows, hide_index=True,
+                                use_container_width=True,
+                            )
+                        scenario_by_id = {
+                            item.get("scenario_id"): item
+                            for item in row.get("scenarios") or []
+                        }
+                        combination_rows = []
+                        combination_values = row.get("opportunity_combinations") or []
+                        if not combination_values:
+                            combination_values = [{
+                                "scenario_id": scenario.get("scenario_id"),
+                                "asin": observation.get("asin"),
+                                "price_reference": observation.get("reference_price"),
+                                "margin_percent": scenario.get("margin_percent"),
+                                "score": scenario.get("score"),
+                                "opportunity": scenario.get("opportunity"),
+                                "economics": scenario.get("economics") or {},
+                            } for scenario in row.get("scenarios") or []]
+                        for item in combination_values:
+                            scenario = scenario_by_id.get(item.get("scenario_id"), {})
+                            economics = item.get("economics") or {}
+                            combination_rows.append({
+                                "Fornitore": str(scenario.get("supplier") or "").upper(),
+                                "Scenario": scenario.get("scenario_label") or "—",
+                                "ASIN": item.get("asin"),
+                                "Requisito": scenario_requirement_label(scenario),
+                                "Costo netto": f"€ {scenario['cost_net_unit_eur']:.2f}",
+                                "Costo ivato": f"€ {scenario['cost_gross_unit_eur']:.2f}",
+                                "Stock": (
+                                    str(scenario.get("stock"))
+                                    if scenario.get("stock") is not None else "—"
+                                ),
+                                "Warehouse": scenario.get("warehouse") or "—",
+                                "Disponibilità": (
+                                    scenario.get("availability_text")
+                                    or scenario.get("availability_status")
+                                    or "—"
+                                ),
+                                "Lead time": scenario.get("lead_time") or "—",
+                                "Prezzo Amazon": f"€ {item['price_reference']:.2f}",
+                                "Margine": f"{item['margin_percent']:.2f}%",
+                                "Prezzo 15%": f"€ {target_price(economics, 15):.2f}",
+                                "Prezzo 20%": f"€ {target_price(economics, 20):.2f}",
+                                "Prezzo 25%": f"€ {target_price(economics, 25):.2f}",
+                                "Score": item["score"],
+                                "Opportunità": item["opportunity"],
+                                "Ruolo": (
+                                    "Raccomandata" if combination and item.get("combination_id") == combination.get("combination_id") else ""
+                                ),
+                            })
+                        if combination_rows:
+                            st.caption("Combinazioni")
+                            st.dataframe(
+                                combination_rows, hide_index=True,
+                                use_container_width=True,
+                            )
+        filters_used = state.get("filters") or {}
+        st.caption(
+            "Filtri utilizzati · "
+            f"BSR {filters_used.get('bsr_min')}–{filters_used.get('bsr_max')} · "
+            f"FBA max {filters_used.get('max_fba_sellers')} · "
+            f"venditori max {filters_used.get('max_total_sellers')} · "
+            f"margine min {filters_used.get('minimum_margin')}% · "
+            f"fornitori {', '.join(state.get('selected_suppliers') or ['Qogita'])}"
+        )
+        if discovery_result.get("output_bytes") is not None:
+            st.download_button(
+                "Scarica Discovery Excel",
+                data=discovery_result["output_bytes"],
+                file_name=f"glowup_scout_discovery_{state['job_id']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary", use_container_width=True, on_click="ignore",
+            )
