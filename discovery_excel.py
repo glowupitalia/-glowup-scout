@@ -141,6 +141,12 @@ def _status_detail(product, listing, filters, final_product_keys):
                 "Nessun listing Amazon restituito per l'EAN", "—",
                 "catalog_status=not_found",
             )
+        if catalog_status == "catalog_incomplete":
+            return (
+                "catalog_incomplete", "Catalog Amazon incompleto",
+                "La paginazione Catalog non è stata completata; risultato non definitivo",
+                "Ripetere Catalog Items", "catalog_status=catalog_incomplete",
+            )
         return (
             "economics_unavailable", "Economia non disponibile",
             "Nessun listing Amazon valutabile", "—",

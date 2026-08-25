@@ -26,11 +26,16 @@ class AmazonBatchError(RuntimeError):
 
 
 class CatalogItems(list):
-    """Catalog response items plus identifiers intentionally not sent."""
+    """Catalog items plus non-persistent pagination diagnostics."""
 
-    def __init__(self, values=(), *, invalid_identifiers=()):
+    def __init__(
+        self, values=(), *, invalid_identifiers=(), incomplete_identifiers=(),
+        batch_diagnostics=(),
+    ):
         super().__init__(values)
         self.invalid_identifiers = tuple(invalid_identifiers)
+        self.incomplete_identifiers = tuple(incomplete_identifiers)
+        self.batch_diagnostics = tuple(batch_diagnostics)
 
 
 class RefreshingTokenProvider:
@@ -118,6 +123,41 @@ def classify_catalog_identifier(value):
     return {12: "UPC", 13: "EAN", 14: "GTIN"}.get(len(identifier))
 
 
+def _valid_gs1_check_digit(identifier):
+    """Validate UPC-12, EAN-13 and GTIN-14 using the GS1 check digit."""
+    value = str(identifier or "").strip()
+    if not value.isdigit() or len(value) not in {12, 13, 14}:
+        return False
+    body = value[:-1]
+    weighted = sum(
+        int(digit) * (3 if offset % 2 == 0 else 1)
+        for offset, digit in enumerate(reversed(body))
+    )
+    expected = (10 - weighted % 10) % 10
+    return expected == int(value[-1])
+
+
+def normalize_commercial_identifier(value, identifier_type=None):
+    """Return raw GS1 identity and a GTIN-14 comparison form when valid."""
+    raw_identifier = str(value or "").strip()
+    raw_type = str(identifier_type or "").strip().upper() or (
+        classify_catalog_identifier(raw_identifier)
+    )
+    expected_type = classify_catalog_identifier(raw_identifier)
+    canonical = None
+    if (
+        raw_type in {"EAN", "UPC", "GTIN"}
+        and expected_type == raw_type
+        and _valid_gs1_check_digit(raw_identifier)
+    ):
+        canonical = raw_identifier.zfill(14)
+    return {
+        "raw_identifier": raw_identifier,
+        "raw_type": raw_type or None,
+        "canonical_gtin14": canonical,
+    }
+
+
 def catalog_identifier_batches(identifiers):
     """Return homogeneous identifier batches while preserving input order."""
     if not identifiers or len(identifiers) > MAX_BATCH_SIZE:
@@ -152,32 +192,92 @@ def search_catalog_by_gtins_batch(
 ):
     batches, invalid = catalog_identifier_batches(gtins)
     items = []
+    incomplete_identifiers = []
+    batch_diagnostics = []
     for batch_number, (identifier_type, identifiers) in enumerate(batches, start=1):
-        params = {
+        search_params = {
             "marketplaceIds": marketplace_id,
             "identifiers": ",".join(identifiers),
             "identifiersType": identifier_type,
+            "pageSize": MAX_BATCH_SIZE,
             "includedData": (
                 "summaries,identifiers,salesRanks,productTypes,images,"
                 "relationships,attributes,classifications,dimensions"
             ),
         }
-        response = _request_with_retry(
-            "GET",
-            f"{EU_ENDPOINT}/catalog/2022-04-01/items",
-            token_provider=token_provider,
-            request_func=request_func,
-            sleep_func=sleep_func,
-            params=params,
-            headers={"Accept": "application/json"},
-            timeout=30,
-            job_id=job_id,
-            phase="catalog",
-        )
-        items.extend(response.json().get("items", []))
+        page_token = None
+        page_count = 0
+        items_received = 0
+        number_of_results = None
+        had_next_token = False
+        complete = True
+        error = None
+        while True:
+            params = dict(search_params)
+            if page_token:
+                params["pageToken"] = page_token
+            try:
+                response = _request_with_retry(
+                    "GET",
+                    f"{EU_ENDPOINT}/catalog/2022-04-01/items",
+                    token_provider=token_provider,
+                    request_func=request_func,
+                    sleep_func=sleep_func,
+                    params=params,
+                    headers={"Accept": "application/json"},
+                    timeout=30,
+                    job_id=job_id,
+                    phase="catalog",
+                )
+            except Exception as exc:
+                complete = False
+                error = type(exc).__name__
+                incomplete_identifiers.extend(identifiers)
+                logger.error(
+                    "DISCOVERY CATALOG INCOMPLETE | job_id=%s batch=%s "
+                    "page=%s identifier_type=%s error=%s",
+                    job_id, batch_number, page_count + 1, identifier_type, error,
+                )
+                break
+            payload = response.json()
+            page_count += 1
+            page_items = payload.get("items") or []
+            items_received += len(page_items)
+            items.extend(page_items)
+            if payload.get("numberOfResults") is not None:
+                number_of_results = payload.get("numberOfResults")
+            next_token = (payload.get("pagination") or {}).get("nextToken")
+            if not next_token:
+                break
+            had_next_token = True
+            page_token = next_token
+            sleep_func(CATALOG_BATCH_INTERVAL_SECONDS)
+        batch_diagnostics.append({
+            "identifier_type": identifier_type,
+            "page_count": page_count,
+            "number_of_results": number_of_results,
+            "had_next_token": had_next_token,
+            "items_received": items_received,
+            "input_identifier_count": len(identifiers),
+            "complete": complete,
+            "error": error,
+        })
         if batch_number < len(batches):
             sleep_func(CATALOG_BATCH_INTERVAL_SECONDS)
-    return CatalogItems(items, invalid_identifiers=invalid)
+    unique_items = {}
+    without_asin = []
+    for item in items:
+        asin = str(item.get("asin") or "").strip()
+        if asin:
+            unique_items.setdefault(asin, item)
+        else:
+            without_asin.append(item)
+    return CatalogItems(
+        [*unique_items.values(), *without_asin],
+        invalid_identifiers=invalid,
+        incomplete_identifiers=dict.fromkeys(incomplete_identifiers),
+        batch_diagnostics=batch_diagnostics,
+    )
 
 
 def _item_gtins(item):
@@ -188,6 +288,21 @@ def _item_gtins(item):
                 value = str(identifier.get("identifier") or "").strip()
                 if value:
                     values.add(value)
+    return values
+
+
+def _item_trade_identifiers(item):
+    values = []
+    for marketplace in item.get("identifiers") or []:
+        for identifier in marketplace.get("identifiers") or []:
+            identifier_type = str(identifier.get("identifierType") or "").upper()
+            if identifier_type not in {"EAN", "GTIN", "UPC"}:
+                continue
+            normalized = normalize_commercial_identifier(
+                identifier.get("identifier"), identifier_type
+            )
+            if normalized["raw_identifier"]:
+                values.append(normalized)
     return values
 
 
@@ -511,6 +626,7 @@ def _catalog_listing(item, canonical_ean, product=None, marketplace="IT"):
         compatibility_reason=reasons,
         diagnostics={
             "compatibility_evidence": evidence,
+            "commercial_identifiers": _item_trade_identifiers(item),
             **compatibility_diagnostics,
             "classification_records": item.get("classifications") or [],
             "dimensions": item.get("dimensions") or [],
@@ -520,10 +636,32 @@ def _catalog_listing(item, canonical_ean, product=None, marketplace="IT"):
 
 
 def correlate_catalog_items(gtins, items, products=None):
-    by_gtin = {gtin: [] for gtin in gtins}
+    input_identifiers = [str(gtin or "").strip() for gtin in gtins]
+    by_gtin = {gtin: [] for gtin in input_identifiers}
+    raw_inputs = set(input_identifiers)
+    canonical_inputs = {}
+    normalized_inputs = {}
+    for gtin in input_identifiers:
+        normalized = normalize_commercial_identifier(gtin)
+        normalized_inputs[gtin] = normalized
+        canonical = normalized.get("canonical_gtin14")
+        if canonical:
+            canonical_inputs.setdefault(canonical, set()).add(gtin)
     invalid_identifiers = set(getattr(items, "invalid_identifiers", ()))
+    incomplete_identifiers = set(getattr(items, "incomplete_identifiers", ()))
+    diagnostic_by_identifier = {}
+    for diagnostic in getattr(items, "batch_diagnostics", ()):
+        identifier_type = diagnostic.get("identifier_type")
+        for gtin in input_identifiers:
+            if classify_catalog_identifier(gtin) == identifier_type:
+                diagnostic_by_identifier[gtin] = dict(diagnostic)
     for item in items or []:
-        for gtin in _item_gtins(item) & set(gtins):
+        matched_inputs = _item_gtins(item) & raw_inputs
+        for normalized in _item_trade_identifiers(item):
+            canonical = normalized.get("canonical_gtin14")
+            if canonical:
+                matched_inputs.update(canonical_inputs.get(canonical, ()))
+        for gtin in matched_inputs:
             by_gtin[gtin].append(item)
     if isinstance(products, list):
         products = {
@@ -534,6 +672,10 @@ def correlate_catalog_items(gtins, items, products=None):
     result = {}
     for gtin, matches in by_gtin.items():
         identifier_type = classify_catalog_identifier(gtin)
+        correlation_diagnostics = {
+            **diagnostic_by_identifier.get(gtin, {}),
+            "input_identifier": normalized_inputs[gtin],
+        }
         if gtin in invalid_identifiers or identifier_type is None:
             result[gtin] = {
                 "status": "invalid_identifier",
@@ -542,10 +684,19 @@ def correlate_catalog_items(gtins, items, products=None):
             continue
         unique = {str(item.get("asin") or ""): item for item in matches if item.get("asin")}
         if not unique:
+            if gtin in incomplete_identifiers:
+                result[gtin] = {
+                    "status": "catalog_incomplete",
+                    "identifier_type": identifier_type,
+                    "listings": [],
+                    "diagnostics": correlation_diagnostics,
+                }
+                continue
             result[gtin] = {
                 "status": "not_found",
                 "identifier_type": identifier_type,
                 "listings": [],
+                "diagnostics": correlation_diagnostics,
             }
             continue
         listings = [
@@ -557,6 +708,7 @@ def correlate_catalog_items(gtins, items, products=None):
                 "status": "ambiguous", "identifier_type": identifier_type,
                 "listings": listings,
                 "ambiguity_reason": "supplier_identity_unavailable",
+                "diagnostics": correlation_diagnostics,
             }
             continue
         compatible = [
@@ -569,6 +721,7 @@ def correlate_catalog_items(gtins, items, products=None):
                 "identifier_type": identifier_type,
                 "listings": listings,
                 "ambiguity_reason": "no_compatible_listing",
+                "diagnostics": correlation_diagnostics,
             }
             continue
         primary = compatible[0]
@@ -583,6 +736,7 @@ def correlate_catalog_items(gtins, items, products=None):
             "product_type": primary.get("product_type"),
             "listings": listings,
             "compatible_listing_count": len(compatible),
+            "diagnostics": correlation_diagnostics,
         }
     return result
 

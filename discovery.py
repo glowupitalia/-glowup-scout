@@ -904,6 +904,7 @@ def _ensure_product_listings(product, catalog):
         "resolved" if compatible else catalog.get("status") or "not_found"
     )
     product["catalog_identifier_type"] = catalog.get("identifier_type")
+    product["catalog_diagnostics"] = dict(catalog.get("diagnostics") or {})
     if compatible:
         primary = compatible[0]
         product.update({

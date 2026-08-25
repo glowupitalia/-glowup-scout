@@ -34,6 +34,7 @@ from discovery_amazon import (
     catalog_identifier_batches,
     classify_catalog_identifier,
     correlate_catalog_items,
+    normalize_commercial_identifier,
     parse_item_offers_batch,
     search_catalog_by_gtins_batch,
 )
@@ -490,6 +491,149 @@ class AmazonDiscoveryTests(unittest.TestCase):
         self.assertEqual(mapping[eans[1]]["asin"], "B07QM9YV2S")
         self.assertEqual(mapping[eans[2]]["status"], "not_found")
         self.assertEqual(mapping[eans[2]]["identifier_type"], "EAN")
+
+    def test_catalog_paginates_twenty_identifiers_until_all_are_received(self):
+        eans = [f"8800000000{index:03d}" for index in range(20)]
+        calls = []
+
+        def item(asin, ean):
+            return {"asin": asin, "identifiers": [{"identifiers": [
+                {"identifierType": "EAN", "identifier": ean}
+            ]}]}
+
+        def request(_method, _url, **kwargs):
+            calls.append(dict(kwargs["params"]))
+            start = 10 if kwargs["params"].get("pageToken") else 0
+            payload = {
+                "items": [item(f"B{index:09d}", eans[index]) for index in range(start, start + 10)],
+                "numberOfResults": 20,
+            }
+            if start == 0:
+                payload["pagination"] = {"nextToken": "page-2"}
+            return FakeResponse(payload)
+
+        result = search_catalog_by_gtins_batch(
+            eans, RefreshingTokenProvider(lambda: "token"), marketplace_id="IT",
+            request_func=request, sleep_func=lambda _: None,
+        )
+        mapping = correlate_catalog_items(eans, result)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["pageSize"], 20)
+        self.assertNotIn("pageToken", calls[0])
+        self.assertEqual(calls[1]["pageToken"], "page-2")
+        self.assertTrue(all(row["status"] == "resolved" for row in mapping.values()))
+        self.assertEqual(result.batch_diagnostics[0], {
+            "identifier_type": "EAN", "page_count": 2,
+            "number_of_results": 20, "had_next_token": True,
+            "items_received": 20, "input_identifier_count": 20,
+            "complete": True, "error": None,
+        })
+
+    def test_catalog_supports_three_pages_and_deduplicates_asins(self):
+        ean = "8809532221523"
+        payloads = [
+            {"items": [{"asin": "B000000001", "identifiers": [{"identifiers": [
+                {"identifierType": "EAN", "identifier": ean}
+            ]}]}], "pagination": {"nextToken": "two"}},
+            {"items": [{"asin": "B000000001", "identifiers": [{"identifiers": [
+                {"identifierType": "EAN", "identifier": ean}
+            ]}]}], "pagination": {"nextToken": "three"}},
+            {"items": [{"asin": "B000000002", "identifiers": [{"identifiers": [
+                {"identifierType": "EAN", "identifier": ean}
+            ]}]}]},
+        ]
+
+        result = search_catalog_by_gtins_batch(
+            [ean], RefreshingTokenProvider(lambda: "token"), marketplace_id="IT",
+            request_func=lambda *_args, **_kwargs: FakeResponse(payloads.pop(0)),
+            sleep_func=lambda _: None,
+        )
+        mapping = correlate_catalog_items([ean], result)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(mapping[ean]["status"], "ambiguous")
+        self.assertEqual(
+            {row["asin"] for row in mapping[ean]["listings"]},
+            {"B000000001", "B000000002"},
+        )
+        self.assertEqual(result.batch_diagnostics[0]["page_count"], 3)
+
+    def test_catalog_retries_a_transient_second_page(self):
+        ean = "8809532221523"
+        calls = []
+
+        def request(_method, _url, **kwargs):
+            calls.append(kwargs["params"].get("pageToken"))
+            if len(calls) == 1:
+                return FakeResponse({"items": [], "pagination": {"nextToken": "two"}})
+            if len(calls) == 2:
+                return FakeResponse(status=503)
+            return FakeResponse({"items": [{"asin": "B000000001", "identifiers": [{
+                "identifiers": [{"identifierType": "EAN", "identifier": ean}]
+            }]}]})
+
+        result = search_catalog_by_gtins_batch(
+            [ean], RefreshingTokenProvider(lambda: "token"), marketplace_id="IT",
+            request_func=request, sleep_func=lambda _: None,
+        )
+        self.assertEqual(calls, [None, "two", "two"])
+        self.assertEqual(correlate_catalog_items([ean], result)[ean]["status"], "resolved")
+
+    def test_failed_later_page_is_incomplete_not_not_found(self):
+        eans = ["8809532221523", "8809532220748"]
+        calls = []
+
+        def request(_method, _url, **kwargs):
+            calls.append(kwargs["params"].get("pageToken"))
+            if calls[0] is None and len(calls) == 1:
+                return FakeResponse({"items": [], "pagination": {"nextToken": "two"}})
+            return FakeResponse(status=503)
+
+        result = search_catalog_by_gtins_batch(
+            eans, RefreshingTokenProvider(lambda: "token"), marketplace_id="IT",
+            request_func=request, sleep_func=lambda _: None,
+        )
+        mapping = correlate_catalog_items(eans, result)
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(all(row["status"] == "catalog_incomplete" for row in mapping.values()))
+        self.assertFalse(result.batch_diagnostics[0]["complete"])
+        self.assertEqual(result.batch_diagnostics[0]["page_count"], 1)
+
+    def test_no_next_token_is_one_page_and_not_found_is_final(self):
+        ean = "8809532221523"
+        result = search_catalog_by_gtins_batch(
+            [ean], RefreshingTokenProvider(lambda: "token"), marketplace_id="IT",
+            request_func=lambda *_args, **_kwargs: FakeResponse({"items": []}),
+            sleep_func=lambda _: None,
+        )
+        mapping = correlate_catalog_items([ean], result)
+        self.assertEqual(mapping[ean]["status"], "not_found")
+        self.assertEqual(mapping[ean]["diagnostics"]["page_count"], 1)
+        self.assertFalse(mapping[ean]["diagnostics"]["had_next_token"])
+
+    def test_gs1_identifiers_share_a_canonical_gtin14(self):
+        ean = normalize_commercial_identifier("8809532221523", "EAN")
+        gtin = normalize_commercial_identifier("08809532221523", "GTIN")
+        upc = normalize_commercial_identifier("012345678905", "UPC")
+        upc_gtin = normalize_commercial_identifier("00012345678905", "GTIN")
+        self.assertEqual(ean["canonical_gtin14"], "08809532221523")
+        self.assertEqual(ean["canonical_gtin14"], gtin["canonical_gtin14"])
+        self.assertEqual(upc["canonical_gtin14"], upc_gtin["canonical_gtin14"])
+        invalid = normalize_commercial_identifier("8809532221524", "EAN")
+        self.assertIsNone(invalid["canonical_gtin14"])
+        self.assertEqual(invalid["raw_identifier"], "8809532221524")
+
+    def test_zero_padded_gtin_correlates_and_preserves_raw_identifier(self):
+        ean = "8809532221523"
+        raw_gtin = "08809532221523"
+        item = {"asin": "B09ZB7GDJL", "identifiers": [{"identifiers": [
+            {"identifierType": "GTIN", "identifier": raw_gtin}
+        ]}]}
+        mapping = correlate_catalog_items([ean], [item])[ean]
+        self.assertEqual(mapping["status"], "resolved")
+        identifier = mapping["listings"][0]["diagnostics"]["commercial_identifiers"][0]
+        self.assertEqual(identifier["raw_identifier"], raw_gtin)
+        self.assertEqual(identifier["raw_type"], "GTIN")
+        self.assertEqual(identifier["canonical_gtin14"], raw_gtin)
 
     def test_invalid_identifier_is_not_sent_and_is_diagnostic(self):
         calls = []
@@ -1437,6 +1581,36 @@ class MultiScenarioDiscoveryTests(unittest.TestCase):
             self.assertEqual(state["status"], "completed")
             self.assertEqual(state["funnel"]["catalog_invalid_identifier"], 1)
             self.assertEqual(state["funnel"]["amazon_found"], 1)
+
+    def test_catalog_incomplete_is_persisted_without_false_not_found(self):
+        diagnostics = {
+            "page_count": 1, "number_of_results": 20,
+            "had_next_token": True, "items_received": 10,
+            "input_identifier_count": 20, "complete": False,
+            "error": "AmazonBatchError",
+        }
+
+        def catalog(gtins, _job_id):
+            return {
+                gtin: {
+                    "status": "catalog_incomplete", "identifier_type": "EAN",
+                    "listings": [], "diagnostics": diagnostics,
+                }
+                for gtin in gtins
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = DiscoveryCheckpointStore(directory)
+            state = self.run_pipeline(
+                directory, checkpoint_store=store, catalog_batch=catalog,
+            )
+            persisted = store.load(state["job_id"])
+        candidate = persisted["candidates"][0]
+        self.assertEqual(candidate["catalog_status"], "catalog_incomplete")
+        self.assertNotEqual(candidate["catalog_status"], "not_found")
+        self.assertEqual(candidate["catalog_diagnostics"]["page_count"], 1)
+        self.assertFalse(candidate["catalog_diagnostics"]["complete"])
+        self.assertEqual(state["funnel"]["amazon_found"], 0)
 
     def test_bsr_and_competition_filters_run_before_fees(self):
         fees_seen = []
