@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -24,6 +25,24 @@ from product_fees import search_product_fees_batch
 
 
 logger = logging.getLogger(__name__)
+
+
+def _export_metadata(path: Path, result: dict) -> dict:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    details = path.stat()
+    return {
+        "status": "completed",
+        "valid": True,
+        "job_id": result["job_id"],
+        "file_name": path.name,
+        "file_size": details.st_size,
+        "sha256": digest.hexdigest(),
+        "generated_at": result.get("completed_at") or result.get("updated_at"),
+        "result_products": len(result.get("results") or []),
+    }
 
 
 def load_env(path: Path = PROJECT_ROOT / ".env"):
@@ -96,11 +115,7 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
         if result.get("status") == "completed":
             output_path = PROJECT_ROOT / "data" / "discovery_jobs" / f"{job_id}.xlsx"
             write_discovery_excel(result, str(output_path))
-            result["export_state"] = {
-                "status": "generated", "file_name": output_path.name,
-                "generated_at": result.get("completed_at") or result.get("updated_at"),
-                "result_products": len(result.get("results") or []),
-            }
+            result["export_state"] = _export_metadata(output_path, result)
         else:
             result["export_state"] = {
                 "status": "pending", "generated_at": None,

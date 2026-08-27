@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import os
 import re
 import smtplib
@@ -10,12 +11,13 @@ import sqlite3
 import ssl
 import stat
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from purchase_scenarios import recommended_combination, recommended_scenario
@@ -34,8 +36,12 @@ EMAIL_CONFIG_KEYS = {
     "GLOWUP_SCOUT_SMTP_USERNAME",
     "GLOWUP_SCOUT_SMTP_SECURITY",
     "GLOWUP_SCOUT_SMTP_USE_TLS",
+    "GLOWUP_SCOUT_EMAIL_MAX_ATTACHMENT_MB",
 }
 SMTP_SECURITY_MODES = {"ssl", "starttls", "none"}
+DEFAULT_MAX_ATTACHMENT_MB = 15.0
+XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+DEFAULT_ATTACHMENT_ROOT = Path(__file__).resolve().parent / "data/discovery_jobs"
 ROME = ZoneInfo("Europe/Rome")
 DISCOVERY_COMPLETED = "discovery_completed"
 DISCOVERY_COMPLETED_ZERO_RESULTS = "discovery_completed_zero_results"
@@ -68,6 +74,13 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
 CREATE INDEX IF NOT EXISTS idx_notification_outbox_updated
 ON notification_outbox(updated_at DESC);
 """
+
+OUTBOX_ATTACHMENT_COLUMNS = {
+    "attachment_name": "TEXT",
+    "attachment_size": "INTEGER",
+    "attachment_status": "TEXT NOT NULL DEFAULT 'none'",
+    "attachment_error": "TEXT",
+}
 
 
 def utc_now() -> str:
@@ -135,6 +148,7 @@ class EmailConfig:
     smtp_password: str | None
     smtp_security: str
     timeout_seconds: float = 20.0
+    max_attachment_mb: float = DEFAULT_MAX_ATTACHMENT_MB
 
     @classmethod
     def from_env(cls, environment: dict[str, str] | None = None):
@@ -143,6 +157,16 @@ class EmailConfig:
             port = int(values.get("GLOWUP_SCOUT_SMTP_PORT", "587"))
         except (TypeError, ValueError):
             port = 587
+        try:
+            max_attachment_mb = max(
+                0.0,
+                float(values.get(
+                    "GLOWUP_SCOUT_EMAIL_MAX_ATTACHMENT_MB",
+                    str(DEFAULT_MAX_ATTACHMENT_MB),
+                )),
+            )
+        except (TypeError, ValueError):
+            max_attachment_mb = DEFAULT_MAX_ATTACHMENT_MB
         return cls(
             enabled=_env_bool(values.get("GLOWUP_SCOUT_EMAIL_ENABLED")),
             recipient=(
@@ -156,6 +180,7 @@ class EmailConfig:
             ).strip() or None,
             smtp_password=values.get("GLOWUP_SCOUT_SMTP_PASSWORD") or None,
             smtp_security=_smtp_security(values),
+            max_attachment_mb=max_attachment_mb,
         )
 
     @classmethod
@@ -207,6 +232,31 @@ class NotificationContent:
     html: str
 
 
+@dataclass(frozen=True)
+class EmailAttachment:
+    path: Path
+    name: str
+    size: int
+    mime_type: str = XLSX_MIME_TYPE
+
+
+@dataclass(frozen=True)
+class AttachmentDecision:
+    status: str
+    attachment: EmailAttachment | None = None
+    name: str | None = None
+    size: int | None = None
+    error: str | None = None
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "attachment_name": self.name,
+            "attachment_size": self.size,
+            "attachment_status": self.status,
+            "attachment_error": sanitize_text(self.error) if self.error else None,
+        }
+
+
 class NotificationOutbox:
     """SQLite outbox using at-most-once reservation for each logical event."""
 
@@ -224,20 +274,43 @@ class NotificationOutbox:
     def initialize(self):
         with self._connect() as connection:
             connection.executescript(OUTBOX_SCHEMA)
+            existing = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(notification_outbox)"
+                ).fetchall()
+            }
+            for name, declaration in OUTBOX_ATTACHMENT_COLUMNS.items():
+                if name not in existing:
+                    connection.execute(
+                        f"ALTER TABLE notification_outbox ADD COLUMN {name} {declaration}"
+                    )
+            connection.commit()
 
     @staticmethod
     def _row(row):
         return dict(row) if row is not None else None
 
-    def reserve(self, entity_id: str, event_type: str, recipient: str) -> bool:
+    def reserve(
+        self, entity_id: str, event_type: str, recipient: str,
+        attachment_metadata: Mapping[str, Any] | None = None,
+    ) -> bool:
         self.initialize()
         now = utc_now()
+        metadata = dict(attachment_metadata or {})
         with self._connect() as connection:
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO notification_outbox
-                   (entity_id,event_type,channel,status,recipient,created_at,updated_at)
-                   VALUES (?,?, 'email','pending',?,?,?)""",
-                (entity_id, event_type, recipient, now, now),
+                   (entity_id,event_type,channel,status,recipient,created_at,updated_at,
+                    attachment_name,attachment_size,attachment_status,attachment_error)
+                   VALUES (?,?, 'email','pending',?,?,?,?,?,?,?)""",
+                (
+                    entity_id, event_type, recipient, now, now,
+                    metadata.get("attachment_name"),
+                    metadata.get("attachment_size"),
+                    metadata.get("attachment_status") or "none",
+                    sanitize_text(metadata.get("attachment_error"))
+                    if metadata.get("attachment_error") else None,
+                ),
             )
             connection.commit()
             return cursor.rowcount == 1
@@ -273,6 +346,24 @@ class NotificationOutbox:
             )
             connection.commit()
 
+    def update_attachment(
+        self, entity_id: str, event_type: str, metadata: Mapping[str, Any],
+    ):
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE notification_outbox SET attachment_name=?,attachment_size=?,
+                   attachment_status=?,attachment_error=?,updated_at=?
+                   WHERE entity_id=? AND event_type=? AND channel='email'""",
+                (
+                    metadata.get("attachment_name"), metadata.get("attachment_size"),
+                    metadata.get("attachment_status") or "none",
+                    sanitize_text(metadata.get("attachment_error"))
+                    if metadata.get("attachment_error") else None,
+                    utc_now(), entity_id, event_type,
+                ),
+            )
+            connection.commit()
+
     def get(self, entity_id: str, event_type: str | None = None):
         self.initialize()
         query = "SELECT * FROM notification_outbox WHERE entity_id=?"
@@ -293,6 +384,114 @@ def sanitize_text(value: object, limit: int = 500) -> str:
     )
     text = re.sub(r"https?://[^\s?]+\?\S+", "[URL REDACTED]", text)
     return text[:limit]
+
+
+def _stream_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _is_safe_xlsx(path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(path) as workbook:
+            names = set(workbook.namelist())
+            return (
+                "[Content_Types].xml" in names
+                and "xl/workbook.xml" in names
+                and workbook.testzip() is None
+            )
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def prepare_discovery_attachment(
+    state: Mapping[str, Any], runtime: Mapping[str, Any] | None, *,
+    max_attachment_mb: float = DEFAULT_MAX_ATTACHMENT_MB,
+    allowed_roots: Sequence[str | Path] | None = None,
+) -> AttachmentDecision:
+    """Validate the exact final export bound to this Discovery job."""
+    event_type = discovery_terminal_event(dict(state), runtime=dict(runtime or {}))
+    if event_type == DISCOVERY_FAILED:
+        return AttachmentDecision("none")
+    if event_type not in {DISCOVERY_COMPLETED, DISCOVERY_COMPLETED_ZERO_RESULTS}:
+        return AttachmentDecision("none")
+
+    job_id = str(state.get("job_id") or "")
+    runtime = dict(runtime or {})
+    export_state = dict(state.get("export_state") or {})
+    if not job_id or str(runtime.get("job_id") or "") != job_id:
+        return AttachmentDecision("invalid", error="Export non correlato al job")
+    if str(runtime.get("status") or "") != "completed":
+        return AttachmentDecision("invalid", error="Job runtime non completato")
+    if export_state.get("job_id") and str(export_state["job_id"]) != job_id:
+        return AttachmentDecision("invalid", error="Export state non coerente con job_id")
+    if str(export_state.get("status") or "") not in {"completed", "valid", "generated"}:
+        return AttachmentDecision("unavailable", error="Export finale non disponibile")
+    raw_path = runtime.get("export_path")
+    if not raw_path:
+        return AttachmentDecision("unavailable", error="Export path assente")
+
+    candidate = Path(str(raw_path)).expanduser()
+    expected_name = str(export_state.get("file_name") or "")
+    if candidate.is_symlink():
+        return AttachmentDecision("invalid", error="Symlink non consentito")
+    if candidate.suffix.lower() != ".xlsx" or candidate.name.endswith(".part"):
+        return AttachmentDecision("invalid", error="Formato export non valido")
+    if candidate.stem != job_id or (expected_name and candidate.name != expected_name):
+        return AttachmentDecision("invalid", error="Export non coerente con job_id")
+    try:
+        resolved = candidate.resolve(strict=True)
+        details = resolved.stat()
+    except OSError:
+        return AttachmentDecision("unavailable", error="File export non disponibile")
+    if not stat.S_ISREG(details.st_mode) or details.st_size <= 0:
+        return AttachmentDecision("invalid", size=max(0, details.st_size), error="File export non valido")
+
+    roots = [Path(root).expanduser().resolve() for root in (allowed_roots or [DEFAULT_ATTACHMENT_ROOT])]
+    if not any(resolved.is_relative_to(root) for root in roots):
+        return AttachmentDecision("invalid", size=details.st_size, error="Export fuori directory consentita")
+    if not _is_safe_xlsx(resolved):
+        return AttachmentDecision("invalid", size=details.st_size, error="Workbook XLSX non valido")
+    expected_size = export_state.get("file_size")
+    if expected_size is not None and int(expected_size) != details.st_size:
+        return AttachmentDecision("invalid", size=details.st_size, error="Dimensione export incoerente")
+    expected_checksum = str(export_state.get("sha256") or "")
+    if expected_checksum and _stream_sha256(resolved) != expected_checksum:
+        return AttachmentDecision("invalid", size=details.st_size, error="Checksum export incoerente")
+
+    completed_at = _parse_timestamp(state.get("completed_at") or state.get("updated_at"))
+    date_part = (completed_at or datetime.now(timezone.utc)).astimezone(ROME).strftime("%Y-%m-%d")
+    friendly_name = f"GlowUp-Scout-Discovery-{date_part}-{job_id[:8]}.xlsx"
+    limit_bytes = int(max(0.0, float(max_attachment_mb)) * 1024 * 1024)
+    if details.st_size > limit_bytes:
+        return AttachmentDecision(
+            "skipped_too_large", name=friendly_name, size=details.st_size,
+            error="File Excel oltre il limite email configurato",
+        )
+    attachment = EmailAttachment(resolved, friendly_name, details.st_size)
+    return AttachmentDecision("attached", attachment, friendly_name, details.st_size)
+
+
+def _content_with_attachment_note(
+    content: NotificationContent, decision: AttachmentDecision,
+) -> NotificationContent:
+    notes = {
+        "attached": "Il file Excel completo della Discovery è allegato a questa email.",
+        "skipped_too_large": "File Excel non allegato perché supera il limite email configurato.",
+        "unavailable": "File Excel non allegato perché non disponibile.",
+        "invalid": "File Excel non allegato perché non ha superato la validazione.",
+    }
+    note = notes.get(decision.status)
+    if not note:
+        return content
+    return NotificationContent(
+        content.event_type, content.subject,
+        content.text.rstrip() + f"\n\n{note}\n",
+        content.html.replace("</body>", f"<p>{html.escape(note)}</p></body>"),
+    )
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -528,7 +727,10 @@ class SMTPEmailTransport:
         return message["Message-ID"]
 
 
-def build_email(content: NotificationContent, config: EmailConfig, entity_id: str):
+def build_email(
+    content: NotificationContent, config: EmailConfig, entity_id: str,
+    attachment: EmailAttachment | None = None,
+):
     message = EmailMessage()
     message["Subject"] = content.subject
     message["From"] = config.sender
@@ -538,6 +740,15 @@ def build_email(content: NotificationContent, config: EmailConfig, entity_id: st
     message["Message-ID"] = make_msgid(idstring=f"{safe_entity}.{content.event_type}")
     message.set_content(content.text)
     message.add_alternative(content.html, subtype="html")
+    if attachment:
+        with attachment.path.open("rb") as source:
+            payload = source.read(attachment.size + 1)
+        if len(payload) != attachment.size:
+            raise OSError("Attachment changed after validation")
+        maintype, subtype = attachment.mime_type.split("/", 1)
+        message.add_attachment(
+            payload, maintype=maintype, subtype=subtype, filename=attachment.name,
+        )
     return message
 
 
@@ -546,6 +757,7 @@ def send_discovery_terminal_notification(
     runtime: dict[str, Any] | None = None, config: EmailConfig | None = None,
     transport=None, max_attempts: int = 3,
     sleep_func: Callable[[float], None] = time.sleep,
+    allowed_attachment_roots: Sequence[str | Path] | None = None,
 ):
     """Attempt one terminal notification without ever changing job outcome."""
     event_type = discovery_terminal_event(state, runtime=runtime)
@@ -554,11 +766,19 @@ def send_discovery_terminal_notification(
     render_state = dict(state)
     if runtime and "resumable" in runtime:
         render_state["resumable"] = bool(runtime["resumable"])
-    content = render_discovery_notification(render_state, event_type)
+    config = config or EmailConfig.from_runtime()
+    decision = prepare_discovery_attachment(
+        render_state, runtime, max_attachment_mb=config.max_attachment_mb,
+        allowed_roots=allowed_attachment_roots,
+    )
+    content = _content_with_attachment_note(
+        render_discovery_notification(render_state, event_type), decision,
+    )
     return send_notification(
         content, entity_id=str(state.get("job_id") or ""),
         database_path=database_path, config=config, transport=transport,
         max_attempts=max_attempts, sleep_func=sleep_func,
+        attachment=decision.attachment, attachment_metadata=decision.metadata(),
     )
 
 
@@ -566,13 +786,17 @@ def send_notification(
     content: NotificationContent, *, entity_id: str, database_path: str | Path,
     config: EmailConfig | None = None, transport=None, max_attempts: int = 3,
     sleep_func: Callable[[float], None] = time.sleep,
+    attachment: EmailAttachment | None = None,
+    attachment_metadata: Mapping[str, Any] | None = None,
 ):
     """Deliver any rendered email event through the shared persistent outbox."""
     config = config or EmailConfig.from_runtime()
     outbox = NotificationOutbox(database_path)
     if not entity_id:
         return None
-    if not outbox.reserve(entity_id, content.event_type, config.recipient):
+    if not outbox.reserve(
+        entity_id, content.event_type, config.recipient, attachment_metadata,
+    ):
         return outbox.get(entity_id, content.event_type)
     missing = config.missing_requirements()
     if missing:
@@ -582,7 +806,30 @@ def send_notification(
         )
         return outbox.get(entity_id, content.event_type)
 
-    message = build_email(content, config, entity_id)
+    try:
+        message = build_email(content, config, entity_id, attachment)
+    except Exception as exc:
+        if attachment is None:
+            outbox.mark_terminal(
+                entity_id, content.event_type, "failed",
+                f"Preparazione email fallita ({type(exc).__name__})",
+            )
+            return outbox.get(entity_id, content.event_type)
+        attached_note = "Il file Excel completo della Discovery è allegato a questa email."
+        invalid_note = "File Excel non allegato perché non è stato possibile leggerlo."
+        fallback_content = NotificationContent(
+            content.event_type, content.subject,
+            content.text.replace(attached_note, invalid_note),
+            content.html.replace(attached_note, invalid_note),
+        )
+        fallback_metadata = {
+            "attachment_name": attachment.name,
+            "attachment_size": attachment.size,
+            "attachment_status": "invalid",
+            "attachment_error": f"Lettura allegato fallita ({type(exc).__name__})",
+        }
+        outbox.update_attachment(entity_id, content.event_type, fallback_metadata)
+        message = build_email(fallback_content, config, entity_id)
     sender = transport or SMTPEmailTransport(config)
     last_error = ""
     effective_attempts = max(1, min(int(max_attempts), 3))

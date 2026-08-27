@@ -1,19 +1,26 @@
+import hashlib
+import os
 import sqlite3
 import stat
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
+
+from openpyxl import Workbook
 
 from notifications import (
     DEFAULT_RECIPIENT,
     DISCOVERY_COMPLETED,
     DISCOVERY_COMPLETED_ZERO_RESULTS,
     DISCOVERY_FAILED,
+    EmailAttachment,
     EmailConfig,
     NotificationOutbox,
     SMTPEmailTransport,
     discovery_terminal_event,
+    prepare_discovery_attachment,
     render_discovery_notification,
     send_discovery_terminal_notification,
 )
@@ -83,6 +90,25 @@ class NotificationTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def export_for(self, state, *, root=None):
+        root = Path(root or self.temporary.name) / "exports"
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{state['job_id']}.xlsx"
+        workbook = Workbook()
+        workbook.active["A1"] = "Glow Up Scout"
+        workbook.save(path)
+        payload = path.read_bytes()
+        state["export_state"] = {
+            "status": "completed", "valid": True, "job_id": state["job_id"],
+            "file_name": path.name, "file_size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        runtime = {
+            "job_id": state["job_id"], "status": "completed",
+            "resumable": False, "export_path": str(path),
+        }
+        return path, runtime, root
+
     def test_completed_sends_one_multipart_email_to_recipient(self):
         transport = FakeTransport()
         row = send_discovery_terminal_notification(
@@ -95,6 +121,146 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(len(transport.messages), 1)
         self.assertTrue(transport.messages[0].is_multipart())
         self.assertEqual(transport.messages[0]["To"], DEFAULT_RECIPIENT)
+
+    def test_completed_with_valid_xlsx_attaches_final_job_export(self):
+        state = completed_state()
+        path, runtime, root = self.export_for(state)
+        transport = FakeTransport()
+        row = send_discovery_terminal_notification(
+            state, database_path=self.database, runtime=runtime,
+            config=configured_email(), transport=transport,
+            allowed_attachment_roots=[root],
+        )
+        attachments = list(transport.messages[0].iter_attachments())
+        self.assertEqual(row["attachment_status"], "attached")
+        self.assertEqual(row["attachment_size"], path.stat().st_size)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get_content_type(), (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ))
+        self.assertEqual(
+            attachments[0].get_filename(),
+            "GlowUp-Scout-Discovery-2026-08-27-job-1.xlsx",
+        )
+        self.assertIn("Excel completo", transport.messages[0].get_body(preferencelist=("plain",)).get_content())
+
+    def test_zero_results_with_valid_xlsx_is_attached(self):
+        state = completed_state(False)
+        _, runtime, root = self.export_for(state)
+        transport = FakeTransport()
+        row = send_discovery_terminal_notification(
+            state, database_path=self.database, runtime=runtime,
+            config=configured_email(), transport=transport,
+            allowed_attachment_roots=[root],
+        )
+        self.assertEqual(row["attachment_status"], "attached")
+        self.assertEqual(len(list(transport.messages[0].iter_attachments())), 1)
+
+    def test_failed_discovery_never_attaches_partial_workbook(self):
+        state = completed_state(False)
+        _, runtime, root = self.export_for(state)
+        state.update({"status": "failed", "phase": "failed", "errors": [{"message": "boom"}]})
+        runtime.update({"status": "failed", "resumable": False})
+        transport = FakeTransport()
+        row = send_discovery_terminal_notification(
+            state, database_path=self.database, runtime=runtime,
+            config=configured_email(), transport=transport,
+            allowed_attachment_roots=[root],
+        )
+        self.assertEqual(row["attachment_status"], "none")
+        self.assertEqual(list(transport.messages[0].iter_attachments()), [])
+
+    def test_missing_xlsx_sends_summary_with_unavailable_metadata(self):
+        state = completed_state()
+        root = Path(self.temporary.name) / "exports"
+        runtime = {
+            "job_id": state["job_id"], "status": "completed", "resumable": False,
+            "export_path": str(root / f"{state['job_id']}.xlsx"),
+        }
+        state["export_state"] = {
+            "status": "completed", "job_id": state["job_id"],
+            "file_name": f"{state['job_id']}.xlsx",
+        }
+        transport = FakeTransport()
+        row = send_discovery_terminal_notification(
+            state, database_path=self.database, runtime=runtime,
+            config=configured_email(), transport=transport,
+            allowed_attachment_roots=[root],
+        )
+        self.assertEqual((row["status"], row["attachment_status"]), ("sent", "unavailable"))
+        self.assertEqual(list(transport.messages[0].iter_attachments()), [])
+
+    def test_invalid_workbook_and_path_traversal_send_without_attachment(self):
+        for index, outside in enumerate((False, True)):
+            state = completed_state()
+            state["job_id"] = f"invalid-{index}"
+            allowed = Path(self.temporary.name) / f"allowed-{index}"
+            actual = (Path(self.temporary.name) / "outside") if outside else allowed
+            actual.mkdir(parents=True, exist_ok=True)
+            path = actual / f"{state['job_id']}.xlsx"
+            path.write_bytes(b"not-an-xlsx" if not outside else b"outside")
+            state["export_state"] = {
+                "status": "completed", "job_id": state["job_id"],
+                "file_name": path.name,
+            }
+            runtime = {
+                "job_id": state["job_id"], "status": "completed",
+                "resumable": False, "export_path": str(path),
+            }
+            transport = FakeTransport()
+            row = send_discovery_terminal_notification(
+                state, database_path=self.database, runtime=runtime,
+                config=configured_email(), transport=transport,
+                allowed_attachment_roots=[allowed],
+            )
+            self.assertEqual((row["status"], row["attachment_status"]), ("sent", "invalid"))
+            self.assertEqual(list(transport.messages[0].iter_attachments()), [])
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink unavailable")
+    def test_arbitrary_symlink_is_rejected(self):
+        state = completed_state()
+        target, runtime, root = self.export_for(state)
+        link = root / "link.xlsx"
+        link.symlink_to(target)
+        runtime["export_path"] = str(link)
+        state["export_state"]["file_name"] = link.name
+        decision = prepare_discovery_attachment(
+            state, runtime, allowed_roots=[root],
+        )
+        self.assertEqual(decision.status, "invalid")
+
+    def test_attachment_over_limit_is_skipped_without_failing_mail(self):
+        state = completed_state()
+        path, runtime, root = self.export_for(state)
+        config = replace(configured_email(), max_attachment_mb=0.000001)
+        transport = FakeTransport()
+        row = send_discovery_terminal_notification(
+            state, database_path=self.database, runtime=runtime,
+            config=config, transport=transport, allowed_attachment_roots=[root],
+        )
+        self.assertEqual((row["status"], row["attachment_status"]), ("sent", "skipped_too_large"))
+        self.assertEqual(row["attachment_size"], path.stat().st_size)
+        body = transport.messages[0].get_body(preferencelist=("plain",)).get_content()
+        self.assertIn("supera il limite", body)
+
+    def test_attachment_retry_reuses_metadata_and_does_not_duplicate_notification(self):
+        state = completed_state()
+        _, runtime, root = self.export_for(state)
+        transport = FakeTransport(failures=1)
+        first = send_discovery_terminal_notification(
+            state, database_path=self.database, runtime=runtime,
+            config=configured_email(), transport=transport,
+            sleep_func=lambda _: None, allowed_attachment_roots=[root],
+        )
+        second = send_discovery_terminal_notification(
+            state, database_path=self.database, runtime=runtime,
+            config=configured_email(), transport=transport,
+            allowed_attachment_roots=[root],
+        )
+        self.assertEqual((first["status"], first["attempt_count"]), ("sent", 2))
+        self.assertEqual(first["attachment_status"], "attached")
+        self.assertEqual(second["attempt_count"], 2)
+        self.assertEqual(len(transport.messages), 2)
 
     def test_zero_results_has_distinct_event_and_subject(self):
         state = completed_state(results=False)
@@ -311,9 +477,19 @@ class NotificationTests(unittest.TestCase):
         registry.register_checkpoint(initial)
         result = completed_state(False)
         result["job_id"] = initial["job_id"]
+        worker_root = Path(self.temporary.name) / "worker-project"
+
+        def write_worker_export(_state, output):
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            Workbook().save(output)
+
         with (
             patch("discovery_worker.run_discovery", return_value=result),
-            patch("discovery_worker.write_discovery_excel"),
+            patch(
+                "discovery_worker.write_discovery_excel",
+                side_effect=write_worker_export,
+            ),
+            patch("discovery_worker.PROJECT_ROOT", worker_root),
             patch(
                 "discovery_worker.send_discovery_terminal_notification",
                 side_effect=sqlite3.OperationalError("outbox unavailable"),
@@ -324,6 +500,12 @@ class NotificationTests(unittest.TestCase):
             )
         self.assertEqual(returned["status"], "completed")
         self.assertEqual(registry.get(initial["job_id"])["status"], "completed")
+        export_state = checkpoints.load(initial["job_id"])["export_state"]
+        self.assertEqual(export_state["status"], "completed")
+        self.assertTrue(export_state["valid"])
+        self.assertEqual(export_state["job_id"], initial["job_id"])
+        self.assertGreater(export_state["file_size"], 0)
+        self.assertEqual(len(export_state["sha256"]), 64)
 
 
 if __name__ == "__main__":
