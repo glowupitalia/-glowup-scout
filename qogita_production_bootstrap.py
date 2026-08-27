@@ -192,12 +192,15 @@ def main(argv=None):
         raise SystemExit("--execute is required; this runner never creates a bootstrap")
     if args.offers_pacing < MINIMUM_OFFERS_PACING:
         raise SystemExit("offers pacing below the production minimum")
-    _load_env(ROOT / ".env")
+    pointer = _read_pointer(Path(args.pointer).expanduser().resolve())
+    environment_file = Path(
+        pointer.get("environment_file") or (ROOT / ".env")
+    ).expanduser().resolve()
+    _load_env(environment_file)
     email = os.environ.get("QOGITA_EMAIL")
     password = os.environ.get("QOGITA_PASSWORD")
     if not email or not password:
         raise SystemExit("Qogita credentials are unavailable")
-    pointer = _read_pointer(Path(args.pointer).expanduser().resolve())
     database = Path(args.database).expanduser().resolve()
     lock_path = Path(args.lock).expanduser().resolve()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
