@@ -19,9 +19,20 @@ from discovery_amazon import (
     search_catalog_by_gtins_batch,
 )
 from discovery_excel import write_discovery_excel
+from discovery_incremental import (
+    DiscoveryIncrementalStore,
+    IncrementalCandidateCollection,
+    IncrementalObservationCollection,
+    LightweightCheckpointStore,
+    prepare_incremental_job,
+)
+from discovery_incremental_runner import ResourcePause, run_incremental_discovery
+from discovery_resources import DiscoveryResourceGovernor
 from discovery_jobs import DiscoveryJobRegistry, PROJECT_ROOT
 from notifications import send_discovery_terminal_notification
 from product_fees import search_product_fees_batch
+from supplier_catalog import SupplierCatalogStore
+from discovery_rotation import DiscoveryRotationStore
 
 
 logger = logging.getLogger(__name__)
@@ -78,7 +89,27 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
     pid = os.getpid()
     if not registry.claim(job_id, pid=pid):
         raise RuntimeError(f"Discovery job {job_id} is already owned by another worker")
-    state = checkpoint_store.load(job_id)
+    incremental_store = DiscoveryIncrementalStore()
+    incremental = incremental_store.has_job(job_id)
+    state = (
+        LightweightCheckpointStore().load(job_id)
+        if incremental else checkpoint_store.load(job_id)
+    )
+    if (
+        not incremental and state.get("phase") == "initialized"
+        and state.get("selected_suppliers")
+        and Path(checkpoint_store.root) == Path("data/discovery_jobs")
+    ):
+        prepared = prepare_incremental_job(
+            state, supplier_store=SupplierCatalogStore(),
+            rotation_store=DiscoveryRotationStore(),
+        )
+        incremental_store.create_job(
+            prepared["metadata"], prepared["candidates"],
+        )
+        state = incremental_store.summary(job_id)
+        LightweightCheckpointStore().save(state)
+        incremental = True
     token_provider = RefreshingTokenProvider(get_access_token)
 
     def catalog_batch(gtins, current_job_id, products=None):
@@ -104,24 +135,51 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
         )
 
     try:
-        result = run_discovery(
-            state["filters"], checkpoint_store=checkpoint_store,
-            catalog_batch=catalog_batch, pricing_batch=pricing_batch,
-            fees_batch=search_product_fees_batch, token_provider=token_provider,
-            job_id=job_id, selected_suppliers=state.get("selected_suppliers"),
-            run_budget=state.get("run_budget"), progress=progress,
-        )
+        if incremental:
+            result = run_incremental_discovery(
+                job_id, store=incremental_store,
+                metadata_store=LightweightCheckpointStore(),
+                catalog_batch=catalog_batch, pricing_batch=pricing_batch,
+                fees_batch=search_product_fees_batch, token_provider=token_provider,
+                progress=progress,
+                resource_governor=DiscoveryResourceGovernor(
+                    database_path=incremental_store.path,
+                ),
+            )
+        else:
+            result = run_discovery(
+                state["filters"], checkpoint_store=checkpoint_store,
+                catalog_batch=catalog_batch, pricing_batch=pricing_batch,
+                fees_batch=search_product_fees_batch, token_provider=token_provider,
+                job_id=job_id, selected_suppliers=state.get("selected_suppliers"),
+                run_budget=state.get("run_budget"), progress=progress,
+            )
         output_path = None
         if result.get("status") == "completed":
             output_path = PROJECT_ROOT / "data" / "discovery_jobs" / f"{job_id}.xlsx"
-            write_discovery_excel(result, str(output_path))
+            export_result = result
+            if incremental:
+                export_result = {
+                    **result,
+                    "candidates": IncrementalCandidateCollection(incremental_store, job_id),
+                    "results": IncrementalCandidateCollection(
+                        incremental_store, job_id, final_only=True,
+                    ),
+                    "amazon_observations": IncrementalObservationCollection(
+                        incremental_store, job_id,
+                    ),
+                }
+            write_discovery_excel(export_result, str(output_path))
             result["export_state"] = _export_metadata(output_path, result)
         else:
             result["export_state"] = {
                 "status": "pending", "generated_at": None,
                 "result_products": len(result.get("results") or []),
             }
-        checkpoint_store.save(result)
+        if incremental:
+            LightweightCheckpointStore().save(result)
+        else:
+            checkpoint_store.save(result)
         registry.finish(job_id, result, export_path=str(output_path) if output_path else None)
         try:
             send_discovery_terminal_notification(
@@ -132,6 +190,28 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
                 "DISCOVERY NOTIFICATION FAILED | job_id=%s", job_id,
             )
         return result
+    except ResourcePause as exc:
+        metrics = exc.snapshot.as_dict()
+        incremental_store.record_resource_event(
+            job_id, "hard", exc.reason, {**metrics, "threshold": exc.threshold},
+        )
+        incremental_store.set_phase(job_id, "resource_paused", status="resource_paused")
+        paused = {
+            **incremental_store.summary(job_id),
+            "status": "resource_paused", "phase": "resource_paused",
+            "resource_pause": {
+                "reason": exc.reason, "metric": exc.reason,
+                "observed": metrics, "threshold": exc.threshold,
+                "resumable": True,
+            },
+        }
+        LightweightCheckpointStore().save(paused)
+        registry.resource_pause(
+            job_id, reason=exc.reason, metrics=metrics,
+            phase=paused.get("progress_phase") or "resource_paused",
+        )
+        logger.warning("DISCOVERY RESOURCE PAUSED | job_id=%s reason=%s", job_id, exc.reason)
+        return paused
     except Exception as exc:
         logger.exception("DISCOVERY WORKER FAILED | job_id=%s", job_id)
         registry.fail(job_id, str(exc))

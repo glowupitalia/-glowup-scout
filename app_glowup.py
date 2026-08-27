@@ -818,6 +818,18 @@ def _render_discovery_runtime(job_id):
     if runtime["status"] == "completed":
         _load_discovery_result(runtime["job_id"], runtime)
         st.rerun(scope="app")
+    elif runtime["status"] == "resource_paused":
+        state = DiscoveryCheckpointStore().load(runtime["job_id"])
+        pause = state.get("resource_pause") or {}
+        st.warning("Discovery sospesa per proteggere HomeServer")
+        st.caption(
+            f"Fase: {state.get('progress_phase') or state.get('phase') or '—'} · "
+            f"motivo: {pause.get('reason') or 'pressione risorse'} · "
+            "il job e il campione restano riprendibili."
+        )
+        if st.button("Riprendi Discovery", key="resume_resource_paused", type="primary"):
+            _start_discovery_worker(state)
+            st.rerun(scope="app")
     elif runtime.get("resumable"):
         state = DiscoveryCheckpointStore().load(runtime["job_id"])
         st.warning(

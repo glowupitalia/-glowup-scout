@@ -80,7 +80,13 @@ def _as_decimal(value):
 def _export_context(payload):
     if isinstance(payload, dict):
         state = normalize_discovery_state(payload)
-        return state, list(state.get("candidates") or []), list(state.get("results") or [])
+        candidates = state.get("candidates") or []
+        final_products = state.get("results") or []
+        # Incremental collections are deliberately re-iterable SQL views.  Do
+        # not materialize tens of thousands of products merely to export them.
+        if getattr(candidates, "store", None) is not None:
+            return state, candidates, final_products
+        return state, list(candidates), list(final_products)
     products = list(payload or [])
     return {}, products, products
 

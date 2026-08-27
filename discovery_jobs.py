@@ -19,6 +19,7 @@ ACTIVE_STATUSES = {"launching", "running"}
 RESUMABLE_CHECKPOINT_STATUSES = {
     "running", "failed", "interrupted", "waiting_retry",
     "qogita_refresh_failed", "supplier_preparation_failed",
+    "resource_paused",
 }
 
 
@@ -251,6 +252,36 @@ class DiscoveryJobRegistry:
                 """UPDATE discovery_job_runtime SET status='resumable',resumable=1,error=?,
                    updated_at=?,worker_pid=NULL,lease_expires_at=NULL WHERE job_id=?""",
                 (str(message)[:500], utc_now(), job_id),
+            )
+            connection.commit()
+
+    def resource_pause(
+        self, job_id: str, *, reason: str, metrics: dict[str, Any], phase: str,
+    ):
+        """Release ownership without classifying a protective pause as failure."""
+        message = json.dumps(
+            {"reason": reason, "metrics": metrics},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )[:2000]
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE discovery_job_runtime SET status='resource_paused',phase=?,
+                   resumable=1,error=?,updated_at=?,worker_pid=NULL,lease_expires_at=NULL
+                   WHERE job_id=?""",
+                (phase, message, utc_now(), job_id),
+            )
+            connection.commit()
+
+    def update_recovery_progress(
+        self, job_id: str, *, phase: str, current: int, total: int,
+    ):
+        """Align registry counters after an offline, API-free recovery migration."""
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE discovery_job_runtime SET status='resumable',phase=?,
+                   progress_current=?,progress_total=?,resumable=1,updated_at=?,
+                   worker_pid=NULL,lease_expires_at=NULL WHERE job_id=?""",
+                (phase, int(current), int(total), utc_now(), job_id),
             )
             connection.commit()
 

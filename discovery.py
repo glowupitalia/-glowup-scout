@@ -89,6 +89,9 @@ class DiscoveryCheckpointStore:
     def path(self, job_id):
         return self.root / f"{job_id}.json"
 
+    def state_path(self, job_id):
+        return self.root / f"{job_id}.state.json"
+
     def create(self, filters):
         job_id = uuid4().hex
         state = {
@@ -134,6 +137,20 @@ class DiscoveryCheckpointStore:
             raise
 
     def load(self, job_id):
+        compact_path = self.state_path(job_id)
+        if compact_path.exists():
+            with compact_path.open("r", encoding="utf-8") as source:
+                state = json.load(source)
+            if state.get("status") == "completed":
+                from discovery_incremental import (
+                    DiscoveryIncrementalStore, IncrementalCandidateCollection,
+                )
+                incremental = DiscoveryIncrementalStore()
+                if incremental.has_job(job_id):
+                    state["results"] = list(
+                        IncrementalCandidateCollection(incremental, job_id, final_only=True)
+                    )
+            return normalize_discovery_state(state)
         with self.path(job_id).open("r", encoding="utf-8") as source:
             return normalize_discovery_state(json.load(source))
 
@@ -141,7 +158,15 @@ class DiscoveryCheckpointStore:
         if not self.root.exists():
             return None
         states = []
-        for path in self.root.glob("*.json"):
+        compact_jobs = {
+            path.name.removesuffix(".state.json")
+            for path in self.root.glob("*.state.json")
+        }
+        paths = list(self.root.glob("*.state.json")) + [
+            path for path in self.root.glob("*.json")
+            if path.stem not in compact_jobs
+        ]
+        for path in paths:
             try:
                 state = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -149,6 +174,7 @@ class DiscoveryCheckpointStore:
             if state.get("status") in {
                 "running", "failed", "interrupted", "waiting_retry",
                 "qogita_refresh_failed", "supplier_preparation_failed",
+                "resource_paused",
             }:
                 states.append(state)
         latest = max(states, key=lambda row: row.get("updated_at", ""), default=None)
@@ -837,7 +863,8 @@ def normalize_discovery_state(state):
         normalize_amazon_observation(observation)
     for product in normalized_products:
         _refresh_recommended_combination_from_checkpoint(product)
-    recalculate_diagnostic_funnel(state)
+    if state.get("persistence") != "incremental_sqlite_v1" or state.get("candidates"):
+        recalculate_diagnostic_funnel(state)
     compatibility = discovery_checkpoint_compatibility(state)
     state["checkpoint_compatibility"] = compatibility["status"]
     state["checkpoint_compatibility_reason"] = compatibility["reason"]

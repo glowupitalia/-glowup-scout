@@ -1039,6 +1039,50 @@ class SupplierCatalogStore:
             "eligible": sum(canonical_gtin14(value) is not None for value in identifiers),
         }
 
+    def active_identifier_memberships(self, suppliers) -> dict[str, tuple[str, ...]]:
+        """Return identifier membership without materializing product payloads."""
+        selected = [_validate_supplier(value) for value in suppliers]
+        memberships: dict[str, set[str]] = {}
+        self.initialize()
+        promoted = [supplier for supplier in selected if supplier != "qogita"]
+        with _connect(self.path) as connection:
+            if promoted:
+                placeholders = ",".join("?" for _ in promoted)
+                for row in connection.execute(
+                    f"""SELECT active.supplier,scenario.canonical_ean
+                          FROM supplier_catalog_active_generations active
+                          JOIN supplier_catalog_scenarios scenario
+                            ON scenario.run_id=active.run_id
+                         WHERE active.supplier IN ({placeholders})
+                           AND scenario.canonical_ean IS NOT NULL
+                         GROUP BY active.supplier,scenario.canonical_ean""",
+                    promoted,
+                ):
+                    memberships.setdefault(row["canonical_ean"], set()).add(row["supplier"])
+            if "qogita" in selected:
+                from qogita_serving import QogitaServingStore
+                QogitaServingStore(self.path).initialize()
+                for row in connection.execute(
+                    """SELECT scenario.canonical_ean
+                         FROM qogita_serving_active active
+                         JOIN qogita_serving_snapshots snapshot
+                           ON snapshot.serving_generation_id=active.serving_generation_id
+                         JOIN qogita_serving_memberships membership
+                           ON membership.serving_generation_id=snapshot.serving_generation_id
+                         JOIN supplier_catalog_scenarios scenario
+                           ON scenario.run_id=snapshot.source_generation_id
+                          AND scenario.canonical_product_key=membership.canonical_product_key
+                        WHERE active.supplier='qogita' AND snapshot.status='valid'
+                          AND scenario.canonical_ean IS NOT NULL
+                        GROUP BY scenario.canonical_ean"""
+                ):
+                    memberships.setdefault(row["canonical_ean"], set()).add("qogita")
+        return {
+            identifier: tuple(sorted(values))
+            for identifier, values in memberships.items()
+            if canonical_gtin14(identifier) is not None
+        }
+
     def active_candidates_for_identifier(
         self, supplier: str, identifier: str,
     ) -> list[dict[str, Any]]:
