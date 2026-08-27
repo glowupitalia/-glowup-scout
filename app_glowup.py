@@ -50,6 +50,7 @@ from supplier_preparation import (
 from supplier_catalog import SupplierCatalogStore, canonical_gtin14
 from discovery_rotation import DiscoveryRotationStore
 from discovery_jobs import DiscoveryJobRegistry
+from notifications import EmailConfig, NotificationOutbox
 
 
 DISCOVERY_OPERATIONAL_SUPPLIERS = ("qogita", "umma", "abw", "qudo")
@@ -777,6 +778,24 @@ def _load_discovery_result(job_id, runtime=None):
     st.session_state["ui_state"] = "discovery_result"
 
 
+def discovery_notification_status(job_id, database_path=None):
+    if job_id:
+        row = NotificationOutbox(
+            database_path or DiscoveryJobRegistry().path
+        ).get(job_id)
+        if row:
+            labels = {
+                "sent": "Email: inviata",
+                "not_configured": "Email: non configurata",
+                "failed": "Email: invio fallito",
+                "pending": "Email: in preparazione",
+                "sending": "Email: invio in corso",
+            }
+            return labels.get(row.get("status"), "Email: stato non disponibile")
+    config = EmailConfig.from_env()
+    return "Email: attiva" if config.configured else "Email: non configurata"
+
+
 @st.fragment(run_every=2)
 def _render_discovery_runtime(job_id):
     registry = DiscoveryJobRegistry()
@@ -923,6 +942,11 @@ if ui_state == "home":
         st.caption(
             "Trova automaticamente i prodotti più interessanti da acquistare "
             "e vendere su Amazon"
+        )
+        email_config = EmailConfig.from_env()
+        st.caption(
+            f"Notifiche email: {'attive' if email_config.configured else 'disattive'} · "
+            f"Destinatario: {email_config.recipient}"
         )
         if st.button(
             "Apri Discovery",
@@ -1257,6 +1281,11 @@ elif ui_state == "discovery":
             "Trova automaticamente i prodotti più interessanti da acquistare "
             "e vendere su Amazon"
         )
+        email_config = EmailConfig.from_env()
+        st.caption(
+            f"Notifiche email: {'attive' if email_config.configured else 'disattive'} · "
+            f"Destinatario: {email_config.recipient}"
+        )
         active_discovery = DiscoveryJobRegistry().latest_active()
         if active_discovery:
             current = int(active_discovery.get("progress_current") or 0)
@@ -1557,6 +1586,7 @@ elif ui_state == "discovery_result":
             ui_alert(LEGACY_CHECKPOINT_MESSAGE, "warning")
             st.stop()
         result_count = len(state.get("results") or [])
+        st.caption(discovery_notification_status(state.get("job_id")))
         ui_alert(
             f"{result_count} opportunità trovate" if result_count
             else "Nessuna opportunità con i filtri utilizzati.",

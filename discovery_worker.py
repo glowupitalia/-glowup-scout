@@ -19,6 +19,7 @@ from discovery_amazon import (
 )
 from discovery_excel import write_discovery_excel
 from discovery_jobs import DiscoveryJobRegistry, PROJECT_ROOT
+from notifications import send_discovery_terminal_notification
 from product_fees import search_product_fees_batch
 
 
@@ -107,6 +108,14 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
             }
         checkpoint_store.save(result)
         registry.finish(job_id, result, export_path=str(output_path) if output_path else None)
+        try:
+            send_discovery_terminal_notification(
+                result, database_path=registry.path, runtime=registry.get(job_id),
+            )
+        except Exception:
+            logger.error(
+                "DISCOVERY NOTIFICATION FAILED | job_id=%s", job_id,
+            )
         return result
     except Exception as exc:
         logger.exception("DISCOVERY WORKER FAILED | job_id=%s", job_id)

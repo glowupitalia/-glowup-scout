@@ -9,6 +9,7 @@ from streamlit.testing.v1 import AppTest
 
 from discovery import DiscoveryCheckpointStore, default_filters
 from discovery_jobs import DiscoveryJobRegistry
+from notifications import DEFAULT_RECIPIENT
 
 
 class DiscoveryJobRegistryTests(unittest.TestCase):
@@ -194,6 +195,27 @@ class DiscoveryJobUiTests(unittest.TestCase):
             self.assertEqual(len(app.exception), 0)
             self.assertTrue(any(row.value == "Ultima Discovery completata" for row in app.subheader))
             self.assertTrue(any(row.label == "Apri risultati Discovery" for row in app.button))
+
+    def test_discovery_configuration_shows_notification_status(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            registry = DiscoveryJobRegistry(Path(temporary) / "runtime.sqlite3")
+            with patch.dict(
+                os.environ,
+                {
+                    "DISCOVERY_JOB_DATABASE": str(registry.path),
+                    "GLOWUP_SCOUT_EMAIL_ENABLED": "false",
+                },
+                clear=False,
+            ):
+                app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
+                app.session_state["ui_state"] = "discovery"
+                app = app.run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertTrue(any(
+                "Notifiche email: disattive" in row.value
+                and DEFAULT_RECIPIENT in row.value
+                for row in app.caption
+            ))
 
 
 if __name__ == "__main__":
