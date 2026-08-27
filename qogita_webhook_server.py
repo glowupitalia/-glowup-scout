@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from wsgiref.simple_server import make_server
 
 from qogita_catalog_pipeline import (
@@ -22,11 +23,26 @@ MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
 LOGGER = logging.getLogger(__name__)
 
 
+def load_signing_secret() -> str:
+    direct = os.environ.get("QOGITA_WEBHOOK_SIGNING_SECRET")
+    if direct:
+        return direct
+    configured = os.environ.get("QOGITA_WEBHOOK_SIGNING_SECRET_FILE")
+    path = Path(configured).expanduser() if configured else (
+        Path.home() / "Library" / "Application Support" / "GlowUp-Scout"
+        / "secrets" / "qogita-webhook-secret"
+    )
+    try:
+        value = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    # A conventional final newline is not part of a line-oriented secret file.
+    return value[:-1] if value.endswith("\n") and "\n" not in value[:-1] else value
+
+
 def create_qogita_webhook_app(*, store=None, signing_secret=None):
     pipeline_store = store or QogitaCatalogPipelineStore()
-    secret = signing_secret if signing_secret is not None else os.environ.get(
-        "QOGITA_WEBHOOK_SIGNING_SECRET"
-    )
+    secret = signing_secret if signing_secret is not None else load_signing_secret()
 
     def application(environ, start_response):
         if environ.get("PATH_INFO") != "/webhooks/qogita":
@@ -89,7 +105,7 @@ def create_qogita_webhook_app(*, store=None, signing_secret=None):
 def main():
     host = os.environ.get("QOGITA_WEBHOOK_BIND", "127.0.0.1")
     port = int(os.environ.get("QOGITA_WEBHOOK_PORT", "8511"))
-    if not os.environ.get("QOGITA_WEBHOOK_SIGNING_SECRET"):
+    if not load_signing_secret():
         raise SystemExit("QOGITA_WEBHOOK_SIGNING_SECRET is required")
     with make_server(host, port, create_qogita_webhook_app()) as server:
         server.serve_forever()

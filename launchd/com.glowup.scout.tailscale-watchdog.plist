@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.glowup.scout.tailscale-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/casaloria/Developer/GlowUp-Scout/.venv/bin/python</string>
+    <string>/Users/casaloria/Developer/GlowUp-Scout/homeserver_watchdog.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/casaloria/Developer/GlowUp-Scout</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/casaloria/Developer/GlowUp-Scout/data/logs/tailscale-watchdog.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/casaloria/Developer/GlowUp-Scout/data/logs/tailscale-watchdog.error.log</string>
+</dict>
+</plist>

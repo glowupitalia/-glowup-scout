@@ -20,6 +20,7 @@ data/**/*.lock
 data/**/*.tmp
 data/**/*.part
 data/qogita_bootstrap_current.json
+data/tailscale-watchdog.json
 app_glowup_backup.py
 app_glowup_backup_funzionante.py
 test_*.py
