@@ -19,6 +19,7 @@ from qogita_bootstrap import (
     run_qogita_bootstrap,
     run_qogita_bootstrap_concurrent,
 )
+from qogita_production_bootstrap import ProductionHealthGuard
 from qogita_catalog_pipeline import QogitaCatalogPipelineStore
 from supplier_catalog import SupplierCatalogStore
 from supplier_catalog_collectors import QogitaCatalogExportReader, QOGITA_EXPORT_COLUMNS
@@ -399,6 +400,93 @@ class QogitaBootstrapTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertEqual(len(result), 1)
         self.assertGreater(self.store.sqlite_metrics["lock_wait_seconds"], 0)
+
+    def test_production_bootstrap_reuses_carried_forward_and_prioritizes_delta(self):
+        run_id = self.staging(4)
+        with sqlite3.connect(self.database) as connection:
+            rows = connection.execute(
+                """SELECT canonical_product_key FROM supplier_catalog_products
+                     WHERE run_id=? ORDER BY rowid""", (run_id,),
+            ).fetchall()
+            connection.execute(
+                """UPDATE supplier_catalog_products SET enrichment_status='carried_forward',
+                          variant_fid='REUSED',catalog_delta_status='unchanged'
+                     WHERE run_id=? AND canonical_product_key=?""",
+                (run_id, rows[0][0]),
+            )
+            connection.execute(
+                """UPDATE supplier_catalog_products SET variant_fid='CHANGEDFID',
+                          enrichment_status='enrichment_pending',catalog_delta_status='changed'
+                     WHERE run_id=? AND canonical_product_key=?""",
+                (run_id, rows[1][0]),
+            )
+            connection.execute(
+                """UPDATE supplier_catalog_products SET catalog_delta_status='changed'
+                     WHERE run_id=? AND canonical_product_key=?""",
+                (run_id, rows[2][0]),
+            )
+            connection.execute(
+                """UPDATE supplier_catalog_products SET catalog_delta_status='new'
+                     WHERE run_id=? AND canonical_product_key=?""",
+                (run_id, rows[3][0]),
+            )
+        bootstrap = self.store.create_production_bootstrap(run_id, batch_size=2)
+        selected = self.store.products(bootstrap["bootstrap_run_id"])
+        self.assertEqual(bootstrap["run_mode"], "production")
+        self.assertEqual(bootstrap["reusable_products"], 1)
+        self.assertEqual(bootstrap["initial_pending_products"], 3)
+        self.assertEqual(selected[0]["canonical_product_key"], rows[3][0])
+        self.assertEqual(selected[1]["canonical_product_key"], rows[1][0])
+        reused = next(row for row in selected if row["canonical_product_key"] == rows[0][0])
+        self.assertEqual(reused["status"], "enriched")
+
+    def test_production_pacing_floor_and_completion_review(self):
+        run_id = self.staging(1)
+        with self.assertRaises(ValueError):
+            self.store.create_production_bootstrap(run_id, offers_pacing=1.0)
+        bootstrap = self.store.create_production_bootstrap(run_id, offers_pacing=1.15)
+        with self.assertRaises(ValueError):
+            run_qogita_bootstrap_concurrent(
+                bootstrap["bootstrap_run_id"], store=self.store,
+                client_factory=lambda _auth, _limiter: BootstrapFakeClient(),
+                base_url="https://example.test", email="x", password="y", workers=2,
+                offers_pacing=1.0, sleep_func=lambda _: None,
+            )
+        result = run_qogita_bootstrap_concurrent(
+            bootstrap["bootstrap_run_id"], store=self.store,
+            client_factory=lambda _auth, _limiter: BootstrapFakeClient(),
+            base_url="https://example.test", email="x", password="y", workers=2,
+            offers_pacing=1.15, product_link_pacing=0, sleep_func=lambda _: None,
+        )
+        self.assertEqual(result["status"], "awaiting_promotion_review")
+        self.assertIsNone(self.catalog.active_generation_metadata("qogita"))
+
+    def test_production_source_and_disk_guard_fail_closed(self):
+        run_id = self.staging(1)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        guard = ProductionHealthGuard(
+            store=self.store, bootstrap_run_id=bootstrap["bootstrap_run_id"],
+            database=self.database,
+            minimum_free_bytes=10**30,
+        )
+        with self.assertRaisesRegex(RuntimeError, "disk_free_below_guardrail"):
+            guard.initial_check()
+
+    def test_production_auto_stop_is_persisted_and_resumable(self):
+        run_id = self.staging(2)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        result = run_qogita_bootstrap_concurrent(
+            bootstrap["bootstrap_run_id"], store=self.store,
+            client_factory=lambda _auth, _limiter: BootstrapFakeClient(),
+            base_url="https://example.test", email="x", password="y", workers=2,
+            max_products=1, offers_pacing=1.15, product_link_pacing=0,
+            sleep_func=lambda _: None,
+            health_callback=lambda _payload: "operator_test_stop",
+        )
+        self.assertEqual(result["status"], "auto_stopped")
+        self.assertEqual(result["stop_reason"], "operator_test_stop")
+        resumed = self.store.resume_production(bootstrap["bootstrap_run_id"])
+        self.assertEqual(resumed["status"], "running")
 
 
 if __name__ == "__main__":
