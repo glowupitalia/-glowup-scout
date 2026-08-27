@@ -21,7 +21,6 @@ from discovery import (
     default_filters,
     discovery_funnel_view,
     normalize_discovery_state,
-    run_discovery,
 )
 from discovery_amazon import (
     RefreshingTokenProvider,
@@ -30,7 +29,6 @@ from discovery_amazon import (
     parse_item_offers_batch,
     search_catalog_by_gtins_batch,
 )
-from discovery_excel import write_discovery_excel
 from direct_lookup import (
     direct_scenario_rows,
     format_eur,
@@ -51,6 +49,7 @@ from supplier_preparation import (
 )
 from supplier_catalog import SupplierCatalogStore
 from discovery_rotation import DiscoveryRotationStore
+from discovery_jobs import DiscoveryJobRegistry
 
 
 DISCOVERY_OPERATIONAL_SUPPLIERS = ("qogita", "umma", "abw", "qudo")
@@ -749,6 +748,72 @@ def new_discovery_search():
     st.session_state.pop("discovery_error", None)
 
 
+def _open_discovery_job(job_id):
+    st.session_state["discovery_job_id"] = job_id
+    st.session_state["ui_state"] = "discovery_running"
+
+
+def _start_discovery_worker(state):
+    registry = DiscoveryJobRegistry()
+    registry.register_checkpoint(state)
+    pid = registry.launch(state["job_id"])
+    st.session_state["discovery_job_id"] = state["job_id"]
+    st.session_state["discovery_status"] = "running"
+    st.session_state["ui_state"] = "discovery_running"
+    return pid
+
+
+def _load_discovery_result(job_id, runtime=None):
+    state = DiscoveryCheckpointStore().load(job_id)
+    runtime = runtime or DiscoveryJobRegistry().get(job_id) or {}
+    output_bytes = None
+    output_path = runtime.get("export_path")
+    if output_path and os.path.isfile(output_path):
+        with open(output_path, "rb") as output:
+            output_bytes = output.read()
+    st.session_state["discovery_result"] = {
+        "state": state, "output_bytes": output_bytes,
+    }
+    st.session_state["discovery_status"] = state.get("status") or runtime.get("status")
+    st.session_state["ui_state"] = "discovery_result"
+
+
+@st.fragment(run_every=2)
+def _render_discovery_runtime(job_id):
+    registry = DiscoveryJobRegistry()
+    runtime = registry.get(job_id) if job_id else registry.latest()
+    if not runtime:
+        ui_alert("Stato Discovery non disponibile.", "warning")
+        return
+    if runtime["status"] in {"launching", "running"}:
+        current = int(runtime.get("progress_current") or 0)
+        total = int(runtime.get("progress_total") or 0)
+        progress_value = min(1.0, current / total) if total else 0.02
+        st.progress(progress_value)
+        st.caption(
+            f"Fase: {str(runtime.get('phase') or 'preparazione').replace('_', ' ')} · "
+            f"{current:,} / {total:,} · ultimo aggiornamento {runtime.get('updated_at') or '—'}"
+            .replace(",", ".")
+        )
+        st.info("La Discovery continua anche se torni alla Home o chiudi il browser.")
+        return
+    if runtime["status"] == "completed":
+        _load_discovery_result(runtime["job_id"], runtime)
+        st.rerun(scope="app")
+    elif runtime.get("resumable"):
+        state = DiscoveryCheckpointStore().load(runtime["job_id"])
+        st.warning(
+            f"Discovery interrotta alla fase {state.get('phase')}. "
+            "Il checkpoint e lo stesso campione sono disponibili."
+        )
+        if st.button("Riprendi Discovery", key="resume_current_discovery", type="primary"):
+            _start_discovery_worker(state)
+            st.rerun(scope="app")
+    else:
+        _load_discovery_result(runtime["job_id"], runtime)
+        st.rerun(scope="app")
+
+
 if "ui_state" not in st.session_state:
     st.session_state["ui_state"] = (
         "single_result"
@@ -759,6 +824,36 @@ if "ui_state" not in st.session_state:
 ui_state = st.session_state["ui_state"]
 
 if ui_state == "home":
+    discovery_registry = DiscoveryJobRegistry()
+    active_discovery = discovery_registry.latest_active()
+    if active_discovery:
+        with st.container(border=True):
+            st.subheader("Discovery in corso")
+            current = int(active_discovery.get("progress_current") or 0)
+            total = int(active_discovery.get("progress_total") or 0)
+            phase = str(active_discovery.get("phase") or "preparazione").replace("_", " ")
+            st.caption(
+                f"Fase: {phase} · {current:,} / {total:,} · "
+                f"avviata {active_discovery.get('started_at') or '—'}".replace(",", ".")
+            )
+            if st.button("Apri Discovery", key="open_active_discovery", type="primary"):
+                _open_discovery_job(active_discovery["job_id"])
+                st.rerun()
+    else:
+        latest_discovery = discovery_registry.latest()
+        if latest_discovery and latest_discovery.get("status") == "completed":
+            with st.container(border=True):
+                st.subheader("Ultima Discovery completata")
+                st.caption(
+                    f"{latest_discovery.get('budget') or '—'} prodotti · "
+                    f"completata {latest_discovery.get('completed_at') or '—'}"
+                )
+                if st.button(
+                    "Apri risultati Discovery", key="open_completed_discovery",
+                    type="primary",
+                ):
+                    _load_discovery_result(latest_discovery["job_id"], latest_discovery)
+                    st.rerun()
     with st.container(border=True):
         st.subheader("Ricerca singola")
         st.markdown(
@@ -1163,6 +1258,22 @@ elif ui_state == "discovery":
             "Trova automaticamente i prodotti più interessanti da acquistare "
             "e vendere su Amazon"
         )
+        active_discovery = DiscoveryJobRegistry().latest_active()
+        if active_discovery:
+            current = int(active_discovery.get("progress_current") or 0)
+            total = int(active_discovery.get("progress_total") or 0)
+            ui_alert(
+                f"Discovery in corso · {current:,} / {total:,} · "
+                f"fase {str(active_discovery.get('phase') or 'preparazione').replace('_', ' ')}"
+                .replace(",", "."),
+                "warning",
+            )
+            if st.button(
+                "Apri avanzamento", key="open_running_discovery",
+                type="primary", use_container_width=True,
+            ):
+                _open_discovery_job(active_discovery["job_id"])
+                st.rerun()
         st.markdown("**Fornitori**")
         catalog_statuses = discovery_supplier_catalog_status()
         qogita_available = bool(catalog_statuses.get("qogita"))
@@ -1318,18 +1429,25 @@ elif ui_state == "discovery":
             ui_alert(validation_error, "warning")
         if st.button(
             "Trova opportunità", key="start_discovery", type="primary",
-            use_container_width=True, disabled=bool(validation_error),
+            use_container_width=True,
+            disabled=bool(validation_error) or bool(active_discovery),
         ):
             st.session_state["discovery_filters"] = filters
             st.session_state["discovery_selected_suppliers"] = selected_suppliers
             st.session_state["discovery_run_budget"] = run_budget
-            st.session_state["discovery_job_id"] = None
-            st.session_state["discovery_status"] = "ready"
-            st.session_state["ui_state"] = "discovery_running"
+            store = DiscoveryCheckpointStore()
+            state = store.create(filters)
+            state["selected_suppliers"] = selected_suppliers
+            state["run_budget"] = run_budget
+            state["progress_phase"] = "initialized"
+            state["progress_current"] = 0
+            state["progress_total"] = int(run_budget) if run_budget != "all" else 0
+            store.save(state)
+            _start_discovery_worker(state)
             st.rerun()
 
         incomplete = DiscoveryCheckpointStore().latest_incomplete()
-        if incomplete and st.button(
+        if incomplete and not active_discovery and st.button(
             "Riprendi ultima Discovery incompleta",
             key="resume_discovery",
             type="secondary",
@@ -1341,161 +1459,18 @@ elif ui_state == "discovery":
             ) or ["qogita"]
             st.session_state["discovery_run_budget"] = incomplete.get("run_budget", "all")
             st.session_state["discovery_job_id"] = incomplete["job_id"]
-            st.session_state["discovery_status"] = "ready"
-            st.session_state["ui_state"] = "discovery_running"
+            _start_discovery_worker(incomplete)
             st.rerun()
 
 elif ui_state == "discovery_running":
+    st.button(
+        "← Torna alla home", key="back_running_discovery_home",
+        type="secondary", on_click=return_to_home,
+    )
     with st.container(border=True):
         st.subheader("Scopri opportunità")
-        status_placeholder = st.empty()
-        progress_widget = st.progress(0)
-        if st.session_state.get("discovery_status") in {"ready", "processing"}:
-            st.session_state["discovery_status"] = "processing"
-            store = DiscoveryCheckpointStore()
-            token_provider = RefreshingTokenProvider(get_access_token)
-            phase_progress = {
-                "supplier_preparing": 0.03,
-                "supplier_checking": 0.04,
-                "supplier_refreshing": 0.07,
-                "supplier_ready": 0.10,
-                "supplier_unavailable": 0.10,
-                "supplier_preparation_failed": 0.05,
-                "suppliers_loaded": 0.12,
-                "qogita_checking": 0.03,
-                "qogita_refresh_required": 0.05,
-                "qogita_refreshing": 0.07,
-                "qogita_refresh_failed": 0.07,
-                "qogita_loaded": 0.10,
-                "catalog_complete": 0.35,
-                "bsr_filtered": 0.45,
-                "pricing_complete": 0.65,
-                "competition_filtered": 0.72,
-                "fees_complete": 0.90,
-                "completed": 1.0,
-            }
-
-            def update_discovery_progress(phase, _state):
-                st.session_state["discovery_job_id"] = _state["job_id"]
-                progress_widget.progress(phase_progress.get(phase, 0.0))
-                phase_labels = {
-                    "supplier_preparing": "Preparazione fornitori",
-                    "supplier_checking": "Preparazione fornitori",
-                    "supplier_refreshing": "Aggiornamento catalogo fornitore",
-                    "supplier_ready": "Preparazione fornitori",
-                    "supplier_unavailable": "Fornitore non disponibile",
-                    "supplier_preparation_failed": "Fornitori non disponibili",
-                    "suppliers_loaded": "Ricerca prodotti su Amazon",
-                    "qogita_checking": "Verifica dati Qogita",
-                    "qogita_refresh_required": "Aggiornamento catalogo Qogita",
-                    "qogita_refreshing": "Aggiornamento catalogo Qogita…",
-                    "qogita_refresh_failed": "Aggiornamento Qogita non riuscito",
-                    "qogita_loaded": "Analisi Amazon",
-                    "catalog_complete": "Verifica BSR",
-                    "bsr_filtered": "Analisi prezzi e concorrenza",
-                    "pricing_complete": "Analisi prezzi e concorrenza",
-                    "competition_filtered": "Calcolo costi Amazon",
-                    "fees_complete": "Valutazione opportunità",
-                    "completed": "Preparazione risultati",
-                }
-                label = phase_labels.get(phase, f"Fase: {phase.replace('_', ' ')}")
-                supplier = _state.get("current_supplier")
-                detail = f"{label} · {str(supplier).upper()}" if supplier else label
-                if phase in {"suppliers_loaded", "catalog_complete", "pricing_complete"}:
-                    products = len(_state.get("candidates") or [])
-                    scenarios = sum(
-                        len(row.get("scenarios") or [])
-                        for row in _state.get("candidates") or []
-                    )
-                    detail += f" · {products} prodotti · {scenarios} scenari"
-                status_placeholder.caption(detail)
-
-            def catalog_batch(gtins, job_id, products=None):
-                items = search_catalog_by_gtins_batch(
-                    gtins, token_provider,
-                    marketplace_id=os.environ["MARKETPLACE_ID"], job_id=job_id,
-                )
-                return correlate_catalog_items(gtins, items, products)
-
-            def pricing_batch(asins, job_id):
-                entries = get_item_offers_batch(
-                    asins, token_provider,
-                    marketplace_id=os.environ["MARKETPLACE_ID"], job_id=job_id,
-                )
-                return parse_item_offers_batch(entries)
-
-            try:
-                state = run_discovery(
-                    st.session_state["discovery_filters"],
-                    checkpoint_store=store,
-                    catalog_batch=catalog_batch,
-                    pricing_batch=pricing_batch,
-                    fees_batch=search_product_fees_batch,
-                    token_provider=token_provider,
-                    job_id=st.session_state.get("discovery_job_id"),
-                    selected_suppliers=st.session_state.get(
-                        "discovery_selected_suppliers"
-                    ) or list(DISCOVERY_OPERATIONAL_SUPPLIERS),
-                    run_budget=st.session_state.get(
-                        "discovery_run_budget", DEFAULT_DISCOVERY_RUN_BUDGET,
-                    ),
-                    progress=update_discovery_progress,
-                )
-                if state.get("checkpoint_compatibility") == "legacy_incompatible":
-                    st.session_state["discovery_result"] = {
-                        "state": state, "output_bytes": None,
-                    }
-                    st.session_state["discovery_status"] = "legacy_incompatible"
-                    st.session_state["ui_state"] = "discovery_result"
-                    st.rerun()
-                if state.get("status") == "qogita_refresh_failed":
-                    st.session_state["discovery_result"] = {
-                        "state": state, "output_bytes": None,
-                    }
-                    st.session_state["discovery_status"] = (
-                        "qogita_refresh_failed"
-                    )
-                    st.session_state["discovery_error"] = (
-                        "Aggiornamento Qogita non riuscito. La Discovery non "
-                        "è stata avviata per evitare valutazioni basate su "
-                        "prezzi o stock obsoleti."
-                    )
-                    st.session_state["ui_state"] = "discovery_result"
-                    st.rerun()
-                if state.get("status") == "supplier_preparation_failed":
-                    st.session_state["discovery_result"] = {
-                        "state": state, "output_bytes": None,
-                    }
-                    st.session_state["discovery_status"] = "supplier_preparation_failed"
-                    st.session_state["discovery_error"] = (
-                        "Nessun fornitore selezionato è disponibile. La ricerca "
-                        "Amazon non è stata avviata."
-                    )
-                    st.session_state["ui_state"] = "discovery_result"
-                    st.rerun()
-                output_name = f"glowup_scout_discovery_{state['job_id']}.xlsx"
-                output_path = write_discovery_excel(state, output_name)
-                with open(output_path, "rb") as output:
-                    output_bytes = output.read()
-                state["export_state"] = {
-                    "status": "generated", "file_name": output_name,
-                    "generated_at": state.get("completed_at") or state.get("updated_at"),
-                    "result_products": len(state.get("results") or []),
-                }
-                store.save(state)
-                st.session_state["discovery_result"] = {
-                    "state": state,
-                    "output_bytes": output_bytes,
-                }
-                st.session_state["discovery_status"] = state.get("status") or "completed"
-            except Exception:
-                logger.exception("DISCOVERY UI FAILED")
-                st.session_state["discovery_status"] = "error"
-                st.session_state["discovery_error"] = (
-                    "Discovery interrotta. Il checkpoint è stato conservato."
-                )
-            st.session_state["ui_state"] = "discovery_result"
-            st.rerun()
+        job_id = st.session_state.get("discovery_job_id")
+        _render_discovery_runtime(job_id)
 
 elif ui_state == "discovery_result":
     st.button(

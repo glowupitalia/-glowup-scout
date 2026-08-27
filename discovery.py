@@ -182,6 +182,7 @@ def validate_filters(filters):
 
 def _checkpoint(store, state, phase, *, progress=None):
     state["phase"] = phase
+    state["progress_phase"] = phase
     store.save(state)
     logger.info(
         "DISCOVERY CHECKPOINT | job_id=%s phase=%s candidates=%s results=%s",
@@ -1880,6 +1881,8 @@ def run_discovery(
                     },
                 ))
             pending = [row for row in state["candidates"] if not row.get("catalog_status")]
+            catalog_total = len(state["candidates"])
+            catalog_completed = catalog_total - len(pending)
             batches = list(_chunks(pending))
             for batch_number, batch in enumerate(batches, start=1):
                 identifiers = list(dict.fromkeys(row["gtin"] for row in batch))
@@ -1889,6 +1892,12 @@ def run_discovery(
                 for row in batch:
                     catalog = mapping.get(row["gtin"], {"status": "not_found"})
                     _ensure_product_listings(row, catalog)
+                catalog_completed += len(batch)
+                state.update({
+                    "progress_phase": "catalog",
+                    "progress_current": catalog_completed,
+                    "progress_total": catalog_total,
+                })
                 checkpoint_store.save(state)
                 if active_rotation_store is not None and state.get("rotation_scope"):
                     state.update(active_rotation_store.commit_catalog_results(
@@ -1900,6 +1909,8 @@ def run_discovery(
                         },
                     ))
                     checkpoint_store.save(state)
+                if progress:
+                    progress("catalog", state)
                 logger.info("DISCOVERY CATALOG BATCH | job_id=%s batch=%s size=%s", job_id, batch_number, len(batch))
                 if batch_number < len(batches) and catalog_batch_interval:
                     sleep_func(catalog_batch_interval)
@@ -1955,6 +1966,8 @@ def run_discovery(
                 and not listing.get("pricing_status")
             ]
             pending_asins = list(dict.fromkeys(row["asin"] for row in pending))
+            pricing_total = len(pending_asins)
+            pricing_completed = 0
             batches = list(_chunks(pending_asins))
             for batch_number, asins in enumerate(batches, start=1):
                 mapping = pricing_batch(asins, job_id)
@@ -1972,7 +1985,15 @@ def run_discovery(
                         "min_fba_price": pricing.get("Prezzo minimo FBA Amount"),
                         "min_fbm_price": pricing.get("Prezzo minimo FBM Amount"),
                     })
+                pricing_completed += len(asins)
+                state.update({
+                    "progress_phase": "pricing",
+                    "progress_current": pricing_completed,
+                    "progress_total": pricing_total,
+                })
                 checkpoint_store.save(state)
+                if progress:
+                    progress("pricing", state)
                 logger.info("DISCOVERY PRICING BATCH | job_id=%s batch=%s size=%s", job_id, batch_number, len(asins))
                 if batch_number < len(batches) and pricing_batch_interval:
                     sleep_func(pricing_batch_interval)
@@ -2021,6 +2042,8 @@ def run_discovery(
                 row for row in state.get("amazon_observations") or []
                 if row.get("fee_status") in {None, "", "fee_pending"}
             ]
+            fees_total = len(pending)
+            fees_completed = 0
             batches = list(_chunks(pending))
             for batch_number, batch in enumerate(batches, start=1):
                 requests_ = [{
@@ -2034,6 +2057,15 @@ def run_discovery(
                     sleep_func=sleep_func,
                     save_progress=lambda: checkpoint_store.save(state),
                 )
+                fees_completed += len(batch)
+                state.update({
+                    "progress_phase": "fees",
+                    "progress_current": fees_completed,
+                    "progress_total": fees_total,
+                })
+                checkpoint_store.save(state)
+                if progress:
+                    progress("fees", state)
                 logger.info("DISCOVERY FEES BATCH | job_id=%s batch=%s size=%s", job_id, batch_number, len(batch))
                 if batch_number < len(batches) and fee_batch_interval:
                     sleep_func(fee_batch_interval)

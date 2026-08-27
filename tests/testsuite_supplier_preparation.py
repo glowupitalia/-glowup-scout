@@ -322,14 +322,23 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
     def test_configuration_defaults_all_suppliers_and_filters(self):
         app = self.discovery_app()
         self.assertEqual(len(app.exception), 0)
+        qogita_available = bool(
+            SupplierCatalogStore().serving_generation_metadata("qogita")
+        )
         self.assertEqual(
             [
                 (row.label, row.value) for row in app.checkbox
                 if row.label in {"Tutti", "Qogita", "UMMA", "ABW", "Qudo"}
             ],
-            [("Tutti", True), ("Qogita", False), ("UMMA", True), ("ABW", True), ("Qudo", True)],
+            [
+                ("Tutti", True), ("Qogita", qogita_available),
+                ("UMMA", True), ("ABW", True), ("Qudo", True),
+            ],
         )
-        self.assertTrue(next(row for row in app.checkbox if row.label == "Qogita").disabled)
+        self.assertEqual(
+            next(row for row in app.checkbox if row.label == "Qogita").disabled,
+            not qogita_available,
+        )
         values = {row.label: row.value for row in app.number_input}
         self.assertEqual(values["BSR minimo"], 0)
         self.assertEqual(values["BSR massimo"], 20000)
@@ -357,10 +366,14 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         self.assertTrue(any("Seleziona almeno un fornitore" in row.value for row in app.markdown))
 
     def test_running_view_does_not_start_when_not_ready(self):
-        app = AppTest.from_file("app_glowup.py", default_timeout=10).run()
-        app.session_state["ui_state"] = "discovery_running"
-        app.session_state["discovery_status"] = "paused"
-        app.run()
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {"DISCOVERY_JOB_DATABASE": str(Path(temporary) / "runtime.sqlite3")},
+        ):
+            app = AppTest.from_file("app_glowup.py", default_timeout=10).run()
+            app.session_state["ui_state"] = "discovery_running"
+            app.session_state["discovery_status"] = "paused"
+            app.run()
         self.assertEqual(len(app.exception), 0)
         self.assertTrue(any(row.value == "Scopri opportunità" for row in app.subheader))
 
