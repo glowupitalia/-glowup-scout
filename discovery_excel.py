@@ -426,6 +426,7 @@ def _run_metadata(state, candidates, final_products):
         }) or ["QOGITA"]
     return [
         ("Job ID", state.get("job_id") or "—"),
+        ("Schema checkpoint", state.get("schema_version") or "—"),
         ("Stato job", state.get("status") or "—"),
         ("Fase", state.get("phase") or "—"),
         ("Avviato", state.get("started_at") or state.get("created_at") or "—"),
@@ -436,6 +437,26 @@ def _run_metadata(state, candidates, final_products):
         ("Venditori FBA massimi", filters.get("max_fba_sellers")),
         ("Venditori totali massimi", filters.get("max_total_sellers")),
         ("Margine minimo %", filters.get("minimum_margin")),
+        ("EAN universo supplier", state.get("total_supplier_ean_universe")),
+        ("Identificatori idonei", state.get("eligible_identifier_count")),
+        ("Budget ricerca", state.get("run_budget") or "all"),
+        ("Identificatori campionati", state.get("sampled_identifier_count") or len(candidates)),
+        ("Strategia campionamento", state.get("sampling_strategy") or "—"),
+        ("Scope rotazione", state.get("rotation_scope") or "—"),
+        ("Ciclo rotazione", state.get("rotation_cycle_id")),
+        ("Analizzati prima della run", state.get("rotation_analyzed_before_run")),
+        ("Analizzati in questa run", state.get("rotation_analyzed_this_run")),
+        ("Rimanenti nel ciclo", state.get("rotation_remaining_after_run")),
+        *[
+            (
+                f"Freshness {str(supplier).upper()}",
+                " · ".join(filter(None, (
+                    str((state.get("supplier_snapshot_set") or {}).get(supplier, {}).get("freshness") or "—"),
+                    str((state.get("supplier_snapshot_set") or {}).get(supplier, {}).get("snapshot_at") or "—"),
+                ))),
+            )
+            for supplier in selected
+        ],
         ("Prodotti analizzati", len(candidates)),
         ("Prodotti trovati Amazon", funnel.get("amazon_found")),
         ("Pagine Amazon trovate", funnel.get("amazon_listings_found")),

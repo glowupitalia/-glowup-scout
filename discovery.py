@@ -43,7 +43,8 @@ from purchase_scenarios import (
     recommended_combination,
     recommended_scenario,
 )
-from supplier_preparation import prepare_suppliers, normalize_selected_suppliers
+from supplier_preparation import prepare_suppliers, normalize_run_budget, normalize_selected_suppliers
+from discovery_rotation import DiscoveryRotationStore
 from qogita_discovery import load_qogita_cache_rows, normalize_qogita_candidates
 from qogita_refresh import (
     inspect_qogita_cache,
@@ -63,6 +64,7 @@ TRANSIENT_FEE_CODES = {
 }
 TRANSIENT_FEE_TYPES = {"receiver"}
 DISCOVERY_SCHEMA_VERSION = "supplier_multi_listing_v1"
+DISCOVERY_CHECKPOINT_SCHEMA_VERSION = 2
 LEGACY_CHECKPOINT_MESSAGE = (
     "Questo risultato è stato creato con una versione precedente della "
     "Discovery. Avvia una nuova ricerca per utilizzare l'analisi multi-scenario."
@@ -91,6 +93,7 @@ class DiscoveryCheckpointStore:
         job_id = uuid4().hex
         state = {
             "job_id": job_id,
+            "schema_version": DISCOVERY_CHECKPOINT_SCHEMA_VERSION,
             "discovery_schema_version": DISCOVERY_SCHEMA_VERSION,
             "checkpoint_compatibility": "compatible",
             "status": "running",
@@ -1486,6 +1489,8 @@ def run_discovery(
     qogita_normalizer=normalize_qogita_candidates,
     qogita_refresher=refresh_qogita_seller_catalogs,
     selected_suppliers=None,
+    run_budget=None,
+    rotation_store=None,
     supplier_preparer=prepare_suppliers,
     job_id=None,
     progress=None,
@@ -1498,6 +1503,9 @@ def run_discovery(
     filters = validate_filters(filters)
     state = checkpoint_store.load(job_id) if job_id else checkpoint_store.create(filters)
     job_id = state["job_id"]
+    active_rotation_store = rotation_store
+    if active_rotation_store is None and supplier_preparer is prepare_suppliers:
+        active_rotation_store = DiscoveryRotationStore()
     if selected_suppliers is not None:
         selected_suppliers = normalize_selected_suppliers(selected_suppliers)
         if not selected_suppliers:
@@ -1506,7 +1514,14 @@ def run_discovery(
             raise ValueError("Il checkpoint appartiene a fornitori differenti")
         if job_id and state.get("filters") != filters:
             raise ValueError("Il checkpoint appartiene a filtri differenti")
+        normalized_budget = normalize_run_budget(run_budget)
+        checkpoint_budget = state.get("run_budget")
+        if job_id and checkpoint_budget is not None and checkpoint_budget != (
+            "all" if normalized_budget is None else normalized_budget
+        ):
+            raise ValueError("Il checkpoint appartiene a un budget Discovery differente")
         state["selected_suppliers"] = selected_suppliers
+        state["run_budget"] = "all" if normalized_budget is None else normalized_budget
     state.setdefault("amazon_observations", [])
     normalize_discovery_state(state)
     if state.get("checkpoint_compatibility") == "legacy_incompatible":
@@ -1551,13 +1566,27 @@ def run_discovery(
             _checkpoint(
                 checkpoint_store, state, "supplier_preparing", progress=progress,
             )
-            prepared = supplier_preparer(
-                selected_suppliers, filters, now=now_provider(),
-                progress=(
+            preparation_kwargs = {
+                "now": now_provider(),
+                "run_budget": run_budget,
+                "progress": (
                     (lambda phase, supplier: progress(
                         phase, {**state, "current_supplier": supplier}
                     )) if progress else None
                 ),
+            }
+            signature = inspect.signature(supplier_preparer)
+            accepts_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+            if accepts_kwargs or "rotation_store" in signature.parameters:
+                preparation_kwargs.update({
+                    "rotation_store": active_rotation_store,
+                    "rotation_job_id": job_id,
+                })
+            prepared = supplier_preparer(
+                selected_suppliers, filters, **preparation_kwargs,
             )
             state.update({
                 "selected_suppliers": prepared["selected_suppliers"],
@@ -1573,6 +1602,26 @@ def run_discovery(
                 "usable_suppliers": prepared.get("usable_suppliers") or [],
                 "candidates": prepared.get("candidates") or [],
                 "amazon_observations": [],
+                "total_supplier_ean_universe": prepared.get("total_supplier_ean_universe", 0),
+                "eligible_identifier_count": prepared.get("eligible_identifier_count", 0),
+                "run_budget": prepared.get("run_budget", state.get("run_budget", "all")),
+                "sampled_identifier_count": prepared.get("sampled_identifier_count", 0),
+                "sampling_strategy": prepared.get("sampling_strategy"),
+                "rotation_scope": prepared.get("rotation_scope"),
+                "rotation_cycle_id": prepared.get("rotation_cycle_id"),
+                "rotation_universe_count": prepared.get("rotation_universe_count"),
+                "rotation_analyzed_before_run": prepared.get(
+                    "rotation_analyzed_before_run", 0
+                ),
+                "rotation_selected_identifiers": prepared.get(
+                    "rotation_selected_identifiers", []
+                ),
+                "rotation_analyzed_this_run": prepared.get(
+                    "rotation_analyzed_this_run", 0
+                ),
+                "rotation_remaining_after_run": prepared.get(
+                    "rotation_remaining_after_run"
+                ),
             })
             if not state["usable_suppliers"]:
                 state["status"] = "supplier_preparation_failed"
@@ -1821,6 +1870,15 @@ def run_discovery(
             _checkpoint(checkpoint_store, state, "qogita_loaded", progress=progress)
 
         if state["phase"] in {"qogita_loaded", "suppliers_loaded"}:
+            if active_rotation_store is not None and state.get("rotation_scope"):
+                state.update(active_rotation_store.commit_catalog_results(
+                    job_id,
+                    {
+                        str(row.get("canonical_ean") or row.get("gtin") or ""):
+                        row.get("catalog_status")
+                        for row in state.get("candidates") or []
+                    },
+                ))
             pending = [row for row in state["candidates"] if not row.get("catalog_status")]
             batches = list(_chunks(pending))
             for batch_number, batch in enumerate(batches, start=1):
@@ -1832,6 +1890,16 @@ def run_discovery(
                     catalog = mapping.get(row["gtin"], {"status": "not_found"})
                     _ensure_product_listings(row, catalog)
                 checkpoint_store.save(state)
+                if active_rotation_store is not None and state.get("rotation_scope"):
+                    state.update(active_rotation_store.commit_catalog_results(
+                        job_id,
+                        {
+                            str(row.get("canonical_ean") or row.get("gtin") or ""):
+                            row.get("catalog_status")
+                            for row in batch
+                        },
+                    ))
+                    checkpoint_store.save(state)
                 logger.info("DISCOVERY CATALOG BATCH | job_id=%s batch=%s size=%s", job_id, batch_number, len(batch))
                 if batch_number < len(batches) and catalog_batch_interval:
                     sleep_func(catalog_batch_interval)
@@ -1845,6 +1913,15 @@ def run_discovery(
             ]
             state["amazon_listings"] = all_listings
             recalculate_diagnostic_funnel(state)
+            if active_rotation_store is not None and state.get("rotation_scope"):
+                state.update(active_rotation_store.commit_catalog_results(
+                    job_id,
+                    {
+                        str(row.get("canonical_ean") or row.get("gtin") or ""):
+                        row.get("catalog_status")
+                        for row in state.get("candidates") or []
+                    },
+                ))
             _checkpoint(checkpoint_store, state, "catalog_complete", progress=progress)
 
         if state["phase"] == "catalog_complete":

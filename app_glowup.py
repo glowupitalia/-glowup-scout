@@ -31,13 +31,29 @@ from discovery_amazon import (
     search_catalog_by_gtins_batch,
 )
 from discovery_excel import write_discovery_excel
+from direct_lookup import (
+    direct_scenario_rows,
+    format_eur,
+    format_percent,
+    run_direct_lookup,
+    scenario_stock_availability,
+)
 from purchase_scenarios import (
     recommended_combination,
     recommended_scenario,
     scenario_requirement_label,
     target_price,
 )
-from supplier_preparation import SUPPORTED_SUPPLIERS
+from supplier_preparation import (
+    DEFAULT_DISCOVERY_RUN_BUDGET,
+    DISCOVERY_BUDGET_OPTIONS,
+    SUPPORTED_SUPPLIERS,
+)
+from supplier_catalog import SupplierCatalogStore
+from discovery_rotation import DiscoveryRotationStore
+
+
+DISCOVERY_OPERATIONAL_SUPPLIERS = ("umma", "abw", "qudo")
 
 
 logging.basicConfig(
@@ -681,15 +697,41 @@ def discovery_filter_error(filters, selected_suppliers):
 
 def _toggle_all_discovery_suppliers():
     value = bool(st.session_state.get("discovery_supplier_all"))
-    for supplier in SUPPORTED_SUPPLIERS:
+    for supplier in DISCOVERY_OPERATIONAL_SUPPLIERS:
         st.session_state[f"discovery_supplier_{supplier}"] = value
+    st.session_state["discovery_supplier_qogita"] = False
 
 
 def _sync_all_discovery_suppliers():
     st.session_state["discovery_supplier_all"] = all(
         st.session_state.get(f"discovery_supplier_{supplier}", False)
-        for supplier in SUPPORTED_SUPPLIERS
+        for supplier in DISCOVERY_OPERATIONAL_SUPPLIERS
     )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def discovery_supplier_catalog_status():
+    store = SupplierCatalogStore()
+    return {
+        supplier: store.active_generation_metadata(supplier)
+        for supplier in SUPPORTED_SUPPLIERS
+    }
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def discovery_supplier_universe(selected_suppliers):
+    if not selected_suppliers:
+        return {"total": 0, "eligible": 0}
+    result = SupplierCatalogStore().active_identifier_universe(selected_suppliers)
+    rotation = DiscoveryRotationStore().status(selected_suppliers)
+    if not rotation.get("rotation_universe_count"):
+        rotation.update({
+            "rotation_universe_count": result["eligible"],
+            "rotation_analyzed_count": 0,
+            "rotation_remaining_count": result["eligible"],
+            "rotation_coverage_percent": 0.0,
+        })
+    return {**result, **rotation}
 
 
 def new_discovery_search():
@@ -797,23 +839,32 @@ elif ui_state == "single_result":
     )
     if st.session_state.get("single_status") == "pending":
         ean = st.session_state.get("single_ean", "")
-        with st.spinner("Analisi Amazon in corso…"):
+        with st.spinner("Confronto fornitori e analisi Amazon in corso…"):
             try:
-                token = get_access_token()
-                catalog = search_catalog(ean, token)
-                if catalog is None:
-                    st.session_state["single_status"] = "not_found"
-                    st.session_state["single_message"] = "Nessun prodotto trovato."
-                else:
-                    pricing = safe_call(search_pricing, catalog["ASIN"], token)
-                    reference_price, price_source = select_reference_price(pricing)
-                    st.session_state["single_product_result"] = {
-                        "catalog": catalog,
-                        "pricing": pricing,
-                        "reference_price": reference_price,
-                        "price_source": price_source,
-                    }
-                    st.session_state["single_status"] = "found"
+                token_provider = RefreshingTokenProvider(get_access_token)
+
+                def direct_catalog_batch(gtins, job_id, products=None):
+                    items = search_catalog_by_gtins_batch(
+                        gtins, token_provider,
+                        marketplace_id=os.environ["MARKETPLACE_ID"], job_id=job_id,
+                    )
+                    return correlate_catalog_items(gtins, items, products)
+
+                def direct_pricing_batch(asins, job_id):
+                    entries = get_item_offers_batch(
+                        asins, token_provider,
+                        marketplace_id=os.environ["MARKETPLACE_ID"], job_id=job_id,
+                    )
+                    return parse_item_offers_batch(entries)
+
+                state = run_direct_lookup(
+                    ean, catalog_batch=direct_catalog_batch,
+                    pricing_batch=direct_pricing_batch,
+                    fees_batch=search_product_fees_batch,
+                    token_provider=token_provider,
+                )
+                st.session_state["single_product_result"] = {"state": state}
+                st.session_state["single_status"] = "found"
             except Exception as error:
                 logger.exception(
                     "SINGLE PRODUCT ANALYSIS FAILED | "
@@ -832,75 +883,126 @@ elif ui_state == "single_result":
         )
     elif st.session_state.get("single_product_result"):
         single_product_result = st.session_state["single_product_result"]
-        catalog = single_product_result["catalog"]
-        pricing = single_product_result["pricing"]
-        reference_price = single_product_result["reference_price"]
-        price_source = single_product_result["price_source"]
-        ui_alert("Prodotto trovato.")
+        state = normalize_discovery_state(single_product_result["state"])
+        product = (state.get("candidates") or [{}])[0]
+        scenarios = product.get("scenarios") or []
+        listings = product.get("amazon_listings") or []
+        combination = product.get("recommended_combination") or {}
+        scenario_by_id = {
+            row.get("scenario_id"): row for row in scenarios
+        }
+        recommended = scenario_by_id.get(combination.get("scenario_id"))
+        recommended_listing = next((
+            row for row in listings
+            if row.get("asin") == combination.get("asin")
+        ), listings[0] if listings else {})
+        title = (
+            recommended_listing.get("title") or product.get("amazon_title")
+            or product.get("title") or "Prodotto supplier"
+        )
+        brand = (
+            recommended_listing.get("brand") or product.get("amazon_brand")
+            or product.get("brand") or "—"
+        )
+        asin = recommended_listing.get("asin") or product.get("asin")
+        ui_alert("Confronto completato.")
         with st.container(border=True):
-            product, kpis = st.columns([1.05, 2.25], vertical_alignment="top")
-            with product:
-                if catalog["Immagine"]:
-                    st.image(catalog["Immagine"], width="stretch")
+            identity, summary = st.columns([1.05, 2.25], vertical_alignment="top")
+            with identity:
+                image_url = recommended_listing.get("main_image") or product.get("image_url")
+                if image_url:
+                    st.image(image_url, width="stretch")
                 st.markdown(
                     '<div class="gu-product-brand">'
-                    f'{html.escape(str(display_value(catalog["Brand"])))}'
+                    f'{html.escape(str(display_value(brand)))}'
                     '</div><div class="gu-product-title">'
-                    f'{html.escape(str(display_value(catalog["Titolo"])))}'
+                    f'{html.escape(str(display_value(title)))}'
                     '</div><div class="gu-meta">'
-                    f'ASIN {html.escape(str(catalog["ASIN"]))}<br>'
-                    f'{html.escape(str(display_value(catalog["Categoria"])))}'
+                    f'EAN {html.escape(str(product.get("canonical_ean") or state.get("ean_requested") or "—"))}<br>'
+                    f'ASIN {html.escape(str(asin or "—"))}'
                     '</div>',
                     unsafe_allow_html=True,
                 )
-            with kpis:
-                first_row = st.columns(3)
-                first_row[0].metric(
-                    "BSR Beauty", display_value(catalog["BSR Beauty"])
-                )
-                first_row[1].metric(
-                    single_price_label(price_source),
-                    display_value(
-                        f"{float(reference_price):.2f} EUR"
-                        if reference_price is not None else None
-                    ),
-                )
-                first_row[2].metric("Venditori FBA", pricing["Venditori FBA"])
-                secondary_metrics = [
-                    ("Venditori totali", pricing["Venditori totali"]),
-                ]
-                if price_source != "min_fba":
-                    secondary_metrics.append(
-                        ("Prezzo minimo FBA", pricing["Prezzo minimo FBA"])
+            with summary:
+                st.subheader("Migliore opzione di acquisto")
+                if recommended and combination:
+                    columns = st.columns(4)
+                    columns[0].metric("Fornitore", str(recommended.get("supplier") or "—").upper())
+                    columns[1].metric("Scenario", recommended.get("scenario_label") or "—")
+                    columns[2].metric("Costo", format_eur(recommended.get("cost_gross_unit_eur")))
+                    columns[3].metric("Requisito", scenario_requirement_label(recommended))
+                    columns = st.columns(4)
+                    columns[0].metric("Disponibilità", scenario_stock_availability(recommended))
+                    columns[1].metric("Prezzo Amazon", format_eur(combination.get("price_reference")))
+                    columns[2].metric("Utile", format_eur(combination.get("profit")))
+                    columns[3].metric("Margine", format_percent(combination.get("margin_percent")))
+                elif scenarios:
+                    ui_alert(
+                        "Le offerte supplier sono disponibili; l’economia Amazon non è disponibile.",
+                        "warning",
                     )
-                if price_source != "min_fbm":
-                    secondary_metrics.append(
-                        ("Prezzo minimo FBM", pricing["Prezzo minimo FBM"])
+                else:
+                    ui_alert(
+                        "Nessuna offerta supplier-first disponibile nelle baseline attive.",
+                        "warning",
                     )
-                second_row = st.columns(len(secondary_metrics))
-                for column, (label, value) in zip(
-                    second_row, secondary_metrics
-                ):
-                    column.metric(label, display_value(value))
-                asin = catalog["ASIN"]
-                with st.container(
-                    key="product_amazon_actions",
-                    horizontal=True,
-                    vertical_alignment="center",
-                    gap="small",
-                ):
-                    st.link_button(
-                        "Vedi offerte Amazon",
-                        f"https://www.amazon.it/gp/offer-listing/{asin}",
-                        type="primary",
-                        use_container_width=True,
+
+        status_labels = []
+        for supplier in ("abw", "umma", "qudo", "qogita"):
+            supplier_status = (state.get("supplier_snapshot_set") or {}).get(supplier, {})
+            status = supplier_status.get("availability_status") or "unavailable"
+            count = supplier_status.get("scenario_count", 0)
+            label = f"{supplier.upper()} ✓ · {count} scenari" if status == "available" else (
+                "QOGITA — bootstrap scenari in corso" if supplier == "qogita"
+                else f"{supplier.upper()} — EAN assente"
+            )
+            status_labels.append(label)
+        st.caption(" · ".join(status_labels))
+
+        st.subheader("Confronto fornitori")
+        if scenarios:
+            st.dataframe(
+                direct_scenario_rows(state), hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.info("Nessuno scenario di acquisto disponibile nelle baseline supplier-first.")
+
+        st.subheader("Amazon")
+        if listings:
+            for listing in listings:
+                with st.container(border=True):
+                    metrics = st.columns(4)
+                    metrics[0].metric("ASIN", listing.get("asin") or "—")
+                    metrics[1].metric("BSR Beauty", display_value(listing.get("bsr_beauty")))
+                    metrics[2].metric("Prezzo riferimento", format_eur(listing.get("reference_price")))
+                    buy_box = (
+                        listing.get("reference_price")
+                        if listing.get("price_source") == "buy_box" else None
                     )
-                    st.link_button(
-                        "Apri scheda Amazon",
-                        f"https://www.amazon.it/dp/{asin}",
-                        type="primary",
-                        use_container_width=True,
-                    )
+                    metrics[3].metric("Buy Box", format_eur(buy_box))
+                    metrics = st.columns(4)
+                    metrics[0].metric("Venditori FBA", display_value(listing.get("fba_sellers")))
+                    metrics[1].metric("Venditori totali", display_value(listing.get("total_sellers")))
+                    metrics[2].metric("Prezzo minimo FBA", format_eur(listing.get("min_fba_price")))
+                    metrics[3].metric("Prezzo minimo FBM", format_eur(listing.get("min_fbm_price")))
+                    listing_asin = listing.get("asin")
+                    if listing_asin:
+                        with st.container(horizontal=True, gap="small"):
+                            st.link_button(
+                                "Vedi offerte Amazon",
+                                f"https://www.amazon.it/gp/offer-listing/{listing_asin}",
+                                type="primary", use_container_width=True,
+                            )
+                            st.link_button(
+                                "Apri scheda Amazon",
+                                f"https://www.amazon.it/dp/{listing_asin}",
+                                type="primary", use_container_width=True,
+                            )
+        else:
+            st.info(
+                "Nessuna pagina Amazon trovata. Le offerte supplier restano disponibili sopra."
+            )
 
 elif ui_state == "batch_running":
     with st.container(border=True):
@@ -1052,7 +1154,11 @@ elif ui_state == "discovery":
         )
         st.markdown("**Fornitori**")
         for supplier in SUPPORTED_SUPPLIERS:
-            st.session_state.setdefault(f"discovery_supplier_{supplier}", True)
+            st.session_state.setdefault(
+                f"discovery_supplier_{supplier}",
+                supplier in DISCOVERY_OPERATIONAL_SUPPLIERS,
+            )
+        st.session_state["discovery_supplier_qogita"] = False
         st.session_state.setdefault("discovery_supplier_all", True)
         supplier_columns = st.columns(5)
         supplier_columns[0].checkbox(
@@ -1066,11 +1172,34 @@ elif ui_state == "discovery":
             column.checkbox(
                 supplier_labels[supplier], key=f"discovery_supplier_{supplier}",
                 on_change=_sync_all_discovery_suppliers,
+                disabled=supplier == "qogita",
+                help=(
+                    "Bootstrap scenari in corso: il catalogo prodotti è completo, "
+                    "ma non esiste ancora una baseline scenari promossa."
+                    if supplier == "qogita" else None
+                ),
             )
         selected_suppliers = [
-            supplier for supplier in SUPPORTED_SUPPLIERS
+            supplier for supplier in DISCOVERY_OPERATIONAL_SUPPLIERS
             if st.session_state.get(f"discovery_supplier_{supplier}")
         ]
+        catalog_statuses = discovery_supplier_catalog_status()
+        coverage_lines = []
+        for supplier in SUPPORTED_SUPPLIERS:
+            status = catalog_statuses.get(supplier)
+            if not status:
+                coverage_lines.append(
+                    f"**{supplier_labels[supplier]}** · baseline non disponibile"
+                )
+                continue
+            coverage_lines.append(
+                f"**{supplier_labels[supplier]}** · "
+                f"{int(status.get('product_count') or 0):,} prodotti · "
+                f"{int(status.get('scenario_count') or 0):,} scenari · "
+                f"catalogo {str(status.get('product_catalog_coverage_type') or status.get('coverage_type') or 'parziale').replace('_', ' ')} · "
+                f"scenari {str(status.get('scenario_enrichment_status') or 'none')}"
+            )
+        st.caption("  \n".join(coverage_lines).replace(",", "."))
         st.markdown("**Filtri**")
         defaults = default_filters()
         first = st.columns(3)
@@ -1099,7 +1228,64 @@ elif ui_state == "discovery":
             "minimum_margin": minimum_margin,
             "minimum_qogita_stock": defaults["minimum_qogita_stock"],
         }
+        st.markdown("**Ampiezza ricerca**")
+        budget_labels = [str(value) for value in DISCOVERY_BUDGET_OPTIONS] + ["Tutto il catalogo"]
+        previous_budget = st.session_state.get(
+            "discovery_run_budget", DEFAULT_DISCOVERY_RUN_BUDGET,
+        )
+        previous_label = (
+            "Tutto il catalogo" if previous_budget in (None, "all") else str(previous_budget)
+        )
+        budget_label = st.selectbox(
+            "Prodotti da analizzare in questa ricerca",
+            budget_labels,
+            index=budget_labels.index(previous_label) if previous_label in budget_labels else 1,
+        )
+        run_budget = "all" if budget_label == "Tutto il catalogo" else int(budget_label)
+        try:
+            universe = discovery_supplier_universe(tuple(selected_suppliers))
+        except Exception:
+            universe = {"total": 0, "eligible": 0}
+        remaining = int(universe.get("rotation_remaining_count") or 0)
+        if remaining <= 0 and universe["eligible"]:
+            remaining = universe["eligible"]
+        effective_count = remaining if run_budget == "all" else min(int(run_budget), remaining)
+        st.caption(
+            f"Universo disponibile: {universe['total']:,} EAN · "
+            f"idonei: {universe['eligible']:,} · "
+            f"ciclo {int(universe.get('rotation_cycle_id') or 1)}: "
+            f"{int(universe.get('rotation_analyzed_count') or 0):,} analizzati, "
+            f"{remaining:,} rimanenti · prossima ricerca: {effective_count:,}"
+            .replace(",", ".")
+        )
+        all_confirmed = True
+        if run_budget == "all" and remaining > 5000:
+            all_confirmed = st.checkbox(
+                "Confermo di voler analizzare tutto il catalogo",
+                key="discovery_confirm_all_catalog",
+                help="La ricerca completa può generare molte chiamate Amazon e richiedere molto tempo.",
+            )
+        with st.expander("Gestione ciclo Discovery", expanded=False):
+            reset_confirmed = st.checkbox(
+                "Confermo l'avvio di un nuovo ciclo Discovery",
+                key="discovery_confirm_new_cycle",
+            )
+            if st.button(
+                "Nuovo ciclo Discovery", key="discovery_new_cycle",
+                disabled=not reset_confirmed,
+            ):
+                try:
+                    DiscoveryRotationStore().start_new_cycle(
+                        selected_suppliers, confirmed=True,
+                    )
+                    discovery_supplier_universe.clear()
+                    st.session_state["discovery_confirm_new_cycle"] = False
+                    st.rerun()
+                except Exception as exc:
+                    ui_alert(f"Impossibile avviare il nuovo ciclo: {exc}", "warning")
         validation_error = discovery_filter_error(filters, selected_suppliers)
+        if not validation_error and not all_confirmed:
+            validation_error = "Conferma esplicitamente l'analisi di tutto il catalogo."
         if validation_error:
             ui_alert(validation_error, "warning")
         if st.button(
@@ -1108,6 +1294,7 @@ elif ui_state == "discovery":
         ):
             st.session_state["discovery_filters"] = filters
             st.session_state["discovery_selected_suppliers"] = selected_suppliers
+            st.session_state["discovery_run_budget"] = run_budget
             st.session_state["discovery_job_id"] = None
             st.session_state["discovery_status"] = "ready"
             st.session_state["ui_state"] = "discovery_running"
@@ -1124,6 +1311,7 @@ elif ui_state == "discovery":
             st.session_state["discovery_selected_suppliers"] = incomplete.get(
                 "selected_suppliers"
             ) or ["qogita"]
+            st.session_state["discovery_run_budget"] = incomplete.get("run_budget", "all")
             st.session_state["discovery_job_id"] = incomplete["job_id"]
             st.session_state["discovery_status"] = "ready"
             st.session_state["ui_state"] = "discovery_running"
@@ -1219,7 +1407,10 @@ elif ui_state == "discovery_running":
                     job_id=st.session_state.get("discovery_job_id"),
                     selected_suppliers=st.session_state.get(
                         "discovery_selected_suppliers"
-                    ) or list(SUPPORTED_SUPPLIERS),
+                    ) or list(DISCOVERY_OPERATIONAL_SUPPLIERS),
+                    run_budget=st.session_state.get(
+                        "discovery_run_budget", DEFAULT_DISCOVERY_RUN_BUDGET,
+                    ),
                     progress=update_discovery_progress,
                 )
                 if state.get("checkpoint_compatibility") == "legacy_incompatible":
@@ -1322,7 +1513,9 @@ elif ui_state == "discovery_result":
                 supplier_state = snapshot_set.get(supplier) or {}
                 if supplier_state.get("availability_status") == "available":
                     supplier_summary.append(
-                        f"{supplier.upper()} · {supplier_state.get('products_count', 0)} prodotti"
+                        f"{supplier.upper()} · {supplier_state.get('products_count', 0)} prodotti · "
+                        f"aggiornato {supplier_state.get('snapshot_at') or 'n/d'} · "
+                        f"prossimo refresh {supplier_state.get('next_refresh_at') or 'n/d'}"
                     )
                 else:
                     supplier_summary.append(f"{supplier.upper()} · non disponibile")
@@ -1342,6 +1535,19 @@ elif ui_state == "discovery_result":
         with st.container(border=True):
             st.subheader("Riepilogo")
             funnel = discovery_funnel_view(state)
+            st.caption(
+                f"Universo supplier: {int(state.get('total_supplier_ean_universe') or 0):,} EAN · "
+                f"budget: {state.get('run_budget', 'all')} · "
+                f"campione analizzato: {int(state.get('sampled_identifier_count') or len(state.get('candidates') or [])):,}"
+                .replace(",", ".")
+            )
+            if state.get("rotation_scope"):
+                st.caption(
+                    f"Copertura Discovery · ciclo {state.get('rotation_cycle_id')} · "
+                    f"{int(state.get('rotation_analyzed_this_run') or 0):,} analizzati in questa run · "
+                    f"{int(state.get('rotation_remaining_after_run') or 0):,} rimanenti"
+                    .replace(",", ".")
+                )
             summary_columns = st.columns(4)
             summary_columns[0].metric(
                 "Prodotti analizzati", funnel["suppliers"]["supplier_products_total"]

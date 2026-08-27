@@ -1,13 +1,14 @@
 """Supplier-neutral cache preparation for Discovery.
 
-The module deliberately keeps refresh mechanics outside Streamlit.  Manager
-cache readers are read-only; refreshes, when needed, use only the official
-Manager scripts and their existing locks.
+The production path reads only Scout-owned, atomically promoted supplier
+catalog generations.  Legacy Manager components remain injectable solely for
+offline regression fixtures; they are never a runtime fallback.
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import time
@@ -22,10 +23,17 @@ from qogita_refresh import (
 )
 from qudo_discovery import load_qudo_cache_rows, normalize_qudo_candidates
 from umma_discovery import load_umma_cache_rows, normalize_umma_candidates
+from supplier_catalog import SupplierCatalogStore, canonical_gtin14
+from discovery_rotation import DiscoveryRotationStore, ROTATION_STRATEGY
+from supplier_weekly import WeeklySupplierStore, next_weekly_refresh
 
 
 SUPPORTED_SUPPLIERS = ("qogita", "umma", "abw", "qudo")
+DISCOVERY_BUDGET_OPTIONS = (250, 500, 1000, 2500, 5000)
+DEFAULT_DISCOVERY_RUN_BUDGET = 500
+DISCOVERY_SAMPLING_STRATEGY = ROTATION_STRATEGY
 SUPPLIER_TTL_HOURS = {"qogita": 24, "umma": 48, "abw": 48, "qudo": 48}
+SUPPLIER_FIRST_REFRESH_HOURS = {"qogita": 24, "umma": 168, "abw": 168, "qudo": 168}
 MANAGER_REFRESH_SCRIPTS = {
     "umma": "sync_umma_purchase_prices.py",
     "abw": "sync_abw_purchase_prices.py",
@@ -58,6 +66,133 @@ def normalize_selected_suppliers(values):
         if supplier in SUPPORTED_SUPPLIERS and supplier not in selected:
             selected.append(supplier)
     return selected
+
+
+def normalize_run_budget(value):
+    if value is None or str(value).strip().casefold() in {"all", "tutto", "tutto il catalogo"}:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Il budget Discovery deve essere un numero positivo o Tutto il catalogo")
+    budget = int(value)
+    if budget <= 0:
+        raise ValueError("Il budget Discovery deve essere positivo")
+    return budget
+
+
+def _candidate_membership(candidate, selected):
+    scenario_suppliers = {
+        str(row.get("supplier") or "").casefold()
+        for row in candidate.get("scenarios") or []
+    }
+    return tuple(supplier for supplier in selected if supplier in scenario_suppliers)
+
+
+def sample_discovery_candidates(candidates, selected_suppliers, run_budget):
+    """Deterministic supplier-membership stratified sample with no economic signal."""
+    selected = normalize_selected_suppliers(selected_suppliers)
+    budget = normalize_run_budget(run_budget)
+    eligible = [
+        row for row in candidates
+        if canonical_gtin14(row.get("canonical_ean")) is not None
+    ]
+    metadata = {
+        "total_supplier_ean_universe": len(candidates),
+        "eligible_identifier_count": len(eligible),
+        "run_budget": "all" if budget is None else budget,
+        "sampling_strategy": DISCOVERY_SAMPLING_STRATEGY,
+    }
+    if budget is None or budget >= len(eligible):
+        metadata["sampled_identifier_count"] = len(eligible)
+        return eligible, metadata
+
+    strata = {}
+    for candidate in eligible:
+        membership = _candidate_membership(candidate, selected) or ("unknown",)
+        strata.setdefault(membership, []).append(candidate)
+    for membership, rows in strata.items():
+        rows.sort(key=lambda row: (
+            hashlib.sha256(
+                ("|".join(membership) + ":" + str(row.get("canonical_ean"))).encode("utf-8")
+            ).hexdigest(),
+            str(row.get("canonical_ean")),
+        ))
+
+    sizes = {key: len(rows) for key, rows in strata.items()}
+    total = sum(sizes.values())
+    quotas = {key: 0 for key in strata}
+    if budget >= len(strata):
+        quotas = {key: 1 for key in strata}
+    remaining = budget - sum(quotas.values())
+    if remaining > 0:
+        capacity = {key: sizes[key] - quotas[key] for key in strata}
+        capacity_total = sum(capacity.values())
+        exact = {
+            key: (remaining * capacity[key] / capacity_total if capacity_total else 0)
+            for key in strata
+        }
+        for key in strata:
+            add = min(capacity[key], int(exact[key]))
+            quotas[key] += add
+        left = budget - sum(quotas.values())
+        order = sorted(
+            strata,
+            key=lambda key: (-(exact[key] - int(exact[key])), "|".join(key)),
+        )
+        for key in order:
+            if not left:
+                break
+            if quotas[key] < sizes[key]:
+                quotas[key] += 1
+                left -= 1
+
+    sampled = [row for key in sorted(strata) for row in strata[key][:quotas[key]]]
+    sampled.sort(key=lambda row: str(row.get("canonical_ean")))
+    metadata["sampled_identifier_count"] = len(sampled)
+    return sampled, metadata
+
+
+def _apply_run_budget(
+    prepared, selected, run_budget, *, rotation_store=None, rotation_job_id=None,
+):
+    universe_candidates = prepared.get("candidates") or []
+    if rotation_store is not None:
+        candidates, rotation_metadata = rotation_store.select(
+            rotation_job_id, universe_candidates, selected,
+            normalize_run_budget(run_budget),
+            supplier_snapshot_set=prepared.get("supplier_snapshot_set") or {},
+        )
+        metadata = {
+            "total_supplier_ean_universe": len(universe_candidates),
+            "eligible_identifier_count": sum(
+                canonical_gtin14(row.get("canonical_ean")) is not None
+                for row in universe_candidates
+            ),
+            **rotation_metadata,
+        }
+    else:
+        candidates, metadata = sample_discovery_candidates(
+            universe_candidates, selected, run_budget,
+        )
+    coverage = dict(prepared.get("coverage") or {})
+    coverage.update(metadata)
+    coverage.setdefault("universe_products_by_supplier", coverage.get("products_by_supplier") or {})
+    coverage.setdefault("universe_scenarios_by_supplier", coverage.get("scenarios_by_supplier") or {})
+    coverage["unique_eans"] = len(candidates)
+    coverage["shared_eans"] = sum(
+        len(_candidate_membership(row, selected)) > 1 for row in candidates
+    )
+    coverage["products_by_supplier"] = {
+        supplier: sum(supplier in _candidate_membership(row, selected) for row in candidates)
+        for supplier in selected
+    }
+    coverage["scenarios_by_supplier"] = {
+        supplier: sum(
+            str(scenario.get("supplier") or "").casefold() == supplier
+            for row in candidates for scenario in row.get("scenarios") or []
+        )
+        for supplier in selected
+    }
+    return {**prepared, **metadata, "candidates": candidates, "coverage": coverage}
 
 
 def _parse_timestamp(value):
@@ -168,7 +303,7 @@ def _default_components():
     }
 
 
-def prepare_suppliers(
+def _prepare_injected_components(
     selected_suppliers, filters, *, now=None, components=None, refreshers=None,
     progress=None,
 ):
@@ -303,3 +438,172 @@ def prepare_suppliers(
             if statuses[supplier]["availability_status"] == "available"
         ],
     }
+
+
+def _active_supplier_status(supplier, generation, candidates, *, now):
+    completed_at = _parse_timestamp(generation.get("completed_at"))
+    age_hours = (
+        (now - completed_at).total_seconds() / 3600
+        if completed_at is not None else None
+    )
+    products = generation.get("products") or []
+    diagnostics = generation.get("diagnostics") or {}
+    valid_identifiers = sum(bool(row.get("canonical_gtin")) for row in products)
+    scenario_count = len(generation.get("scenarios") or [])
+    weekly_state = None
+    if supplier in {"abw", "umma", "qudo"}:
+        try:
+            weekly_state = WeeklySupplierStore().latest_supplier_state(supplier)
+        except Exception:
+            weekly_state = None
+    return {
+        "supplier": supplier,
+        "snapshot_id": generation["run_id"],
+        "snapshot_at": generation.get("completed_at"),
+        "freshness": (
+            "fresh" if age_hours is not None
+            and age_hours <= SUPPLIER_FIRST_REFRESH_HOURS[supplier] else "stale"
+        ),
+        "refresh_status": "supplier_catalog_latest_success",
+        "refresh_duration_seconds": 0.0,
+        "products_count": len(candidates),
+        "catalog_products_count": len(products),
+        "identifiers_count": valid_identifiers,
+        "identifier_unresolved_count": len(products) - valid_identifiers,
+        "scenarios_count": scenario_count,
+        "availability_status": "available" if candidates else "empty",
+        "coverage_type": generation.get("product_catalog_coverage_type")
+        or generation.get("coverage_type"),
+        "coverage_description": generation.get("coverage_description"),
+        "coverage_complete": bool(
+            generation.get("product_catalog_coverage_complete")
+        ),
+        "scenario_enrichment_status": generation.get("scenario_enrichment_status"),
+        "scenario_enrichment_count": generation.get("scenario_enrichment_count"),
+        "source_count": generation.get("source_count"),
+        "enumerated_count": generation.get("enumerated_count"),
+        "age_hours": age_hours,
+        "next_refresh_at": (
+            next_weekly_refresh(now).isoformat()
+            if supplier in {"abw", "umma", "qudo"} else None
+        ),
+        "last_sync_status": (weekly_state or {}).get("status"),
+        "last_sync_error": (weekly_state or {}).get("error_message"),
+        "coverage_diagnostics": {
+            key: diagnostics.get(key) for key in (
+                "search_total_count", "enumeration_gap", "qudo_offer_products",
+                "invalid_identifier_count", "identifier_valid_count",
+            ) if diagnostics.get(key) is not None
+        },
+    }
+
+
+def _prepare_from_supplier_catalog(selected, *, now, progress, store):
+    collections = []
+    statuses = {}
+    diagnostics = {}
+    warnings = []
+    for supplier in selected:
+        if progress:
+            progress("supplier_checking", supplier)
+        generation = store.latest_success(supplier)
+        if not generation:
+            message = (
+                "Bootstrap scenari in corso; nessuna baseline promossa"
+                if supplier == "qogita" else
+                "Nessuna baseline supplier-first promossa"
+            )
+            statuses[supplier] = {
+                "supplier": supplier, "snapshot_id": None, "snapshot_at": None,
+                "freshness": "unavailable", "refresh_status": "baseline_missing",
+                "refresh_duration_seconds": 0.0, "products_count": 0,
+                "catalog_products_count": 0, "identifiers_count": 0,
+                "identifier_unresolved_count": 0, "scenarios_count": 0,
+                "availability_status": "unavailable", "coverage_type": None,
+                "coverage_description": message, "coverage_complete": False,
+                "scenario_enrichment_status": "none", "error": message,
+            }
+            diagnostics[supplier] = {"error": "active_generation_missing"}
+            warnings.append(f"{supplier.upper()}: {message}")
+            if progress:
+                progress("supplier_unavailable", supplier)
+            continue
+        candidates = store.latest_candidates(supplier)
+        status = _active_supplier_status(supplier, generation, candidates, now=now)
+        statuses[supplier] = status
+        diagnostics[supplier] = generation.get("diagnostics") or {}
+        if status["freshness"] != "fresh":
+            status["warning"] = "Baseline supplier-first oltre la cadenza settimanale"
+            warnings.append(
+                f"{supplier.upper()}: baseline non recente; ultima baseline valida preservata"
+            )
+        if not candidates:
+            warnings.append(f"{supplier.upper()}: nessuno scenario utilizzabile")
+        else:
+            collections.append(candidates)
+            if progress:
+                progress("supplier_ready", supplier)
+    candidates = merge_product_candidates(*collections)
+    supplier_eans = {
+        supplier: {
+            row.get("canonical_ean") for row in candidates
+            if supplier in (row.get("suppliers") or []) and row.get("canonical_ean")
+        }
+        for supplier in selected
+    }
+    unique_eans = {ean for values in supplier_eans.values() for ean in values}
+    return {
+        "selected_suppliers": selected,
+        "supplier_snapshot_set": statuses,
+        "supplier_diagnostics": diagnostics,
+        "supplier_warnings": warnings,
+        "candidates": candidates,
+        "coverage": {
+            "unique_eans": len(unique_eans),
+            "shared_eans": sum(
+                sum(ean in values for values in supplier_eans.values()) > 1
+                for ean in unique_eans
+            ),
+            "products_by_supplier": {
+                supplier: len(values) for supplier, values in supplier_eans.items()
+            },
+            "catalog_products_by_supplier": {
+                supplier: statuses[supplier].get("catalog_products_count", 0)
+                for supplier in selected
+            },
+            "scenarios_by_supplier": {
+                supplier: statuses[supplier].get("scenarios_count", 0)
+                for supplier in selected
+            },
+        },
+        "usable_suppliers": [
+            supplier for supplier in selected
+            if statuses[supplier]["availability_status"] == "available"
+        ],
+    }
+
+
+def prepare_suppliers(
+    selected_suppliers, filters, *, now=None, components=None, refreshers=None,
+    progress=None, store=None, run_budget=None, rotation_store=None,
+    rotation_job_id=None,
+):
+    """Freeze active Scout supplier generations; never fall back to Manager."""
+    selected = normalize_selected_suppliers(selected_suppliers)
+    if not selected:
+        raise ValueError("Seleziona almeno un fornitore")
+    now = now or datetime.now(timezone.utc)
+    if components is not None:
+        prepared = _prepare_injected_components(
+            selected, filters, now=now, components=components,
+            refreshers=refreshers, progress=progress,
+        )
+    else:
+        prepared = _prepare_from_supplier_catalog(
+            selected, now=now, progress=progress,
+            store=store or SupplierCatalogStore(),
+        )
+    return _apply_run_budget(
+        prepared, selected, run_budget,
+        rotation_store=rotation_store, rotation_job_id=rotation_job_id,
+    )

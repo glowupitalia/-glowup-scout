@@ -9,15 +9,27 @@ from streamlit.testing.v1 import AppTest
 
 from discovery import DiscoveryCheckpointStore, default_filters, run_discovery, validate_filters
 from supplier_preparation import (
+    DISCOVERY_SAMPLING_STRATEGY,
     SUPPORTED_SUPPLIERS,
     inspect_supplier_rows,
     normalize_selected_suppliers,
     prepare_suppliers,
     refresh_manager_supplier,
+    sample_discovery_candidates,
 )
+from supplier_catalog import SupplierCatalogGeneration, SupplierCatalogStore, candidates_to_cache_records
 
 
 NOW = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+
+
+def valid_ean(index):
+    prefix = f"{index:012d}"
+    total = sum(
+        int(char) * (1 if position % 2 == 0 else 3)
+        for position, char in enumerate(prefix)
+    )
+    return prefix + str((10 - total % 10) % 10)
 
 
 def scenario(supplier, ean, suffix="one"):
@@ -68,6 +80,28 @@ def component(supplier, *, ean="8809532220748", rows=None):
 
 
 class SupplierPreparationTests(unittest.TestCase):
+    def test_budget_sample_is_deterministic_and_exact(self):
+        rows = [candidate("umma", valid_ean(index)) for index in range(700)]
+        first, metadata = sample_discovery_candidates(rows, ["umma"], 500)
+        second, second_metadata = sample_discovery_candidates(list(reversed(rows)), ["umma"], 500)
+        self.assertEqual([row["canonical_ean"] for row in first], [row["canonical_ean"] for row in second])
+        self.assertEqual(len(first), 500)
+        self.assertEqual(metadata, second_metadata)
+        self.assertEqual(metadata["sampling_strategy"], DISCOVERY_SAMPLING_STRATEGY)
+
+    def test_budget_preserves_cross_supplier_stratum(self):
+        rows = [candidate("umma", valid_ean(index)) for index in range(20)]
+        shared = candidate("umma", valid_ean(999999))
+        shared["scenarios"].append(scenario("abw", shared["canonical_ean"]))
+        sampled, _ = sample_discovery_candidates(rows + [shared], ["umma", "abw"], 5)
+        self.assertIn(valid_ean(999999), {row["canonical_ean"] for row in sampled})
+
+    def test_all_catalog_keeps_entire_eligible_union(self):
+        rows = [candidate("umma", valid_ean(index)) for index in range(7)]
+        sampled, metadata = sample_discovery_candidates(rows, ["umma"], "all")
+        self.assertEqual(len(sampled), 7)
+        self.assertEqual(metadata["run_budget"], "all")
+
     def test_selection_is_supported_deduplicated_and_ordered(self):
         self.assertEqual(
             normalize_selected_suppliers(["UMMA", "qogita", "umma", "other"]),
@@ -124,6 +158,40 @@ class SupplierPreparationTests(unittest.TestCase):
             "manager_tracked_products",
         )
 
+    def test_production_path_uses_only_active_scout_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SupplierCatalogStore(Path(temporary) / "catalog.sqlite3")
+            products, scenarios = candidates_to_cache_records([candidate("umma")])
+            value = SupplierCatalogGeneration(
+                supplier="umma", coverage_type="partial_catalog",
+                coverage_description="4.185 di 4.212 prodotti enumerati",
+                coverage_complete=False, products=products, scenarios=scenarios,
+                source_count=4212, enumerated_count=4185, unique_count=4185,
+                completeness_status="partial_catalog",
+                product_catalog_coverage_type="partial_catalog",
+                product_catalog_coverage_complete=False,
+                scenario_enrichment_status="partial",
+                scenario_enrichment_count=1,
+                diagnostics={"search_total_count": 4212, "enumeration_gap": 27},
+            )
+            run_id = store.start_run(
+                "umma", coverage_type="partial_catalog",
+                coverage_description=value.coverage_description,
+                coverage_complete=False, sampled=False,
+            )
+            store.publish(run_id, value, elapsed_seconds=1)
+            result = prepare_suppliers(
+                ["umma", "qogita"], default_filters(), now=datetime.now(timezone.utc),
+                store=store,
+            )
+        self.assertEqual(result["usable_suppliers"], ["umma"])
+        self.assertEqual(result["supplier_snapshot_set"]["umma"]["snapshot_id"], run_id)
+        self.assertEqual(result["supplier_snapshot_set"]["umma"]["source_count"], 4212)
+        self.assertEqual(
+            result["supplier_snapshot_set"]["qogita"]["refresh_status"],
+            "baseline_missing",
+        )
+
     def test_stale_refresh_success_reloads_new_generation(self):
         stale = [{"gtin": "8809532220748", "run_id": "old", "observed_at": "2026-08-20T10:00:00Z"}]
         fresh = [fresh_row()]
@@ -175,6 +243,21 @@ class SupplierPreparationTests(unittest.TestCase):
                     catalog_batch=lambda *args: {}, pricing_batch=lambda *args: {},
                     fees_batch=lambda *args: [], token_provider=object(),
                     selected_suppliers=["umma"], job_id=state["job_id"],
+                )
+
+    def test_resume_rejects_changed_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = DiscoveryCheckpointStore(temporary)
+            state = store.create(default_filters())
+            state.update({"selected_suppliers": ["umma"], "run_budget": 500})
+            store.save(state)
+            with self.assertRaisesRegex(ValueError, "budget Discovery differente"):
+                run_discovery(
+                    default_filters(), checkpoint_store=store,
+                    catalog_batch=lambda *args: {}, pricing_batch=lambda *args: {},
+                    fees_batch=lambda *args: [], token_provider=object(),
+                    selected_suppliers=["umma"], run_budget=250,
+                    job_id=state["job_id"],
                 )
 
     def test_resume_after_frozen_snapshot_does_not_prepare_again(self):
@@ -240,13 +323,21 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         app = self.discovery_app()
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(
-            [(row.label, row.value) for row in app.checkbox],
-            [("Tutti", True), ("Qogita", True), ("UMMA", True), ("ABW", True), ("Qudo", True)],
+            [
+                (row.label, row.value) for row in app.checkbox
+                if row.label in {"Tutti", "Qogita", "UMMA", "ABW", "Qudo"}
+            ],
+            [("Tutti", True), ("Qogita", False), ("UMMA", True), ("ABW", True), ("Qudo", True)],
         )
+        self.assertTrue(next(row for row in app.checkbox if row.label == "Qogita").disabled)
         values = {row.label: row.value for row in app.number_input}
         self.assertEqual(values["BSR minimo"], 0)
         self.assertEqual(values["BSR massimo"], 20000)
         self.assertEqual(values["Margine minimo %"], 15)
+        self.assertEqual(
+            next(row for row in app.selectbox if row.label == "Prodotti da analizzare in questa ricerca").value,
+            "500",
+        )
 
     def test_tutti_tracks_individual_selection(self):
         app = self.discovery_app()
