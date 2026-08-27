@@ -53,7 +53,7 @@ from supplier_catalog import SupplierCatalogStore
 from discovery_rotation import DiscoveryRotationStore
 
 
-DISCOVERY_OPERATIONAL_SUPPLIERS = ("umma", "abw", "qudo")
+DISCOVERY_OPERATIONAL_SUPPLIERS = ("qogita", "umma", "abw", "qudo")
 
 
 logging.basicConfig(
@@ -698,14 +698,20 @@ def discovery_filter_error(filters, selected_suppliers):
 def _toggle_all_discovery_suppliers():
     value = bool(st.session_state.get("discovery_supplier_all"))
     for supplier in DISCOVERY_OPERATIONAL_SUPPLIERS:
-        st.session_state[f"discovery_supplier_{supplier}"] = value
-    st.session_state["discovery_supplier_qogita"] = False
+        available = supplier != "qogita" or bool(
+            st.session_state.get("discovery_supplier_available_qogita")
+        )
+        st.session_state[f"discovery_supplier_{supplier}"] = value and available
 
 
 def _sync_all_discovery_suppliers():
+    selectable = [
+        supplier for supplier in DISCOVERY_OPERATIONAL_SUPPLIERS
+        if supplier != "qogita" or st.session_state.get("discovery_supplier_available_qogita")
+    ]
     st.session_state["discovery_supplier_all"] = all(
         st.session_state.get(f"discovery_supplier_{supplier}", False)
-        for supplier in DISCOVERY_OPERATIONAL_SUPPLIERS
+        for supplier in selectable
     )
 
 
@@ -713,7 +719,10 @@ def _sync_all_discovery_suppliers():
 def discovery_supplier_catalog_status():
     store = SupplierCatalogStore()
     return {
-        supplier: store.active_generation_metadata(supplier)
+        supplier: (
+            store.serving_generation_metadata(supplier) if supplier == "qogita"
+            else store.active_generation_metadata(supplier)
+        )
         for supplier in SUPPORTED_SUPPLIERS
     }
 
@@ -953,6 +962,8 @@ elif ui_state == "single_result":
             status = supplier_status.get("availability_status") or "unavailable"
             count = supplier_status.get("scenario_count", 0)
             label = f"{supplier.upper()} ✓ · {count} scenari" if status == "available" else (
+                "QOGITA — prodotto a catalogo, scenari non ancora verificati"
+                if supplier == "qogita" and status == "catalog_present_scenarios_pending" else
                 "QOGITA — bootstrap scenari in corso" if supplier == "qogita"
                 else f"{supplier.upper()} — EAN assente"
             )
@@ -1153,13 +1164,20 @@ elif ui_state == "discovery":
             "e vendere su Amazon"
         )
         st.markdown("**Fornitori**")
+        catalog_statuses = discovery_supplier_catalog_status()
+        qogita_available = bool(catalog_statuses.get("qogita"))
+        st.session_state["discovery_supplier_available_qogita"] = qogita_available
         for supplier in SUPPORTED_SUPPLIERS:
             st.session_state.setdefault(
                 f"discovery_supplier_{supplier}",
-                supplier in DISCOVERY_OPERATIONAL_SUPPLIERS,
+                supplier in DISCOVERY_OPERATIONAL_SUPPLIERS
+                and (supplier != "qogita" or qogita_available),
             )
-        st.session_state["discovery_supplier_qogita"] = False
+        if not qogita_available:
+            st.session_state["discovery_supplier_qogita"] = False
         st.session_state.setdefault("discovery_supplier_all", True)
+        if qogita_available and st.session_state.get("discovery_supplier_all"):
+            st.session_state["discovery_supplier_qogita"] = True
         supplier_columns = st.columns(5)
         supplier_columns[0].checkbox(
             "Tutti", key="discovery_supplier_all",
@@ -1172,18 +1190,17 @@ elif ui_state == "discovery":
             column.checkbox(
                 supplier_labels[supplier], key=f"discovery_supplier_{supplier}",
                 on_change=_sync_all_discovery_suppliers,
-                disabled=supplier == "qogita",
+                disabled=supplier == "qogita" and not qogita_available,
                 help=(
-                    "Bootstrap scenari in corso: il catalogo prodotti è completo, "
-                    "ma non esiste ancora una baseline scenari promossa."
-                    if supplier == "qogita" else None
+                    "Bootstrap scenari in corso: Qogita diventa selezionabile dopo "
+                    "il primo snapshot serving verificato."
+                    if supplier == "qogita" and not qogita_available else None
                 ),
             )
         selected_suppliers = [
             supplier for supplier in DISCOVERY_OPERATIONAL_SUPPLIERS
             if st.session_state.get(f"discovery_supplier_{supplier}")
         ]
-        catalog_statuses = discovery_supplier_catalog_status()
         coverage_lines = []
         for supplier in SUPPORTED_SUPPLIERS:
             status = catalog_statuses.get(supplier)
@@ -1192,13 +1209,24 @@ elif ui_state == "discovery":
                     f"**{supplier_labels[supplier]}** · baseline non disponibile"
                 )
                 continue
-            coverage_lines.append(
-                f"**{supplier_labels[supplier]}** · "
-                f"{int(status.get('product_count') or 0):,} prodotti · "
-                f"{int(status.get('scenario_count') or 0):,} scenari · "
-                f"catalogo {str(status.get('product_catalog_coverage_type') or status.get('coverage_type') or 'parziale').replace('_', ' ')} · "
-                f"scenari {str(status.get('scenario_enrichment_status') or 'none')}"
-            )
+            if supplier == "qogita" and status.get("serving_snapshot"):
+                coverage_lines.append(
+                    f"**Qogita** · Catalogo {int(status.get('product_catalog_count') or 0):,} prodotti · "
+                    f"Scenari verificati {int(status.get('enriched_product_count') or 0):,} / "
+                    f"{int(status.get('product_catalog_count') or 0):,} · "
+                    f"Copertura {float(status.get('coverage_percent') or 0):.2f}% · "
+                    f"Bootstrap {status.get('duty_state') or 'in corso'} · "
+                    f"ultimo snapshot {status.get('created_at') or '—'} · "
+                    f"prossima transizione {status.get('current_window_deadline') or status.get('rest_until') or '—'}"
+                )
+            else:
+                coverage_lines.append(
+                    f"**{supplier_labels[supplier]}** · "
+                    f"{int(status.get('product_count') or 0):,} prodotti · "
+                    f"{int(status.get('scenario_count') or 0):,} scenari · "
+                    f"catalogo {str(status.get('product_catalog_coverage_type') or status.get('coverage_type') or 'parziale').replace('_', ' ')} · "
+                    f"scenari {str(status.get('scenario_enrichment_status') or 'none')}"
+                )
         st.caption("  \n".join(coverage_lines).replace(",", "."))
         st.markdown("**Filtri**")
         defaults = default_filters()

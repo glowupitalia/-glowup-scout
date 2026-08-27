@@ -467,7 +467,9 @@ def _active_supplier_status(supplier, generation, candidates, *, now):
         "refresh_status": "supplier_catalog_latest_success",
         "refresh_duration_seconds": 0.0,
         "products_count": len(candidates),
-        "catalog_products_count": len(products),
+        "catalog_products_count": int(
+            generation.get("product_catalog_count") or len(products)
+        ),
         "identifiers_count": valid_identifiers,
         "identifier_unresolved_count": len(products) - valid_identifiers,
         "scenarios_count": scenario_count,
@@ -480,6 +482,11 @@ def _active_supplier_status(supplier, generation, candidates, *, now):
         ),
         "scenario_enrichment_status": generation.get("scenario_enrichment_status"),
         "scenario_enrichment_count": generation.get("scenario_enrichment_count"),
+        "usable_identifier_count": generation.get("usable_identifier_count"),
+        "coverage_percent": generation.get("coverage_percent"),
+        "bootstrap_state": generation.get("bootstrap_state"),
+        "bootstrap_window_number": generation.get("bootstrap_window_number"),
+        "serving_generation_id": generation.get("serving_generation_id"),
         "source_count": generation.get("source_count"),
         "enumerated_count": generation.get("enumerated_count"),
         "age_hours": age_hours,
@@ -506,10 +513,13 @@ def _prepare_from_supplier_catalog(selected, *, now, progress, store):
     for supplier in selected:
         if progress:
             progress("supplier_checking", supplier)
-        generation = store.latest_success(supplier)
+        generation = (
+            store.latest_serving(supplier) if supplier == "qogita"
+            else store.latest_success(supplier)
+        )
         if not generation:
             message = (
-                "Bootstrap scenari in corso; nessuna baseline promossa"
+                "Bootstrap scenari in corso; nessuno snapshot serving disponibile"
                 if supplier == "qogita" else
                 "Nessuna baseline supplier-first promossa"
             )

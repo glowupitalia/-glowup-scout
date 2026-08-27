@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from decimal import Decimal
@@ -16,6 +17,8 @@ from direct_lookup import (
 )
 from purchase_scenarios import product_key
 from product_fees import ProductFeeBatchResults
+from qogita_bootstrap import QogitaBootstrapStore
+from qogita_serving import QogitaServingStore
 from supplier_catalog import (
     SupplierCatalogGeneration,
     SupplierCatalogStore,
@@ -78,6 +81,45 @@ def publish(store, supplier, scenarios=None):
     )
     store.publish(run_id, generation, elapsed_seconds=1)
     return run_id
+
+
+def publish_qogita_serving(store):
+    scenarios = [scenario("qogita", suffix="mov_500", cost="7")]
+    products, scenario_rows = candidates_to_cache_records([
+        candidate("qogita", scenarios=scenarios)
+    ])
+    generation = SupplierCatalogGeneration(
+        supplier="qogita", coverage_type="full_account_catalog",
+        coverage_description="full catalog fixture", coverage_complete=True,
+        products=products, scenarios=scenario_rows,
+        completeness_status="full_account_catalog",
+        product_catalog_coverage_type="full_account_catalog",
+        product_catalog_coverage_complete=True,
+        scenario_enrichment_status="partial", scenario_enrichment_count=1,
+    )
+    run_id = store.start_run(
+        "qogita", coverage_type="full_account_catalog",
+        coverage_description="fixture", coverage_complete=True, sampled=False,
+    )
+    store.publish(run_id, generation, elapsed_seconds=1, promote=False)
+    bootstrap_store = QogitaBootstrapStore(store.path)
+    bootstrap = bootstrap_store.create_production_bootstrap(run_id)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """UPDATE supplier_catalog_products SET variant_fid='FID-QOGITA',
+                      variant_fid_source='fixture',enrichment_status='enriched',
+                      offer_tier_observed_at='2026-08-27T10:00:00Z'
+                WHERE run_id=?""", (run_id,),
+        )
+        connection.execute(
+            """UPDATE qogita_bootstrap_products SET status='enriched',
+                      variant_fid='FID-QOGITA',scenario_count=1,
+                      completed_at='2026-08-27T10:00:00Z'
+                WHERE bootstrap_run_id=?""", (bootstrap["bootstrap_run_id"],),
+        )
+    return QogitaServingStore(store.path).build_snapshot(
+        bootstrap["bootstrap_run_id"], window_number=1, bootstrap_state="running",
+    )
 
 
 def catalog_found(gtins, _job_id, _products=None):
@@ -144,7 +186,7 @@ class DirectLookupTests(unittest.TestCase):
         context = load_direct_supplier_context(EAN, store=self.store)
         self.assertEqual(context["supplier_memberships"], ["abw", "qudo", "umma"])
         self.assertEqual(len(context["candidate"]["scenarios"]), 4)
-        self.assertEqual(context["supplier_snapshot_set"]["qogita"]["availability_status"], "disabled")
+        self.assertEqual(context["supplier_snapshot_set"]["qogita"]["availability_status"], "unavailable")
 
     def test_each_operational_supplier_can_be_loaded_alone(self):
         for supplier in ("abw", "umma", "qudo"):
@@ -156,6 +198,17 @@ class DirectLookupTests(unittest.TestCase):
                 context = load_direct_supplier_context(EAN, store=isolated)
                 self.assertEqual(context["supplier_memberships"], [supplier])
                 self.assertEqual(len(context["candidate"]["scenarios"]), 1)
+
+    def test_direct_lookup_reads_enriched_qogita_from_serving_not_latest_success(self):
+        snapshot = publish_qogita_serving(self.store)
+        self.assertIsNone(self.store.active_generation_metadata("qogita"))
+        context = load_direct_supplier_context(EAN, store=self.store)
+        self.assertIn("qogita", context["supplier_memberships"])
+        self.assertEqual(
+            context["supplier_snapshot_set"]["qogita"]["snapshot_id"],
+            snapshot["serving_generation_id"],
+        )
+        self.assertEqual(context["supplier_snapshot_set"]["qogita"]["scenario_count"], 1)
 
     def test_active_identifier_lookup_handles_zero_padded_gtin(self):
         publish(self.store, "qudo")

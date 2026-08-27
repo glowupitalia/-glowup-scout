@@ -12,6 +12,7 @@ import shutil
 import sys
 import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,9 @@ from qogita_bootstrap import (
     run_qogita_bootstrap_concurrent,
 )
 from supplier_catalog import DEFAULT_DATABASE_PATH
+from qogita_serving import (
+    QogitaServingStore, REST_WINDOW_SECONDS, RUN_WINDOW_SECONDS,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -178,6 +182,8 @@ def _parser():
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--minimum-free-bytes", type=int, default=DEFAULT_MINIMUM_FREE_BYTES)
     parser.add_argument("--max-products", type=int)
+    parser.add_argument("--run-window-seconds", type=int, default=RUN_WINDOW_SECONDS)
+    parser.add_argument("--rest-window-seconds", type=int, default=REST_WINDOW_SECONDS)
     parser.add_argument("--execute", action="store_true")
     return parser
 
@@ -211,6 +217,7 @@ def main(argv=None):
         logging.info("Qogita production bootstrap is already running")
         return 0
     store = QogitaBootstrapStore(database)
+    serving_store = QogitaServingStore(database)
     run = store.bootstrap(pointer["bootstrap_run_id"])
     if not run or run.get("staging_run_id") != pointer["source_generation_id"]:
         raise SystemExit("Configured bootstrap/source pair does not exist")
@@ -219,14 +226,7 @@ def main(argv=None):
     if run.get("status") == "awaiting_promotion_review":
         logging.info("Qogita bootstrap already awaits promotion review")
         return 0
-    store.resume_production(pointer["bootstrap_run_id"])
-    guard = ProductionHealthGuard(
-        store=store, bootstrap_run_id=pointer["bootstrap_run_id"],
-        database=database, minimum_free_bytes=args.minimum_free_bytes,
-    )
     try:
-        initial = guard.initial_check()
-        logging.info("Qogita production bootstrap preflight: %s", initial)
         base_url = os.environ.get("QOGITA_BASE_URL", "https://api.qogita.com")
         credentials = {"base_url": base_url, "email": email, "password": password}
 
@@ -235,23 +235,120 @@ def main(argv=None):
                 **credentials, auth_manager=auth_manager, rate_limiter=rate_limiter,
             )
 
-        result = run_qogita_bootstrap_concurrent(
-            pointer["bootstrap_run_id"], store=store, client_factory=client_factory,
-            workers=2, max_products=args.max_products,
-            checkpoint_every=max(1, args.checkpoint_every),
-            product_link_pacing=args.product_link_pacing,
-            offers_pacing=args.offers_pacing,
-            health_callback=guard.product, checkpoint_callback=guard.checkpoint,
-            **credentials,
-        )
-        logging.info(
-            "Qogita production bootstrap invocation ended: status=%s attempted=%s",
-            result.get("status"), result.get("invocation_products_attempted"),
-        )
-        return 0
+        while True:
+            duty = serving_store.ensure_running_window(
+                pointer["bootstrap_run_id"], run_window_seconds=args.run_window_seconds,
+                rest_window_seconds=args.rest_window_seconds,
+            )
+            if duty["state"] == "completed":
+                logging.info("Qogita duty cycle is complete and awaits promotion review")
+                return 0
+            if duty["state"] == "auto_stopped":
+                logging.error("Qogita duty cycle is auto-stopped; operator review required")
+                return 0
+            if duty["state"] == "checkpointing":
+                current = store.bootstrap(pointer["bootstrap_run_id"]) or {}
+                progress = current.get("last_progress") or {}
+                complete = current.get("status") == "awaiting_promotion_review" or not int(
+                    progress.get("remaining") or 0
+                )
+                wal = serving_store.checkpoint_sqlite()
+                snapshot = serving_store.build_snapshot(
+                    pointer["bootstrap_run_id"], window_number=int(duty["window_number"]),
+                    bootstrap_state=("completed" if complete else "resting"),
+                )
+                if complete:
+                    serving_store.mark_completed(
+                        pointer["bootstrap_run_id"],
+                        serving_generation_id=snapshot["serving_generation_id"],
+                    )
+                    return 0
+                rest = serving_store.begin_rest(
+                    pointer["bootstrap_run_id"],
+                    serving_generation_id=snapshot["serving_generation_id"],
+                )
+                logging.info(
+                    "Recovered checkpointing window; snapshot=%s WAL=%s REST until %s",
+                    snapshot["serving_generation_id"], wal, rest["rest_until"],
+                )
+                continue
+            if duty["state"] == "resting":
+                rest_until = datetime.fromisoformat(
+                    duty["rest_until"].replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+                remaining = max(0.0, (rest_until - datetime.now(timezone.utc)).total_seconds())
+                if remaining:
+                    logging.info("Qogita REST window; no supplier traffic until %s", duty["rest_until"])
+                    time.sleep(min(remaining, 60.0))
+                    continue
+                continue
+
+            store.resume_production(pointer["bootstrap_run_id"])
+            guard = ProductionHealthGuard(
+                store=store, bootstrap_run_id=pointer["bootstrap_run_id"],
+                database=database, minimum_free_bytes=args.minimum_free_bytes,
+            )
+            initial = guard.initial_check()
+            logging.info(
+                "Qogita duty window %s preflight: %s", duty["window_number"], initial,
+            )
+            deadline = datetime.fromisoformat(
+                duty["current_window_deadline"].replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+            result = run_qogita_bootstrap_concurrent(
+                pointer["bootstrap_run_id"], store=store, client_factory=client_factory,
+                workers=2, max_products=args.max_products,
+                checkpoint_every=max(1, args.checkpoint_every),
+                product_link_pacing=args.product_link_pacing,
+                offers_pacing=args.offers_pacing,
+                health_callback=guard.product, checkpoint_callback=guard.checkpoint,
+                graceful_stop_callback=lambda: datetime.now(timezone.utc) >= deadline,
+                **credentials,
+            )
+            logging.info(
+                "Qogita duty invocation ended: status=%s attempted=%s graceful=%s",
+                result.get("status"), result.get("invocation_products_attempted"),
+                result.get("graceful_stop"),
+            )
+            if result.get("auto_stop_reason"):
+                serving_store.mark_auto_stopped(pointer["bootstrap_run_id"])
+                return 0
+            progress = result.get("last_progress") or {}
+            complete = result.get("status") == "awaiting_promotion_review" or not int(
+                progress.get("remaining") or 0
+            )
+            if result.get("graceful_stop") or complete:
+                serving_store.mark_checkpointing(pointer["bootstrap_run_id"])
+                wal = serving_store.checkpoint_sqlite()
+                snapshot = serving_store.build_snapshot(
+                    pointer["bootstrap_run_id"], window_number=int(duty["window_number"]),
+                    bootstrap_state=("completed" if complete else "resting"),
+                )
+                if complete:
+                    serving_store.mark_completed(
+                        pointer["bootstrap_run_id"],
+                        serving_generation_id=snapshot["serving_generation_id"],
+                    )
+                    logging.info(
+                        "Qogita final serving snapshot %s created; promotion remains pending",
+                        snapshot["serving_generation_id"],
+                    )
+                    return 0
+                rest = serving_store.begin_rest(
+                    pointer["bootstrap_run_id"],
+                    serving_generation_id=snapshot["serving_generation_id"],
+                )
+                logging.info(
+                    "Qogita serving snapshot %s created; WAL=%s; REST until %s",
+                    snapshot["serving_generation_id"], wal, rest["rest_until"],
+                )
+                continue
+            # A bounded diagnostic invocation must not spin or create a snapshot.
+            return 0
     except Exception as exc:
         logging.exception("Qogita production bootstrap stopped safely: %s", type(exc).__name__)
         store.mark_stopped(pointer["bootstrap_run_id"], str(exc))
+        serving_store.mark_auto_stopped(pointer["bootstrap_run_id"])
         return 0
     finally:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)

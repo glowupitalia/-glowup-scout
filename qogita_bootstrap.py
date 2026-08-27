@@ -1702,6 +1702,7 @@ def run_qogita_bootstrap_concurrent(
     sleep_func: Callable[[float], None] = time.sleep,
     health_callback: Callable[[dict[str, Any]], str | None] | None = None,
     checkpoint_callback: Callable[[dict[str, Any]], None] | None = None,
+    graceful_stop_callback: Callable[[], bool] | None = None,
 ):
     """Bounded persistent worker pool; default remains one worker, maximum two."""
     if workers not in {1, 2}:
@@ -1730,6 +1731,7 @@ def run_qogita_bootstrap_concurrent(
     progress_lock = threading.Lock()
     stop_event = threading.Event()
     stop_reason = None
+    graceful_stop = False
     processed = 0
     queue_wait_seconds = 0.0
     invocation_started = time.monotonic()
@@ -1775,13 +1777,20 @@ def run_qogita_bootstrap_concurrent(
             return True
 
     def worker(worker_number: int):
-        nonlocal processed, queue_wait_seconds, budget, stop_reason
+        nonlocal processed, queue_wait_seconds, budget, stop_reason, graceful_stop
         worker_id = f"worker-{worker_number}-{uuid4().hex[:8]}"
         client = client_factory(auth, limiter)
         with clients_lock:
             clients.append(client)
         try:
-            while not stop_event.is_set() and reserve():
+            while not stop_event.is_set():
+                if graceful_stop_callback and graceful_stop_callback():
+                    with progress_lock:
+                        graceful_stop = True
+                        stop_event.set()
+                    break
+                if not reserve():
+                    break
                 claimed = store.claim_batch(
                     bootstrap_run_id, worker_id=worker_id,
                     limit=max(1, int(claim_size)), lease_seconds=lease_seconds,
@@ -1816,6 +1825,9 @@ def run_qogita_bootstrap_concurrent(
                         if reason and not stop_reason:
                             stop_reason = str(reason)
                             stop_event.set()
+                        elif graceful_stop_callback and graceful_stop_callback():
+                            graceful_stop = True
+                            stop_event.set()
                     if should_checkpoint:
                         checkpoint(checkpoint_every)
                     if stop_event.is_set():
@@ -1842,6 +1854,7 @@ def run_qogita_bootstrap_concurrent(
     final["global_rate_wait_seconds"] = dict(limiter.wait_seconds)
     final["effective_pacing"] = dict(limiter.intervals)
     final["auto_stop_reason"] = stop_reason
+    final["graceful_stop"] = graceful_stop
     final["queue_wait_seconds"] = queue_wait_seconds
     final["claim_summary"] = store.claim_summary(bootstrap_run_id)
     return final

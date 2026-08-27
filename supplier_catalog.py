@@ -912,26 +912,123 @@ class SupplierCatalogStore:
             result["diagnostics"] = json.loads(result.pop("diagnostics_json") or "{}")
             return result
 
+    def serving_generation_metadata(self, supplier: str) -> dict[str, Any] | None:
+        """Return a validated partial serving snapshot without implying promotion."""
+        supplier = _validate_supplier(supplier)
+        if supplier != "qogita":
+            return self.active_generation_metadata(supplier)
+        from qogita_serving import QogitaServingStore
+
+        snapshot = QogitaServingStore(self.path).active_snapshot()
+        if not snapshot:
+            return None
+        duty = QogitaServingStore(self.path).duty_state(snapshot["bootstrap_run_id"]) or {}
+        return {
+            **snapshot,
+            "run_id": snapshot["serving_generation_id"],
+            "completed_at": snapshot["created_at"],
+            "coverage_type": snapshot["product_catalog_coverage_type"],
+            "coverage_description": (
+                "Full account product catalog; partial verified offer/tier serving snapshot"
+            ),
+            "coverage_complete": snapshot["product_catalog_coverage_complete"],
+            "product_count": snapshot["product_catalog_count"],
+            "scenario_enrichment_count": snapshot["enriched_product_count"],
+            "scenario_count": snapshot["scenario_count"],
+            "sampled": False,
+            "serving_snapshot": True,
+            "duty_state": duty.get("state"),
+            "current_window_started_at": duty.get("current_window_started_at"),
+            "current_window_deadline": duty.get("current_window_deadline"),
+            "rest_until": duty.get("rest_until"),
+        }
+
+    def latest_serving(self, supplier: str) -> dict[str, Any] | None:
+        """Load immutable data referenced by the active serving snapshot."""
+        supplier = _validate_supplier(supplier)
+        if supplier != "qogita":
+            return self.latest_success(supplier)
+        metadata = self.serving_generation_metadata(supplier)
+        if not metadata:
+            return None
+        self.initialize()
+        with _connect(self.path) as connection:
+            products = []
+            for row in connection.execute(
+                """SELECT product.* FROM qogita_serving_memberships membership
+                     JOIN supplier_catalog_products product
+                       ON product.run_id=?
+                      AND product.canonical_product_key=membership.canonical_product_key
+                    WHERE membership.serving_generation_id=?
+                    ORDER BY product.canonical_product_key""",
+                (metadata["source_generation_id"], metadata["serving_generation_id"]),
+            ):
+                product = dict(row)
+                product["raw_identifiers"] = json.loads(
+                    product.pop("raw_identifiers_json") or "[]"
+                )
+                product["metadata"] = json.loads(product.pop("metadata_json") or "{}")
+                products.append(product)
+            scenarios = []
+            for row in connection.execute(
+                """SELECT scenario.canonical_product_key,scenario.payload_json
+                     FROM qogita_serving_memberships membership
+                     JOIN supplier_catalog_scenarios scenario
+                       ON scenario.run_id=?
+                      AND scenario.canonical_product_key=membership.canonical_product_key
+                    WHERE membership.serving_generation_id=?
+                    ORDER BY scenario.scenario_id""",
+                (metadata["source_generation_id"], metadata["serving_generation_id"]),
+            ):
+                scenario = normalize_purchase_scenario(json.loads(row["payload_json"]))
+                scenario["supplier_catalog_product_key"] = row["canonical_product_key"]
+                scenario["supplier_serving_generation_id"] = metadata["serving_generation_id"]
+                scenarios.append(scenario)
+        return {**metadata, "products": products, "scenarios": scenarios}
+
     def active_identifier_universe(self, suppliers) -> dict[str, int]:
         """Count the union eligible for Discovery without loading scenario payloads."""
         selected = [_validate_supplier(value) for value in suppliers]
         if not selected:
             return {"total": 0, "eligible": 0}
         self.initialize()
-        placeholders = ",".join("?" for _ in selected)
+        promoted = [supplier for supplier in selected if supplier != "qogita"]
         with _connect(self.path) as connection:
-            identifiers = [
-                row["canonical_ean"]
-                for row in connection.execute(
-                    f"""SELECT DISTINCT scenario.canonical_ean
-                         FROM supplier_catalog_active_generations active
-                         JOIN supplier_catalog_scenarios scenario
-                           ON scenario.run_id=active.run_id
-                         WHERE active.supplier IN ({placeholders})
-                           AND scenario.canonical_ean IS NOT NULL""",
-                    selected,
+            identifiers = set()
+            if promoted:
+                placeholders = ",".join("?" for _ in promoted)
+                identifiers.update(
+                    row["canonical_ean"]
+                    for row in connection.execute(
+                        f"""SELECT DISTINCT scenario.canonical_ean
+                             FROM supplier_catalog_active_generations active
+                             JOIN supplier_catalog_scenarios scenario
+                               ON scenario.run_id=active.run_id
+                             WHERE active.supplier IN ({placeholders})
+                               AND scenario.canonical_ean IS NOT NULL""",
+                        promoted,
+                    )
                 )
-            ]
+            if "qogita" in selected:
+                from qogita_serving import QogitaServingStore
+                QogitaServingStore(self.path).initialize()
+                identifiers.update(
+                    row["canonical_ean"]
+                    for row in connection.execute(
+                        """SELECT DISTINCT scenario.canonical_ean
+                             FROM qogita_serving_active active
+                             JOIN qogita_serving_snapshots snapshot
+                               ON snapshot.serving_generation_id=active.serving_generation_id
+                             JOIN qogita_serving_memberships membership
+                               ON membership.serving_generation_id=snapshot.serving_generation_id
+                             JOIN supplier_catalog_scenarios scenario
+                               ON scenario.run_id=snapshot.source_generation_id
+                              AND scenario.canonical_product_key=membership.canonical_product_key
+                            WHERE active.supplier='qogita'
+                              AND snapshot.status='valid'
+                              AND scenario.canonical_ean IS NOT NULL"""
+                    )
+                )
             return {
                 "total": len(identifiers),
                 "eligible": sum(canonical_gtin14(value) is not None for value in identifiers),
@@ -950,6 +1047,8 @@ class SupplierCatalogStore:
         comparison = canonical_gtin14(identifier)
         if comparison is None:
             return []
+        if supplier == "qogita":
+            return self._serving_candidates_for_identifier(identifier, comparison)
         self.initialize()
         with _connect(self.path) as connection:
             active = connection.execute(
@@ -1010,6 +1109,66 @@ class SupplierCatalogStore:
                 })
             return candidates
 
+    def _serving_candidates_for_identifier(
+        self, identifier: str, comparison: str,
+    ) -> list[dict[str, Any]]:
+        metadata = self.serving_generation_metadata("qogita")
+        if not metadata:
+            return []
+        with _connect(self.path) as connection:
+            product_rows = connection.execute(
+                """SELECT product.* FROM qogita_serving_memberships membership
+                     JOIN supplier_catalog_products product
+                       ON product.run_id=?
+                      AND product.canonical_product_key=membership.canonical_product_key
+                    WHERE membership.serving_generation_id=?
+                      AND product.canonical_gtin=?
+                    ORDER BY product.canonical_product_key""",
+                (metadata["source_generation_id"], metadata["serving_generation_id"], comparison),
+            ).fetchall()
+            candidates = []
+            for product_row in product_rows:
+                scenario_rows = connection.execute(
+                    """SELECT payload_json FROM supplier_catalog_scenarios
+                       WHERE run_id=? AND canonical_product_key=? ORDER BY scenario_id""",
+                    (metadata["source_generation_id"], product_row["canonical_product_key"]),
+                ).fetchall()
+                scenarios = [
+                    normalize_purchase_scenario(json.loads(row["payload_json"]))
+                    for row in scenario_rows
+                ]
+                if not scenarios:
+                    continue
+                candidates.append({
+                    "product_key": scenarios[0].get("product_key"),
+                    "canonical_ean": product_row["canonical_ean"],
+                    "identifier_type": product_row["identifier_type"],
+                    "brand": product_row["brand"], "title": product_row["title"],
+                    "volume_value": product_row["size_value"],
+                    "volume_unit": product_row["size_unit"],
+                    "pack_count": product_row["pack_count"], "scenarios": scenarios,
+                    "supplier_catalog_run_id": metadata["source_generation_id"],
+                    "supplier_serving_generation_id": metadata["serving_generation_id"],
+                    "supplier_catalog_completed_at": metadata["created_at"],
+                    "coverage_type": metadata["product_catalog_coverage_type"],
+                    "coverage_complete": True,
+                })
+            return candidates
+
+    def serving_catalog_contains_identifier(self, supplier: str, identifier: str) -> bool:
+        """Check immutable source catalog membership, never mutable bootstrap state."""
+        supplier = _validate_supplier(supplier)
+        comparison = canonical_gtin14(identifier)
+        metadata = self.serving_generation_metadata(supplier)
+        if supplier != "qogita" or comparison is None or not metadata:
+            return False
+        with _connect(self.path) as connection:
+            return connection.execute(
+                """SELECT 1 FROM supplier_catalog_products
+                   WHERE run_id=? AND canonical_gtin=? LIMIT 1""",
+                (metadata["source_generation_id"], comparison),
+            ).fetchone() is not None
+
     def iter_products(self, run_id: str, *, fetch_size: int = 1000):
         """Yield product rows in bounded batches for catalogs with hundreds of thousands of GTINs."""
         self.initialize()
@@ -1060,7 +1219,7 @@ class SupplierCatalogStore:
         ``latest_success()['products']`` for catalog diagnostics, but cannot
         participate in supplier economics and are omitted from this view.
         """
-        generation = self.latest_success(supplier)
+        generation = self.latest_serving(supplier) if supplier == "qogita" else self.latest_success(supplier)
         if not generation:
             return []
         product_by_key = {

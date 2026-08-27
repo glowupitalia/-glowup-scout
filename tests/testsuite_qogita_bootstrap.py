@@ -20,6 +20,7 @@ from qogita_bootstrap import (
     run_qogita_bootstrap_concurrent,
 )
 from qogita_production_bootstrap import ProductionHealthGuard
+from qogita_serving import QogitaServingStore
 from qogita_catalog_pipeline import QogitaCatalogPipelineStore
 from supplier_catalog import SupplierCatalogStore
 from supplier_catalog_collectors import QogitaCatalogExportReader, QOGITA_EXPORT_COLUMNS
@@ -487,6 +488,111 @@ class QogitaBootstrapTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "operator_test_stop")
         resumed = self.store.resume_production(bootstrap["bootstrap_run_id"])
         self.assertEqual(resumed["status"], "running")
+
+    def test_graceful_deadline_finishes_claimed_items_without_auto_stop(self):
+        run_id = self.staging(6)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        clients = []
+        def factory(_auth, _limiter):
+            client = BootstrapFakeClient()
+            clients.append(client)
+            return client
+        result = run_qogita_bootstrap_concurrent(
+            bootstrap["bootstrap_run_id"], store=self.store, client_factory=factory,
+            base_url="https://example.test", email="x", password="y", workers=2,
+            offers_pacing=1.15, product_link_pacing=0, sleep_func=lambda _: None,
+            graceful_stop_callback=lambda: sum(len(c.offer_calls) for c in clients) >= 1,
+        )
+        self.assertTrue(result["graceful_stop"])
+        self.assertIsNone(result["auto_stop_reason"])
+        self.assertEqual(result["status"], "running")
+        self.assertGreaterEqual(result["offers_success"], 1)
+        self.assertLess(result["offers_success"], 6)
+        self.assertEqual(result["claim_summary"]["claimed"], 0)
+
+    def test_duty_cycle_is_restart_safe_and_preserves_three_hour_rest(self):
+        run_id = self.staging(1)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        duty = QogitaServingStore(self.database)
+        first = duty.ensure_running_window(
+            bootstrap["bootstrap_run_id"], now="2026-08-27T00:00:00Z",
+        )
+        self.assertEqual(first["state"], "running")
+        self.assertEqual(first["current_window_deadline"], "2026-08-27T04:00:00Z")
+        duty.mark_checkpointing(bootstrap["bootstrap_run_id"], now="2026-08-27T04:00:00Z")
+        self.assertEqual(
+            QogitaServingStore(self.database).ensure_running_window(
+                bootstrap["bootstrap_run_id"], now="2026-08-27T04:01:00Z",
+            )["state"],
+            "checkpointing",
+        )
+        resting = duty.begin_rest(
+            bootstrap["bootstrap_run_id"], serving_generation_id="snapshot-one",
+            now="2026-08-27T04:00:00Z",
+        )
+        self.assertEqual(resting["rest_until"], "2026-08-27T07:00:00Z")
+        restarted = QogitaServingStore(self.database).ensure_running_window(
+            bootstrap["bootstrap_run_id"], now="2026-08-27T06:59:59Z",
+        )
+        self.assertEqual(restarted["state"], "resting")
+        resumed = duty.ensure_running_window(
+            bootstrap["bootstrap_run_id"], now="2026-08-27T07:00:00Z",
+        )
+        self.assertEqual(resumed["state"], "running")
+        self.assertEqual(resumed["window_number"], 2)
+        self.assertEqual(resumed["current_window_deadline"], "2026-08-27T11:00:00Z")
+
+    def test_partial_serving_snapshot_is_atomic_and_reuses_source_scenarios(self):
+        run_id = self.staging(3)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        run_qogita_bootstrap(
+            bootstrap["bootstrap_run_id"], store=self.store,
+            client=BootstrapFakeClient(), max_products=2,
+            product_link_pacing=0, offers_pacing=0, sleep_func=lambda _: None,
+        )
+        serving = QogitaServingStore(self.database)
+        snapshot = serving.build_snapshot(
+            bootstrap["bootstrap_run_id"], window_number=1,
+            bootstrap_state="resting", now="2026-08-27T04:00:00Z",
+        )
+        self.assertEqual(snapshot["enriched_product_count"], 2)
+        self.assertEqual(snapshot["pending_count"], 1)
+        self.assertEqual(snapshot["scenario_count"], 4)
+        self.assertEqual(snapshot["scenario_enrichment_status"], "partial")
+        self.assertIsNone(self.catalog.active_generation_metadata("qogita"))
+        self.assertEqual(len(self.catalog.latest_candidates("qogita")), 2)
+        self.assertEqual(self.catalog.active_identifier_universe(["qogita"])["eligible"], 2)
+        with sqlite3.connect(self.database) as connection:
+            before = connection.execute(
+                "SELECT COUNT(*) FROM supplier_catalog_scenarios WHERE run_id=?", (run_id,),
+            ).fetchone()[0]
+        second = serving.build_snapshot(
+            bootstrap["bootstrap_run_id"], window_number=2,
+            bootstrap_state="resting", now="2026-08-27T11:00:00Z",
+        )
+        with sqlite3.connect(self.database) as connection:
+            after = connection.execute(
+                "SELECT COUNT(*) FROM supplier_catalog_scenarios WHERE run_id=?", (run_id,),
+            ).fetchone()[0]
+            connection.execute(
+                """UPDATE qogita_bootstrap_products SET scenario_count=999
+                   WHERE bootstrap_run_id=? AND canonical_product_key=(
+                       SELECT canonical_product_key FROM qogita_bootstrap_products
+                       WHERE bootstrap_run_id=? AND status='enriched' LIMIT 1
+                   )""",
+                (bootstrap["bootstrap_run_id"], bootstrap["bootstrap_run_id"]),
+            )
+        self.assertEqual(before, after)
+        self.assertNotEqual(snapshot["serving_generation_id"], second["serving_generation_id"])
+        with self.assertRaisesRegex(RuntimeError, "inconsistent"):
+            serving.build_snapshot(
+                bootstrap["bootstrap_run_id"], window_number=3,
+                bootstrap_state="resting",
+            )
+        self.assertEqual(
+            serving.active_snapshot()["serving_generation_id"],
+            second["serving_generation_id"],
+        )
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from supplier_catalog import SupplierCatalogStore, canonical_gtin14
 
 
 DIRECT_LOOKUP_SCHEMA_VERSION = 1
-DIRECT_SUPPLIERS = ("abw", "umma", "qudo")
+DIRECT_SUPPLIERS = ("abw", "umma", "qudo", "qogita")
 
 
 def format_eur(value: Any, fallback: str = "—") -> str:
@@ -64,12 +64,18 @@ def load_direct_supplier_context(
     candidates = []
     statuses = {}
     for supplier in suppliers:
-        generation = store.active_generation_metadata(supplier)
+        generation = (
+            store.serving_generation_metadata(supplier) if supplier == "qogita"
+            else store.active_generation_metadata(supplier)
+        )
         if not generation:
             statuses[supplier] = {
                 "availability_status": "unavailable", "snapshot_id": None,
                 "snapshot_at": None, "freshness": "unavailable",
-                "reason": "baseline_missing",
+                "reason": (
+                    "scenario_bootstrap_in_progress" if supplier == "qogita"
+                    else "baseline_missing"
+                ),
             }
             continue
         matches = store.active_candidates_for_identifier(supplier, requested)
@@ -83,24 +89,26 @@ def load_direct_supplier_context(
             (now - completed_at.astimezone(timezone.utc)).total_seconds() / 3600
             if completed_at else None
         )
+        catalog_present_pending = bool(
+            supplier == "qogita" and not matches
+            and store.serving_catalog_contains_identifier(supplier, requested)
+        )
         statuses[supplier] = {
-            "availability_status": "available" if matches else "ean_absent",
+            "availability_status": (
+                "available" if matches else
+                "catalog_present_scenarios_pending" if catalog_present_pending else
+                "ean_absent"
+            ),
             "snapshot_id": generation.get("run_id"), "snapshot_at": completed,
             "freshness": "fresh" if age_hours is not None and age_hours <= 168 else "stale",
             "age_hours": age_hours,
             "scenario_count": sum(len(row.get("scenarios") or []) for row in matches),
             "coverage_type": generation.get("product_catalog_coverage_type")
             or generation.get("coverage_type"),
+            "coverage_percent": generation.get("coverage_percent"),
+            "bootstrap_state": generation.get("bootstrap_state"),
         }
         candidates.extend(matches)
-    qogita = store.active_generation_metadata("qogita")
-    statuses["qogita"] = {
-        "availability_status": "disabled",
-        "snapshot_id": (qogita or {}).get("run_id"),
-        "snapshot_at": (qogita or {}).get("completed_at"),
-        "freshness": "disabled",
-        "reason": "scenario_bootstrap_in_progress",
-    }
     merged = merge_product_candidates(*([row] for row in candidates)) if candidates else []
     if merged:
         candidate = merged[0]
