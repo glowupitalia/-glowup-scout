@@ -8,19 +8,34 @@ import re
 import smtplib
 import sqlite3
 import ssl
+import stat
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 from purchase_scenarios import recommended_combination, recommended_scenario
 
 
 DEFAULT_RECIPIENT = "nicola@glowupitalia.it"
+DEFAULT_RUNTIME_DIRECTORY = Path.home() / "Library/Application Support/GlowUp-Scout"
+DEFAULT_EMAIL_CONFIG_PATH = DEFAULT_RUNTIME_DIRECTORY / "email.env"
+DEFAULT_EMAIL_PASSWORD_PATH = DEFAULT_RUNTIME_DIRECTORY / "secrets/smtp_password"
+EMAIL_CONFIG_KEYS = {
+    "GLOWUP_SCOUT_EMAIL_ENABLED",
+    "GLOWUP_SCOUT_EMAIL_TO",
+    "GLOWUP_SCOUT_EMAIL_FROM",
+    "GLOWUP_SCOUT_SMTP_HOST",
+    "GLOWUP_SCOUT_SMTP_PORT",
+    "GLOWUP_SCOUT_SMTP_USERNAME",
+    "GLOWUP_SCOUT_SMTP_SECURITY",
+    "GLOWUP_SCOUT_SMTP_USE_TLS",
+}
+SMTP_SECURITY_MODES = {"ssl", "starttls", "none"}
 ROME = ZoneInfo("Europe/Rome")
 DISCOVERY_COMPLETED = "discovery_completed"
 DISCOVERY_COMPLETED_ZERO_RESULTS = "discovery_completed_zero_results"
@@ -65,6 +80,50 @@ def _env_bool(value: str | None, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _read_runtime_email_config(path: str | Path) -> dict[str, str]:
+    """Read the allow-listed, non-secret email settings without shell evaluation."""
+    source = Path(path).expanduser()
+    if not source.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in source.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in EMAIL_CONFIG_KEYS:
+            values[key] = value.strip()
+    return values
+
+
+def _read_password_file(path: str | Path) -> str | None:
+    """Read a password only from a private regular file owned by the current user."""
+    source = Path(path).expanduser()
+    if not source.exists():
+        return None
+    details = source.stat()
+    if not stat.S_ISREG(details.st_mode):
+        raise ValueError("Il secret SMTP non è un file regolare")
+    if details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) != 0o600:
+        raise PermissionError("Il secret SMTP deve appartenere all'utente e avere mode 0600")
+    password = source.read_text(encoding="utf-8").rstrip("\r\n")
+    return password or None
+
+
+def _smtp_security(values: Mapping[str, str]) -> str:
+    explicit = (values.get("GLOWUP_SCOUT_SMTP_SECURITY") or "").strip().lower()
+    if explicit:
+        if explicit not in SMTP_SECURITY_MODES:
+            raise ValueError("GLOWUP_SCOUT_SMTP_SECURITY deve essere ssl, starttls o none")
+        return explicit
+    return (
+        "starttls"
+        if _env_bool(values.get("GLOWUP_SCOUT_SMTP_USE_TLS"), default=True)
+        else "none"
+    )
+
+
 @dataclass(frozen=True)
 class EmailConfig:
     enabled: bool
@@ -74,7 +133,7 @@ class EmailConfig:
     smtp_port: int
     smtp_username: str | None
     smtp_password: str | None
-    smtp_use_tls: bool
+    smtp_security: str
     timeout_seconds: float = 20.0
 
     @classmethod
@@ -96,10 +155,28 @@ class EmailConfig:
                 values.get("GLOWUP_SCOUT_SMTP_USERNAME") or ""
             ).strip() or None,
             smtp_password=values.get("GLOWUP_SCOUT_SMTP_PASSWORD") or None,
-            smtp_use_tls=_env_bool(
-                values.get("GLOWUP_SCOUT_SMTP_USE_TLS"), default=True,
-            ),
+            smtp_security=_smtp_security(values),
         )
+
+    @classmethod
+    def from_runtime(
+        cls, environment: Mapping[str, str] | None = None, *,
+        config_path: str | Path = DEFAULT_EMAIL_CONFIG_PATH,
+        password_path: str | Path = DEFAULT_EMAIL_PASSWORD_PATH,
+    ):
+        """Load launchd-safe settings; process environment takes precedence."""
+        values = _read_runtime_email_config(config_path)
+        values.update(dict(os.environ if environment is None else environment))
+        if not values.get("GLOWUP_SCOUT_SMTP_PASSWORD"):
+            password = _read_password_file(password_path)
+            if password:
+                values["GLOWUP_SCOUT_SMTP_PASSWORD"] = password
+        return cls.from_env(values)
+
+    @property
+    def smtp_use_tls(self) -> bool:
+        """Backward-compatible view of the former STARTTLS boolean."""
+        return self.smtp_security == "starttls"
 
     def missing_requirements(self) -> list[str]:
         if not self.enabled:
@@ -429,13 +506,21 @@ class SMTPEmailTransport:
         self.config = config
 
     def send(self, message: EmailMessage):
-        with smtplib.SMTP(
-            self.config.smtp_host, self.config.smtp_port,
-            timeout=self.config.timeout_seconds,
-        ) as client:
+        context = ssl.create_default_context()
+        if self.config.smtp_security == "ssl":
+            connection = smtplib.SMTP_SSL(
+                self.config.smtp_host, self.config.smtp_port,
+                timeout=self.config.timeout_seconds, context=context,
+            )
+        else:
+            connection = smtplib.SMTP(
+                self.config.smtp_host, self.config.smtp_port,
+                timeout=self.config.timeout_seconds,
+            )
+        with connection as client:
             client.ehlo()
-            if self.config.smtp_use_tls:
-                client.starttls(context=ssl.create_default_context())
+            if self.config.smtp_security == "starttls":
+                client.starttls(context=context)
                 client.ehlo()
             if self.config.smtp_username:
                 client.login(self.config.smtp_username, self.config.smtp_password)
@@ -483,7 +568,7 @@ def send_notification(
     sleep_func: Callable[[float], None] = time.sleep,
 ):
     """Deliver any rendered email event through the shared persistent outbox."""
-    config = config or EmailConfig.from_env()
+    config = config or EmailConfig.from_runtime()
     outbox = NotificationOutbox(database_path)
     if not entity_id:
         return None

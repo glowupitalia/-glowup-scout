@@ -792,7 +792,7 @@ def discovery_notification_status(job_id, database_path=None):
                 "sending": "Email: invio in corso",
             }
             return labels.get(row.get("status"), "Email: stato non disponibile")
-    config = EmailConfig.from_env()
+    config = EmailConfig.from_runtime()
     return "Email: attiva" if config.configured else "Email: non configurata"
 
 
@@ -943,7 +943,7 @@ if ui_state == "home":
             "Trova automaticamente i prodotti più interessanti da acquistare "
             "e vendere su Amazon"
         )
-        email_config = EmailConfig.from_env()
+        email_config = EmailConfig.from_runtime()
         st.caption(
             f"Notifiche email: {'attive' if email_config.configured else 'disattive'} · "
             f"Destinatario: {email_config.recipient}"
@@ -1281,7 +1281,7 @@ elif ui_state == "discovery":
             "Trova automaticamente i prodotti più interessanti da acquistare "
             "e vendere su Amazon"
         )
-        email_config = EmailConfig.from_env()
+        email_config = EmailConfig.from_runtime()
         st.caption(
             f"Notifiche email: {'attive' if email_config.configured else 'disattive'} · "
             f"Destinatario: {email_config.recipient}"

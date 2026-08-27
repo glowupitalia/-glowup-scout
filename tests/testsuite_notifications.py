@@ -1,4 +1,5 @@
 import sqlite3
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from notifications import (
     DISCOVERY_FAILED,
     EmailConfig,
     NotificationOutbox,
+    SMTPEmailTransport,
     discovery_terminal_event,
     render_discovery_notification,
     send_discovery_terminal_notification,
@@ -22,7 +24,7 @@ def configured_email():
         enabled=True, recipient=DEFAULT_RECIPIENT,
         sender="scout@example.test", smtp_host="smtp.example.test",
         smtp_port=587, smtp_username="user", smtp_password="top-secret",
-        smtp_use_tls=True,
+        smtp_security="starttls",
     )
 
 
@@ -166,6 +168,111 @@ class NotificationTests(unittest.TestCase):
         )
         self.assertEqual(row["status"], "not_configured")
         self.assertEqual(transport.messages, [])
+
+    def test_implicit_ssl_transport_authenticates_and_sends(self):
+        config = EmailConfig(
+            enabled=True, recipient="to@example.test", sender="from@example.test",
+            smtp_host="smtp.example.test", smtp_port=465, smtp_username="user",
+            smtp_password="secret", smtp_security="ssl",
+        )
+        client = unittest.mock.MagicMock()
+        client.__enter__.return_value = client
+        message = unittest.mock.MagicMock()
+        message.__getitem__.return_value = "message-id"
+        with (
+            patch("notifications.smtplib.SMTP_SSL", return_value=client) as ssl_smtp,
+            patch("notifications.smtplib.SMTP") as plain_smtp,
+        ):
+            self.assertEqual(SMTPEmailTransport(config).send(message), "message-id")
+        ssl_smtp.assert_called_once()
+        plain_smtp.assert_not_called()
+        client.starttls.assert_not_called()
+        client.login.assert_called_once_with("user", "secret")
+        client.send_message.assert_called_once_with(message)
+
+    def test_starttls_and_plain_transport_paths(self):
+        for security, expected_starttls in (("starttls", True), ("none", False)):
+            config = EmailConfig(
+                enabled=True, recipient="to@example.test", sender="from@example.test",
+                smtp_host="smtp.example.test", smtp_port=587, smtp_username=None,
+                smtp_password=None, smtp_security=security,
+            )
+            client = unittest.mock.MagicMock()
+            client.__enter__.return_value = client
+            with patch("notifications.smtplib.SMTP", return_value=client):
+                SMTPEmailTransport(config).send({"Message-ID": "message-id"})
+            self.assertEqual(client.starttls.called, expected_starttls)
+            client.login.assert_not_called()
+
+    def test_explicit_security_and_legacy_tls_mapping(self):
+        self.assertEqual(EmailConfig.from_env({}).smtp_security, "starttls")
+        self.assertEqual(
+            EmailConfig.from_env({"GLOWUP_SCOUT_SMTP_USE_TLS": "false"}).smtp_security,
+            "none",
+        )
+        self.assertEqual(
+            EmailConfig.from_env({
+                "GLOWUP_SCOUT_SMTP_USE_TLS": "true",
+                "GLOWUP_SCOUT_SMTP_SECURITY": "ssl",
+            }).smtp_security,
+            "ssl",
+        )
+        with self.assertRaises(ValueError):
+            EmailConfig.from_env({"GLOWUP_SCOUT_SMTP_SECURITY": "invalid"})
+
+    def test_launchd_safe_runtime_config_and_private_password(self):
+        root = Path(self.temporary.name)
+        config_path = root / "email.env"
+        password_path = root / "secrets" / "smtp_password"
+        config_path.write_text(
+            "GLOWUP_SCOUT_EMAIL_ENABLED=true\n"
+            "GLOWUP_SCOUT_EMAIL_TO=to@example.test\n"
+            "GLOWUP_SCOUT_EMAIL_FROM=from@example.test\n"
+            "GLOWUP_SCOUT_SMTP_HOST=authsmtp.securemail.pro\n"
+            "GLOWUP_SCOUT_SMTP_PORT=465\n"
+            "GLOWUP_SCOUT_SMTP_USERNAME=to@example.test\n"
+            "GLOWUP_SCOUT_SMTP_SECURITY=ssl\n",
+            encoding="utf-8",
+        )
+        password_path.parent.mkdir()
+        password_path.write_text("file-secret\n", encoding="utf-8")
+        password_path.chmod(0o600)
+        config = EmailConfig.from_runtime(
+            {}, config_path=config_path, password_path=password_path,
+        )
+        self.assertTrue(config.configured)
+        self.assertEqual(config.smtp_security, "ssl")
+        self.assertEqual(config.smtp_password, "file-secret")
+        self.assertEqual(stat.S_IMODE(password_path.stat().st_mode), 0o600)
+
+    def test_runtime_environment_overrides_file_and_secret_permissions_are_checked(self):
+        root = Path(self.temporary.name)
+        config_path = root / "email.env"
+        password_path = root / "smtp_password"
+        config_path.write_text("GLOWUP_SCOUT_SMTP_SECURITY=ssl\n", encoding="utf-8")
+        password_path.write_text("secret\n", encoding="utf-8")
+        password_path.chmod(0o644)
+        with self.assertRaises(PermissionError):
+            EmailConfig.from_runtime({}, config_path=config_path, password_path=password_path)
+        password_path.chmod(0o600)
+        config = EmailConfig.from_runtime(
+            {"GLOWUP_SCOUT_SMTP_SECURITY": "none"},
+            config_path=config_path, password_path=password_path,
+        )
+        self.assertEqual(config.smtp_security, "none")
+
+    def test_runtime_config_ignores_unknown_and_password_keys(self):
+        root = Path(self.temporary.name)
+        config_path = root / "email.env"
+        config_path.write_text(
+            "GLOWUP_SCOUT_SMTP_PASSWORD=must-not-load\n"
+            "UNRELATED_SECRET=must-not-load\n",
+            encoding="utf-8",
+        )
+        config = EmailConfig.from_runtime(
+            {}, config_path=config_path, password_path=root / "missing",
+        )
+        self.assertIsNone(config.smtp_password)
 
     def test_html_is_escaped_and_best_opportunity_rendered(self):
         content = render_discovery_notification(completed_state(), DISCOVERY_COMPLETED)
