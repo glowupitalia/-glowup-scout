@@ -986,11 +986,11 @@ class SupplierCatalogStore:
                 scenarios.append(scenario)
         return {**metadata, "products": products, "scenarios": scenarios}
 
-    def active_identifier_universe(self, suppliers) -> dict[str, int]:
-        """Count the union eligible for Discovery without loading scenario payloads."""
+    def active_identifiers(self, suppliers) -> set[str]:
+        """Return the active supplier-first identifier union without payloads."""
         selected = [_validate_supplier(value) for value in suppliers]
         if not selected:
-            return {"total": 0, "eligible": 0}
+            return set()
         self.initialize()
         promoted = [supplier for supplier in selected if supplier != "qogita"]
         with _connect(self.path) as connection:
@@ -1029,10 +1029,15 @@ class SupplierCatalogStore:
                               AND scenario.canonical_ean IS NOT NULL"""
                     )
                 )
-            return {
-                "total": len(identifiers),
-                "eligible": sum(canonical_gtin14(value) is not None for value in identifiers),
-            }
+            return identifiers
+
+    def active_identifier_universe(self, suppliers) -> dict[str, int]:
+        """Count the union eligible for Discovery without loading scenario payloads."""
+        identifiers = self.active_identifiers(suppliers)
+        return {
+            "total": len(identifiers),
+            "eligible": sum(canonical_gtin14(value) is not None for value in identifiers),
+        }
 
     def active_candidates_for_identifier(
         self, supplier: str, identifier: str,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +56,13 @@ CREATE TABLE IF NOT EXISTS discovery_rotation_selections (
     FOREIGN KEY (scope_key, canonical_identifier)
       REFERENCES discovery_rotation_items(scope_key, canonical_identifier)
 );
+CREATE TABLE IF NOT EXISTS discovery_rotation_global_history (
+    canonical_identifier TEXT PRIMARY KEY,
+    first_discovery_at TEXT NOT NULL,
+    last_discovery_at TEXT NOT NULL,
+    discovery_count INTEGER NOT NULL DEFAULT 0,
+    last_job_id TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_discovery_rotation_remaining
 ON discovery_rotation_items(scope_key,active,last_analyzed_cycle,priority_new,last_discovery_at);
 CREATE INDEX IF NOT EXISTS idx_discovery_rotation_job
@@ -99,8 +107,9 @@ def _definitive_catalog_status(value: Any) -> bool:
 
 
 class DiscoveryRotationStore:
-    def __init__(self, path: str | Path = DEFAULT_ROTATION_DATABASE):
-        self.path = Path(path).expanduser().resolve()
+    def __init__(self, path: str | Path | None = None):
+        configured = path or os.environ.get("DISCOVERY_ROTATION_DATABASE")
+        self.path = Path(configured or DEFAULT_ROTATION_DATABASE).expanduser().resolve()
 
     def _connect(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +123,22 @@ class DiscoveryRotationStore:
     def initialize(self):
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            # Safe, idempotent migration from the original scope-local history.
+            # Exact canonical identifiers are aggregated without changing cycles,
+            # selections, checkpoints, or prior scope membership.
+            connection.execute(
+                """INSERT INTO discovery_rotation_global_history
+                     (canonical_identifier,first_discovery_at,last_discovery_at,
+                      discovery_count,last_job_id)
+                   SELECT canonical_identifier,
+                          MIN(COALESCE(last_discovery_at,first_seen_at)),
+                          MAX(COALESCE(last_discovery_at,first_seen_at)),
+                          SUM(discovery_count),MAX(last_job_id)
+                     FROM discovery_rotation_items
+                    WHERE discovery_count>0
+                    GROUP BY canonical_identifier
+                   ON CONFLICT(canonical_identifier) DO NOTHING"""
+            )
 
     def sync_universe(
         self, candidates: Iterable[dict[str, Any]], selected_suppliers: Iterable[str],
@@ -141,6 +166,24 @@ class DiscoveryRotationStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             initializing = self._scope_row(connection, scope) is None
+            global_history = {
+                row["canonical_identifier"]: row["last_discovery_at"]
+                for row in connection.execute(
+                    """SELECT canonical_identifier,last_discovery_at
+                       FROM discovery_rotation_global_history"""
+                )
+            }
+            previous_row, _ = self._previous_scope_context(connection, selected, scope)
+            previous_identifiers = set()
+            if initializing and previous_row:
+                previous_identifiers = {
+                    row["canonical_identifier"]
+                    for row in connection.execute(
+                        """SELECT canonical_identifier FROM discovery_rotation_items
+                           WHERE scope_key=? AND active=1""",
+                        (previous_row["scope_key"],),
+                    )
+                }
             connection.execute(
                 """INSERT INTO discovery_rotation_scopes
                    (scope_key,selected_suppliers_json,current_cycle_id,created_at,updated_at)
@@ -158,8 +201,8 @@ class DiscoveryRotationStore:
                     """INSERT INTO discovery_rotation_items
                        (scope_key,canonical_identifier,supplier_membership_json,
                         first_seen_at,last_seen_at,last_seen_catalog_generation_json,
-                        active,priority_new)
-                       VALUES (?,?,?,?,?,?,1,?)
+                        active,priority_new,last_discovery_at)
+                       VALUES (?,?,?,?,?,?,1,?,?)
                        ON CONFLICT(scope_key,canonical_identifier) DO UPDATE SET
                          supplier_membership_json=excluded.supplier_membership_json,
                          last_seen_at=excluded.last_seen_at,
@@ -167,7 +210,12 @@ class DiscoveryRotationStore:
                          active=1""",
                     (
                         scope, identifier, _json(value["membership"]), observed, observed,
-                        _json(value["generations"]), 0 if initializing else 1,
+                        _json(value["generations"]),
+                        (
+                            int(identifier not in previous_identifiers)
+                            if initializing and previous_row else (0 if initializing else 1)
+                        ),
+                        global_history.get(identifier),
                     ),
                 )
             connection.commit()
@@ -178,35 +226,128 @@ class DiscoveryRotationStore:
             "SELECT * FROM discovery_rotation_scopes WHERE scope_key=?", (scope,)
         ).fetchone()
 
-    def status(self, selected_suppliers: Iterable[str]) -> dict[str, Any]:
+    def _previous_scope_context(self, connection, selected: tuple[str, ...], scope: str):
+        candidates = []
+        selected_set = set(selected)
+        for row in connection.execute(
+            "SELECT * FROM discovery_rotation_scopes WHERE scope_key<>?", (scope,)
+        ):
+            previous = tuple(json.loads(row["selected_suppliers_json"]))
+            if set(previous).issubset(selected_set):
+                candidates.append((len(previous), row["updated_at"], row, previous))
+        if not candidates:
+            return None, ()
+        _, _, row, previous = max(candidates, key=lambda value: (value[0], value[1]))
+        return row, previous
+
+    def status(
+        self, selected_suppliers: Iterable[str], *,
+        active_identifiers: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
         self.initialize()
         selected = normalize_rotation_suppliers(selected_suppliers)
         scope = rotation_scope_key(selected)
+        supplied_identifiers = None
+        if active_identifiers is not None:
+            supplied_identifiers = {
+                str(value).strip() for value in active_identifiers
+                if canonical_gtin14(value) is not None
+            }
         with self._connect() as connection:
             scope_row = self._scope_row(connection, scope)
+            previous_row, previous_suppliers = self._previous_scope_context(
+                connection, selected, scope,
+            )
+            global_identifiers = {
+                row["canonical_identifier"]
+                for row in connection.execute(
+                    "SELECT canonical_identifier FROM discovery_rotation_global_history"
+                )
+            }
             if not scope_row:
+                universe = len(supplied_identifiers or ())
+                global_overlap = len((supplied_identifiers or set()) & global_identifiers)
+                previous_identifiers = set()
+                previous_analyzed = 0
+                if previous_row:
+                    previous_identifiers = {
+                        row["canonical_identifier"]
+                        for row in connection.execute(
+                            """SELECT canonical_identifier FROM discovery_rotation_items
+                               WHERE scope_key=? AND active=1""",
+                            (previous_row["scope_key"],),
+                        )
+                    }
+                    previous_analyzed = connection.execute(
+                        """SELECT COUNT(*) FROM discovery_rotation_items
+                           WHERE scope_key=? AND active=1 AND last_analyzed_cycle=?""",
+                        (previous_row["scope_key"], previous_row["current_cycle_id"]),
+                    ).fetchone()[0]
                 return {
                     "rotation_scope": scope, "rotation_cycle_id": 1,
-                    "rotation_universe_count": 0, "rotation_analyzed_count": 0,
-                    "rotation_remaining_count": 0, "rotation_coverage_percent": 0.0,
+                    "rotation_scope_initialized": False,
+                    "rotation_selected_suppliers": list(selected),
+                    "rotation_universe_count": universe, "rotation_analyzed_count": 0,
+                    "rotation_remaining_count": universe, "rotation_coverage_percent": 0.0,
+                    "rotation_global_analyzed_count": global_overlap,
+                    "rotation_never_analyzed_count": max(0, universe - global_overlap),
+                    "rotation_new_identifier_count": len(
+                        (supplied_identifiers or set()) - previous_identifiers
+                    ) if previous_row else universe,
+                    "rotation_previous_scope": previous_row["scope_key"] if previous_row else None,
+                    "rotation_previous_cycle_id": (
+                        int(previous_row["current_cycle_id"]) if previous_row else None
+                    ),
+                    "rotation_previous_analyzed_count": previous_analyzed,
+                    "rotation_previous_suppliers": list(previous_suppliers),
+                    "rotation_added_suppliers": sorted(set(selected) - set(previous_suppliers)),
+                    "rotation_cycle_complete": False,
                 }
             cycle = int(scope_row["current_cycle_id"])
-            universe = connection.execute(
-                "SELECT COUNT(*) FROM discovery_rotation_items WHERE scope_key=? AND active=1",
+            stored_rows = connection.execute(
+                """SELECT canonical_identifier,last_analyzed_cycle,priority_new
+                   FROM discovery_rotation_items WHERE scope_key=? AND active=1""",
                 (scope,),
-            ).fetchone()[0]
-            analyzed = connection.execute(
-                """SELECT COUNT(*) FROM discovery_rotation_items
-                   WHERE scope_key=? AND active=1 AND last_analyzed_cycle=?""",
-                (scope, cycle),
-            ).fetchone()[0]
+            ).fetchall()
+            stored = {row["canonical_identifier"]: row for row in stored_rows}
+            active = supplied_identifiers if supplied_identifiers is not None else set(stored)
+            universe = len(active)
+            analyzed = sum(
+                identifier in stored and int(stored[identifier]["last_analyzed_cycle"]) == cycle
+                for identifier in active
+            )
+            global_overlap = len(active & global_identifiers)
+            pending_new = sum(
+                identifier not in stored or int(stored[identifier]["priority_new"]) == 1
+                for identifier in active
+            )
+            previous_analyzed = 0
+            if previous_row:
+                previous_analyzed = connection.execute(
+                    """SELECT COUNT(*) FROM discovery_rotation_items
+                       WHERE scope_key=? AND active=1 AND last_analyzed_cycle=?""",
+                    (previous_row["scope_key"], previous_row["current_cycle_id"]),
+                ).fetchone()[0]
         return {
             "rotation_scope": scope,
             "rotation_cycle_id": cycle,
+            "rotation_scope_initialized": True,
+            "rotation_selected_suppliers": list(selected),
             "rotation_universe_count": universe,
             "rotation_analyzed_count": analyzed,
             "rotation_remaining_count": max(0, universe - analyzed),
             "rotation_coverage_percent": (analyzed / universe * 100.0) if universe else 0.0,
+            "rotation_global_analyzed_count": global_overlap,
+            "rotation_never_analyzed_count": max(0, universe - global_overlap),
+            "rotation_new_identifier_count": pending_new,
+            "rotation_previous_scope": previous_row["scope_key"] if previous_row else None,
+            "rotation_previous_cycle_id": (
+                int(previous_row["current_cycle_id"]) if previous_row else None
+            ),
+            "rotation_previous_analyzed_count": previous_analyzed,
+            "rotation_previous_suppliers": list(previous_suppliers),
+            "rotation_added_suppliers": sorted(set(selected) - set(previous_suppliers)),
+            "rotation_cycle_complete": bool(universe and analyzed == universe),
         }
 
     def select(
@@ -244,17 +385,6 @@ class DiscoveryRotationStore:
                        WHERE scope_key=? AND active=1 AND last_analyzed_cycle<>?""",
                     (scope, cycle),
                 ).fetchall()
-                if not remaining:
-                    cycle += 1
-                    connection.execute(
-                        """UPDATE discovery_rotation_scopes
-                           SET current_cycle_id=?,updated_at=? WHERE scope_key=?""",
-                        (cycle, observed, scope),
-                    )
-                    remaining = connection.execute(
-                        "SELECT * FROM discovery_rotation_items WHERE scope_key=? AND active=1",
-                        (scope,),
-                    ).fetchall()
                 ordered = sorted(
                     remaining,
                     key=lambda row: (
@@ -285,7 +415,12 @@ class DiscoveryRotationStore:
             ).fetchone()[0]
             connection.commit()
         selected_rows = [by_identifier[value] for value in identifiers if value in by_identifier]
+        scope_status = self.status(selected)
         metadata = {
+            **{
+                key: value for key, value in scope_status.items()
+                if key.startswith("rotation_")
+            },
             "rotation_scope": scope,
             "rotation_cycle_id": cycle,
             "rotation_universe_count": universe,
@@ -322,7 +457,7 @@ class DiscoveryRotationStore:
                        WHERE job_id=? AND canonical_identifier=?""",
                     (str(status), observed, job_id, identifier),
                 )
-                connection.execute(
+                item_update = connection.execute(
                     """UPDATE discovery_rotation_items SET
                          last_discovery_at=?,discovery_count=discovery_count+1,
                          last_analyzed_cycle=?,last_job_id=?,priority_new=0
@@ -333,6 +468,18 @@ class DiscoveryRotationStore:
                         identifier, int(row["cycle_id"]),
                     ),
                 )
+                if item_update.rowcount:
+                    connection.execute(
+                        """INSERT INTO discovery_rotation_global_history
+                             (canonical_identifier,first_discovery_at,last_discovery_at,
+                              discovery_count,last_job_id)
+                           VALUES (?,?,?,?,?)
+                           ON CONFLICT(canonical_identifier) DO UPDATE SET
+                             last_discovery_at=excluded.last_discovery_at,
+                             discovery_count=discovery_rotation_global_history.discovery_count+1,
+                             last_job_id=excluded.last_job_id""",
+                        (identifier, observed, observed, 1, job_id),
+                    )
             first = selections[0] if selections else None
             if not first:
                 connection.commit()
@@ -361,6 +508,7 @@ class DiscoveryRotationStore:
             "rotation_analyzed_this_run": analyzed_run,
             "rotation_remaining_after_run": max(0, universe - analyzed),
             "rotation_coverage_percent": (analyzed / universe * 100.0) if universe else 0.0,
+            "rotation_cycle_complete": bool(universe and analyzed == universe),
         }
 
     def start_new_cycle(

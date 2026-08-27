@@ -47,7 +47,7 @@ from supplier_preparation import (
     DISCOVERY_BUDGET_OPTIONS,
     SUPPORTED_SUPPLIERS,
 )
-from supplier_catalog import SupplierCatalogStore
+from supplier_catalog import SupplierCatalogStore, canonical_gtin14
 from discovery_rotation import DiscoveryRotationStore
 from discovery_jobs import DiscoveryJobRegistry
 
@@ -730,15 +730,14 @@ def discovery_supplier_catalog_status():
 def discovery_supplier_universe(selected_suppliers):
     if not selected_suppliers:
         return {"total": 0, "eligible": 0}
-    result = SupplierCatalogStore().active_identifier_universe(selected_suppliers)
-    rotation = DiscoveryRotationStore().status(selected_suppliers)
-    if not rotation.get("rotation_universe_count"):
-        rotation.update({
-            "rotation_universe_count": result["eligible"],
-            "rotation_analyzed_count": 0,
-            "rotation_remaining_count": result["eligible"],
-            "rotation_coverage_percent": 0.0,
-        })
+    identifiers = SupplierCatalogStore().active_identifiers(selected_suppliers)
+    eligible_identifiers = {
+        value for value in identifiers if canonical_gtin14(value) is not None
+    }
+    result = {"total": len(identifiers), "eligible": len(eligible_identifiers)}
+    rotation = DiscoveryRotationStore().status(
+        selected_suppliers, active_identifiers=eligible_identifiers,
+    )
     return {**result, **rotation}
 
 
@@ -1368,35 +1367,69 @@ elif ui_state == "discovery":
             "minimum_qogita_stock": defaults["minimum_qogita_stock"],
         }
         st.markdown("**Ampiezza ricerca**")
-        budget_labels = [str(value) for value in DISCOVERY_BUDGET_OPTIONS] + ["Tutto il catalogo"]
         previous_budget = st.session_state.get(
             "discovery_run_budget", DEFAULT_DISCOVERY_RUN_BUDGET,
         )
         previous_label = (
             "Tutto il catalogo" if previous_budget in (None, "all") else str(previous_budget)
         )
-        budget_label = st.selectbox(
-            "Prodotti da analizzare in questa ricerca",
-            budget_labels,
-            index=budget_labels.index(previous_label) if previous_label in budget_labels else 1,
-        )
-        run_budget = "all" if budget_label == "Tutto il catalogo" else int(budget_label)
         try:
             universe = discovery_supplier_universe(tuple(selected_suppliers))
         except Exception:
             universe = {"total": 0, "eligible": 0}
         remaining = int(universe.get("rotation_remaining_count") or 0)
-        if remaining <= 0 and universe["eligible"]:
-            remaining = universe["eligible"]
+        all_catalog_label = f"Tutto il catalogo — {remaining:,} rimanenti".replace(",", ".")
+        budget_labels = [str(value) for value in DISCOVERY_BUDGET_OPTIONS] + [all_catalog_label]
+        budget_label = st.selectbox(
+            "Prodotti da analizzare in questa ricerca",
+            budget_labels,
+            index=(
+                len(budget_labels) - 1
+                if previous_label == "Tutto il catalogo"
+                else budget_labels.index(previous_label)
+                if previous_label in budget_labels else 1
+            ),
+        )
+        run_budget = "all" if budget_label == all_catalog_label else int(budget_label)
         effective_count = remaining if run_budget == "all" else min(int(run_budget), remaining)
+        st.markdown("**Copertura Discovery**")
         st.caption(
-            f"Universo disponibile: {universe['total']:,} EAN · "
-            f"idonei: {universe['eligible']:,} · "
-            f"ciclo {int(universe.get('rotation_cycle_id') or 1)}: "
-            f"{int(universe.get('rotation_analyzed_count') or 0):,} analizzati, "
-            f"{remaining:,} rimanenti · prossima ricerca: {effective_count:,}"
+            f"Scope: {universe.get('rotation_scope') or '—'} · "
+            f"ciclo {int(universe.get('rotation_cycle_id') or 1)} · "
+            f"universo {universe['total']:,} EAN · idonei {universe['eligible']:,} · "
+            f"{int(universe.get('rotation_analyzed_count') or 0):,} analizzati · "
+            f"{remaining:,} rimanenti · copertura "
+            f"{float(universe.get('rotation_coverage_percent') or 0):.1f}% · "
+            f"prossima ricerca {effective_count:,}"
             .replace(",", ".")
         )
+        global_analyzed = int(universe.get("rotation_global_analyzed_count") or 0)
+        new_identifiers = int(universe.get("rotation_new_identifier_count") or 0)
+        st.caption(
+            f"Storico Amazon globale: {global_analyzed:,} EAN già analizzati · "
+            f"nuovi nello scope/catalogo corrente: {new_identifiers:,}".replace(",", ".")
+        )
+        added_suppliers = universe.get("rotation_added_suppliers") or []
+        if universe.get("rotation_previous_scope") and added_suppliers:
+            added_labels = " · ".join(
+                supplier_labels.get(value, value.upper()) for value in added_suppliers
+            )
+            ui_alert(
+                (
+                    f"Nuovo insieme fornitori: {added_labels} è stato aggiunto. "
+                    f"Lo scope precedente conserva "
+                    f"{int(universe.get('rotation_previous_analyzed_count') or 0):,} "
+                    "EAN analizzati; la storia Amazon globale non è stata cancellata. "
+                    "Il nuovo scope parte dal ciclo 1 perché include nuovi scenari di acquisto."
+                ).replace(",", "."),
+                "info",
+            )
+        if universe.get("rotation_cycle_complete"):
+            ui_alert(
+                "Il ciclo corrente è completo. Avvia esplicitamente un nuovo ciclo "
+                "prima di una nuova Discovery.",
+                "info",
+            )
         all_confirmed = True
         if run_budget == "all" and remaining > 5000:
             all_confirmed = st.checkbox(
@@ -1404,25 +1437,53 @@ elif ui_state == "discovery":
                 key="discovery_confirm_all_catalog",
                 help="La ricerca completa può generare molte chiamate Amazon e richiedere molto tempo.",
             )
-        with st.expander("Gestione ciclo Discovery", expanded=False):
-            reset_confirmed = st.checkbox(
-                "Confermo l'avvio di un nuovo ciclo Discovery",
-                key="discovery_confirm_new_cycle",
+        st.markdown("**Gestione ciclo**")
+        can_start_new_cycle = bool(universe.get("rotation_scope_initialized"))
+        if st.button(
+            "Nuovo ciclo Discovery", key="discovery_new_cycle",
+            disabled=bool(active_discovery) or not can_start_new_cycle,
+            help=(
+                "Il primo ciclo verrà creato con la prima Discovery per questo insieme fornitori."
+                if not can_start_new_cycle else None
+            ),
+        ):
+            st.session_state["discovery_new_cycle_confirmation_scope"] = universe.get(
+                "rotation_scope"
             )
-            if st.button(
-                "Nuovo ciclo Discovery", key="discovery_new_cycle",
-                disabled=not reset_confirmed,
+            st.rerun()
+        confirmation_scope = st.session_state.get(
+            "discovery_new_cycle_confirmation_scope"
+        )
+        if confirmation_scope == universe.get("rotation_scope"):
+            st.warning(
+                (
+                    "Vuoi iniziare un nuovo ciclo? "
+                    f"I {universe['eligible']:,} prodotti dell'universo corrente torneranno "
+                    "eleggibili. Lo storico dei cicli, dei job e delle analisi Amazon sarà conservato."
+                ).replace(",", ".")
+            )
+            confirm_columns = st.columns(2)
+            if confirm_columns[0].button(
+                "Conferma nuovo ciclo", key="discovery_confirm_new_cycle",
+                type="primary",
             ):
                 try:
                     DiscoveryRotationStore().start_new_cycle(
                         selected_suppliers, confirmed=True,
                     )
                     discovery_supplier_universe.clear()
-                    st.session_state["discovery_confirm_new_cycle"] = False
+                    st.session_state.pop("discovery_new_cycle_confirmation_scope", None)
                     st.rerun()
                 except Exception as exc:
                     ui_alert(f"Impossibile avviare il nuovo ciclo: {exc}", "warning")
+            if confirm_columns[1].button(
+                "Annulla", key="discovery_cancel_new_cycle",
+            ):
+                st.session_state.pop("discovery_new_cycle_confirmation_scope", None)
+                st.rerun()
         validation_error = discovery_filter_error(filters, selected_suppliers)
+        if not validation_error and universe.get("rotation_cycle_complete"):
+            validation_error = "Il ciclo corrente è completo: avvia un nuovo ciclo Discovery."
         if not validation_error and not all_confirmed:
             validation_error = "Conferma esplicitamente l'analisi di tutto il catalogo."
         if validation_error:

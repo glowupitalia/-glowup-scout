@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from discovery import DiscoveryCheckpointStore, default_filters, run_discovery, validate_filters
@@ -18,6 +19,7 @@ from supplier_preparation import (
     sample_discovery_candidates,
 )
 from supplier_catalog import SupplierCatalogGeneration, SupplierCatalogStore, candidates_to_cache_records
+from discovery_rotation import DiscoveryRotationStore
 
 
 NOW = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
@@ -347,6 +349,15 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             next(row for row in app.selectbox if row.label == "Prodotti da analizzare in questa ricerca").value,
             "500",
         )
+        self.assertTrue(any(row.label == "Nuovo ciclo Discovery" for row in app.button))
+        budget_select = next(
+            row for row in app.selectbox
+            if row.label == "Prodotti da analizzare in questa ricerca"
+        )
+        self.assertTrue(any(
+            str(option).startswith("Tutto il catalogo —")
+            for option in budget_select.options
+        ))
 
     def test_tutti_tracks_individual_selection(self):
         app = self.discovery_app()
@@ -357,6 +368,38 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         app.checkbox[2].set_value(True).run()
         values = {row.label: row.value for row in app.checkbox}
         self.assertTrue(values["Tutti"])
+
+    def test_new_cycle_ui_requires_explicit_second_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {"DISCOVERY_ROTATION_DATABASE": str(Path(temporary) / "rotation.sqlite3")},
+        ):
+            rotation = DiscoveryRotationStore()
+            ean = "8809562191179"
+            rotation.sync_universe(
+                [{
+                    "canonical_ean": ean,
+                    "scenarios": [
+                        {"supplier": supplier} for supplier in SUPPORTED_SUPPLIERS
+                    ],
+                }],
+                SUPPORTED_SUPPLIERS,
+            )
+            st.cache_data.clear()
+            app = self.discovery_app()
+            new_cycle = next(
+                row for row in app.button if row.label == "Nuovo ciclo Discovery"
+            )
+            self.assertFalse(new_cycle.disabled)
+            app = new_cycle.click().run()
+            self.assertEqual(rotation.status(SUPPORTED_SUPPLIERS)["rotation_cycle_id"], 1)
+            confirm = next(
+                row for row in app.button if row.label == "Conferma nuovo ciclo"
+            )
+            app = confirm.click().run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(rotation.status(SUPPORTED_SUPPLIERS)["rotation_cycle_id"], 2)
+            st.cache_data.clear()
 
     def test_zero_suppliers_disables_start_before_any_api(self):
         app = self.discovery_app()

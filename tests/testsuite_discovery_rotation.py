@@ -54,7 +54,16 @@ class DiscoveryRotationTests(unittest.TestCase):
         second, _ = self.store.select("job-2", self.rows, ["abw"], 5)
         self.assertFalse(self.ids(first) & self.ids(second))
 
-    def test_last_chunk_is_smaller_and_next_run_starts_new_cycle(self):
+    def test_five_thousand_analyzed_survive_restart(self):
+        rows = [candidate(index) for index in range(5000)]
+        selected, _ = self.store.select("job-5000", rows, ["abw"], 5000)
+        self.commit("job-5000", selected)
+        reopened = DiscoveryRotationStore(self.path)
+        status = reopened.status(["abw"])
+        self.assertEqual(status["rotation_analyzed_count"], 5000)
+        self.assertEqual(status["rotation_global_analyzed_count"], 5000)
+
+    def test_last_chunk_is_smaller_and_next_run_waits_for_explicit_cycle(self):
         first, _ = self.store.select("job-1", self.rows, ["abw"], 5)
         self.commit("job-1", first)
         second, _ = self.store.select("job-2", self.rows, ["abw"], 5)
@@ -63,8 +72,13 @@ class DiscoveryRotationTests(unittest.TestCase):
         self.assertEqual(len(third), 2)
         self.commit("job-3", third)
         fourth, fourth_meta = self.store.select("job-4", self.rows, ["abw"], 5)
-        self.assertEqual(len(fourth), 5)
-        self.assertEqual(fourth_meta["rotation_cycle_id"], third_meta["rotation_cycle_id"] + 1)
+        self.assertEqual(len(fourth), 0)
+        self.assertEqual(fourth_meta["rotation_cycle_id"], third_meta["rotation_cycle_id"])
+        self.assertTrue(self.store.status(["abw"])["rotation_cycle_complete"])
+        self.store.start_new_cycle(["abw"], confirmed=True)
+        fifth, fifth_meta = self.store.select("job-5", self.rows, ["abw"], 5)
+        self.assertEqual(len(fifth), 5)
+        self.assertEqual(fifth_meta["rotation_cycle_id"], third_meta["rotation_cycle_id"] + 1)
 
     def test_restart_persistence_and_resume_same_selection(self):
         first, metadata = self.store.select("job-1", self.rows, ["abw"], 5)
@@ -109,6 +123,73 @@ class DiscoveryRotationTests(unittest.TestCase):
             rotation_scope_key(["abw"]), rotation_scope_key(["abw", "umma"])
         )
 
+    def test_filters_and_budget_are_not_part_of_scope_identity(self):
+        suppliers = ["abw", "umma"]
+        expected = rotation_scope_key(suppliers)
+        for _filters, _budget in (
+            ({"bsr_min": 0, "minimum_margin": 15}, 500),
+            ({"bsr_min": 8000, "minimum_margin": 25}, 5000),
+            ({"bsr_min": 4000, "minimum_margin": 10}, None),
+        ):
+            self.assertEqual(rotation_scope_key(suppliers), expected)
+
+    def test_generation_and_snapshot_ids_do_not_change_scope_or_progress(self):
+        first, _ = self.store.select(
+            "job-1", self.rows, ["abw"], 3,
+            supplier_snapshot_set={"abw": {"snapshot_id": "generation-a"}},
+        )
+        self.commit("job-1", first)
+        self.store.sync_universe(
+            self.rows, ["abw"],
+            supplier_snapshot_set={"abw": {"snapshot_id": "generation-b"}},
+        )
+        status = self.store.status(["abw"])
+        self.assertEqual(status["rotation_scope"], rotation_scope_key(["abw"]))
+        self.assertEqual(status["rotation_analyzed_count"], 3)
+
+    def test_new_supplier_scope_preserves_global_history_without_auto_consuming(self):
+        old_rows = [candidate(index, ("abw", "umma")) for index in range(8)]
+        analyzed, _ = self.store.select("old-job", old_rows, ["abw", "umma"], 5)
+        self.commit("old-job", analyzed)
+        new_qogita = candidate(999, ("qogita",))
+        new_scope_rows = old_rows + [new_qogita]
+        preview = self.store.status(
+            ["qogita", "umma", "abw"],
+            active_identifiers=[row["canonical_ean"] for row in new_scope_rows],
+        )
+        self.assertFalse(preview["rotation_scope_initialized"])
+        self.assertEqual(preview["rotation_analyzed_count"], 0)
+        self.assertEqual(preview["rotation_global_analyzed_count"], 5)
+        self.assertEqual(preview["rotation_previous_analyzed_count"], 5)
+        self.assertEqual(preview["rotation_added_suppliers"], ["qogita"])
+        self.assertEqual(preview["rotation_new_identifier_count"], 1)
+        selected, metadata = self.store.select(
+            "new-job", new_scope_rows, ["abw", "qogita", "umma"], 1,
+        )
+        self.assertEqual(selected[0]["canonical_ean"], new_qogita["canonical_ean"])
+        self.assertEqual(metadata["rotation_global_analyzed_count"], 5)
+
+    def test_qogita_snapshot_growth_keeps_scope_and_prioritizes_new_identifier(self):
+        initial = [candidate(index, ("abw", "qogita")) for index in range(5)]
+        analyzed, metadata = self.store.select(
+            "job-1", initial, ["abw", "qogita"], 2,
+            supplier_snapshot_set={"qogita": {"snapshot_id": "snapshot-1"}},
+        )
+        self.commit("job-1", analyzed)
+        new_row = candidate(777, ("qogita",))
+        self.store.sync_universe(
+            initial + [new_row], ["qogita", "abw"],
+            supplier_snapshot_set={"qogita": {"snapshot_id": "snapshot-2"}},
+        )
+        status = self.store.status(["abw", "qogita"])
+        self.assertEqual(status["rotation_scope"], metadata["rotation_scope"])
+        self.assertEqual(status["rotation_analyzed_count"], 2)
+        self.assertEqual(status["rotation_remaining_count"], 4)
+        selected, _ = self.store.select(
+            "job-2", initial + [new_row], ["abw", "qogita"], 1,
+        )
+        self.assertEqual(selected[0]["canonical_ean"], new_row["canonical_ean"])
+
     def test_failed_before_catalog_is_not_consumed(self):
         first, _ = self.store.select("job-1", self.rows, ["abw"], 5)
         second, _ = self.store.select("job-2", self.rows, ["abw"], 12)
@@ -128,10 +209,31 @@ class DiscoveryRotationTests(unittest.TestCase):
 
     def test_manual_new_cycle_requires_confirmation(self):
         self.store.sync_universe(self.rows, ["abw"])
+        selected, _ = self.store.select("job", self.rows, ["abw"], 2)
+        self.commit("job", selected)
         with self.assertRaises(ValueError):
             self.store.start_new_cycle(["abw"], confirmed=False)
         result = self.store.start_new_cycle(["abw"], confirmed=True)
         self.assertEqual(result["rotation_cycle_id"], 2)
+        with self.store._connect() as connection:
+            history = connection.execute(
+                "SELECT COUNT(*) FROM discovery_rotation_global_history"
+            ).fetchone()[0]
+            old_selections = connection.execute(
+                "SELECT COUNT(*) FROM discovery_rotation_selections WHERE job_id='job'"
+            ).fetchone()[0]
+        self.assertEqual(history, 2)
+        self.assertEqual(old_selections, 2)
+
+    def test_repeated_commit_is_idempotent_for_global_history(self):
+        selected, _ = self.store.select("job", self.rows, ["abw"], 1)
+        self.commit("job", selected)
+        self.commit("job", selected)
+        with self.store._connect() as connection:
+            count = connection.execute(
+                "SELECT discovery_count FROM discovery_rotation_global_history"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
 
     def test_all_means_all_remaining(self):
         first, _ = self.store.select("job-1", self.rows, ["abw"], 3)
@@ -165,6 +267,9 @@ class DiscoveryRotationTests(unittest.TestCase):
         state.update({
             "selected_suppliers": ["abw", "umma"],
             "rotation_scope": "scope", "rotation_cycle_id": 3,
+            "rotation_scope_initialized": True,
+            "rotation_global_analyzed_count": 620,
+            "rotation_new_identifier_count": 12,
             "rotation_analyzed_before_run": 500,
             "rotation_analyzed_this_run": 480,
             "rotation_remaining_after_run": 120,
@@ -176,6 +281,8 @@ class DiscoveryRotationTests(unittest.TestCase):
         self.assertEqual(state["schema_version"], DISCOVERY_CHECKPOINT_SCHEMA_VERSION)
         metadata = dict(_run_metadata(state, [], []))
         self.assertEqual(metadata["Ciclo rotazione"], 3)
+        self.assertEqual(metadata["Storico Amazon globale"], 620)
+        self.assertEqual(metadata["Nuovi identificatori scope"], 12)
         self.assertEqual(metadata["Analizzati in questa run"], 480)
         self.assertIn("fresh", metadata["Freshness ABW"])
 
