@@ -77,6 +77,18 @@ def normalized_qudo(*, rows=None, now=NOW):
 
 
 class QudoAdapterTests(unittest.TestCase):
+    def test_same_gtin_different_supplier_products_keep_distinct_scenarios(self):
+        first = qudo_row()
+        second = qudo_row(
+            product_id="893", offer_id="47063", supplier_sku="QUDO-HARU-15_2",
+        )
+        candidates, diagnostics = normalize_qudo_candidates([first, second], now=NOW)
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(diagnostics["qudo_scenarios"], 2)
+        self.assertEqual(
+            len({row["scenarios"][0]["scenario_id"] for row in candidates}), 2,
+        )
+
     def test_real_qudo_scenario_maps_identity_price_vat_stock_and_mov(self):
         candidate, diagnostics = normalized_qudo()
         self.assertEqual(candidate["canonical_ean"], EAN)

@@ -375,6 +375,7 @@ def normalize_abw_candidates(rows, *, now=None):
                     "discount_label": str(row.get("discount_label") or ""),
                     "price_source": str(row.get("price_source") or ""),
                     "price_basis": str(row.get("price_basis") or ""),
+                    "displayed_unit_price": str(row.get("displayed_unit_price") or ""),
                     "product_url": str(row.get("product_url") or ""),
                     "source": str(row.get("source") or ""),
                     "cost_scope": "merchandise_gross_excluding_landed_costs",

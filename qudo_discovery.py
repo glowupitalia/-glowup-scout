@@ -225,16 +225,26 @@ def normalize_qudo_candidates(rows, *, now=None):
                 "canonical_ean": ean, "reason": "invalid_identifier",
             })
             continue
-        current = grouped.get(ean)
+        identity_sku = str(row.get("supplier_sku") or "").strip()
+        if identity_sku.casefold().startswith("qudo-"):
+            identity_sku = identity_sku[5:]
+        identity = (
+            ean,
+            str(row.get("supplier_product_id") or "").strip(),
+            str(row.get("supplier_offer_id") or "").strip(),
+            identity_sku,
+        )
+        current = grouped.get(identity)
         if current is None or (
             str(row.get("observed_at") or ""), str(row.get("run_id") or "")
         ) > (
             str(current.get("observed_at") or ""), str(current.get("run_id") or "")
         ):
-            grouped[ean] = row
+            grouped[identity] = row
 
     candidates = []
-    for ean, row in grouped.items():
+    for identity, row in grouped.items():
+        ean = identity[0]
         rejection = None
         net = _decimal(row.get("unit_price"), positive=True)
         currency = str(row.get("currency") or "").strip().upper()
@@ -324,6 +334,7 @@ def normalize_qudo_candidates(rows, *, now=None):
                 "price_basis": price_basis,
                 "pricing_scope": str(row.get("pricing_scope") or ""),
                 "source": str(row.get("source") or ""),
+                "identifier_source": str(row.get("identifier_source") or ""),
                 "stock_source": "add_to_cart.maximum",
                 "cost_scope": "merchandise_gross_excluding_landed_costs",
             },
