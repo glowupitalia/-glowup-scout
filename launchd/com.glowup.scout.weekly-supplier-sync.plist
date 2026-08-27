@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.glowup.scout.weekly-supplier-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/casaloria/Developer/GlowUp-Scout/.venv/bin/python</string>
+    <string>/Users/casaloria/Developer/GlowUp-Scout/weekly_supplier_sync.py</string>
+    <string>run</string>
+    <string>--trigger</string>
+    <string>scheduled</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/casaloria/Developer/GlowUp-Scout</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>0</integer><key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>0</integer><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>/Users/casaloria/Developer/GlowUp-Scout/data/logs/weekly-supplier-sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/casaloria/Developer/GlowUp-Scout/data/logs/weekly-supplier-sync.error.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
