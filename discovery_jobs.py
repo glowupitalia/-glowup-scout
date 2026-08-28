@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -15,11 +16,15 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATABASE = PROJECT_ROOT / "data" / "discovery_jobs.sqlite3"
 DEFAULT_LOG_DIR = PROJECT_ROOT / "data" / "logs"
-ACTIVE_STATUSES = {"launching", "running"}
+ACTIVE_STATUSES = {
+    "launching", "running", "export_running", "notification_pending",
+}
 RESUMABLE_CHECKPOINT_STATUSES = {
     "running", "failed", "interrupted", "waiting_retry",
     "qogita_refresh_failed", "supplier_preparation_failed",
     "resource_paused",
+    "computed", "export_pending", "export_running", "export_resource_paused",
+    "export_complete", "notification_pending",
 }
 
 
@@ -78,13 +83,21 @@ class DiscoveryJobRegistry:
         configured = path or os.environ.get("DISCOVERY_JOB_DATABASE") or DEFAULT_DATABASE
         self.path = Path(configured).expanduser().resolve()
 
-    def _connect(self):
+    def _new_connection(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=30000")
         return connection
+
+    @contextmanager
+    def _connect(self):
+        connection = self._new_connection()
+        try:
+            yield connection
+        finally:
+            connection.close()
 
     def initialize(self):
         with self._connect() as connection:
@@ -223,9 +236,108 @@ class DiscoveryJobRegistry:
         with self._connect() as connection:
             connection.execute(
                 f"UPDATE discovery_job_runtime SET {','.join(updates)} "
-                "WHERE job_id=? AND worker_pid=? AND status='running'", values,
+                "WHERE job_id=? AND worker_pid=? "
+                "AND status IN ('running','export_running','notification_pending')", values,
             )
             connection.commit()
+
+    def prepare_finalization(self, job_id: str, state: dict[str, Any]):
+        """Persist the computation/export hand-off without retaining ownership."""
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE discovery_job_runtime SET status='export_pending',
+                   phase='export_pending',updated_at=?,completed_at=?,
+                   progress_current=?,progress_total=?,resumable=1,error=NULL,
+                   worker_pid=NULL,lease_expires_at=NULL WHERE job_id=?""",
+                (
+                    utc_now(), state.get("completed_at"),
+                    int(state.get("progress_current") or state.get("selected_count") or 0),
+                    int(state.get("progress_total") or state.get("selected_count") or 0),
+                    job_id,
+                ),
+            )
+            connection.commit()
+
+    def claim_finalization(
+        self, job_id: str, *, pid: int, lease_seconds: int = 300,
+    ) -> bool:
+        """Idempotently claim only the export/notification phase."""
+        self.initialize()
+        now = datetime.now(timezone.utc)
+        observed = now.isoformat().replace("+00:00", "Z")
+        expires = (now + timedelta(seconds=lease_seconds)).isoformat().replace("+00:00", "Z")
+        allowed = {
+            "computed", "export_pending", "export_running",
+            "export_resource_paused", "export_complete", "notification_pending",
+            # Recovery of a computation persisted before the state machine was added.
+            "running", "resumable",
+        }
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM discovery_job_runtime WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if row is None or str(row["status"]) not in allowed:
+                connection.rollback()
+                return False
+            owner = row["worker_pid"]
+            lease = _parse_time(row["lease_expires_at"])
+            if owner and int(owner) != int(pid) and process_alive(owner) and lease and lease > now:
+                connection.rollback()
+                return False
+            next_status = (
+                "notification_pending"
+                if row["export_path"] and str(row["status"]) in {"export_complete", "notification_pending"}
+                else "export_running"
+            )
+            next_phase = "notification_pending" if next_status == "notification_pending" else "export_running"
+            connection.execute(
+                """UPDATE discovery_job_runtime SET status=?,phase=?,worker_pid=?,
+                   lease_expires_at=?,updated_at=?,resumable=1,error=NULL WHERE job_id=?""",
+                (next_status, next_phase, int(pid), expires, observed, job_id),
+            )
+            connection.commit()
+        return True
+
+    def mark_export_complete(self, job_id: str, *, pid: int, export_path: str):
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE discovery_job_runtime SET status='notification_pending',
+                   phase='notification_pending',export_path=?,updated_at=?
+                   WHERE job_id=? AND worker_pid=? AND status='export_running'""",
+                (str(export_path), utc_now(), job_id, int(pid)),
+            )
+            connection.commit()
+
+    def export_resource_pause(
+        self, job_id: str, *, reason: str, metrics: dict[str, Any], phase: str,
+    ):
+        message = json.dumps(
+            {"reason": reason, "metrics": metrics},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )[:2000]
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE discovery_job_runtime SET status='export_resource_paused',
+                   phase=?,resumable=1,error=?,updated_at=?,worker_pid=NULL,
+                   lease_expires_at=NULL WHERE job_id=?""",
+                (phase, message, utc_now(), job_id),
+            )
+            connection.commit()
+
+    def launch_finalizer(self, job_id: str) -> int:
+        """Start finalization in a clean interpreter after computation persists."""
+        log_dir = DEFAULT_LOG_DIR
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"discovery-{job_id}.log"
+        with log_path.open("ab", buffering=0) as log:
+            process = subprocess.Popen(
+                [sys.executable, str(PROJECT_ROOT / "discovery_finalize_worker.py"),
+                 "--job-id", job_id],
+                cwd=PROJECT_ROOT, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=log, start_new_session=True, close_fds=True,
+            )
+        return int(process.pid)
 
     def finish(self, job_id: str, state: dict[str, Any], *, export_path: str | None = None):
         status = str(state.get("status") or "failed")
@@ -288,9 +400,11 @@ class DiscoveryJobRegistry:
     def reconcile(self):
         self.initialize()
         now = datetime.now(timezone.utc)
+        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM discovery_job_runtime WHERE status IN ('launching','running')"
+                f"SELECT * FROM discovery_job_runtime WHERE status IN ({placeholders})",
+                tuple(sorted(ACTIVE_STATUSES)),
             ).fetchall()
             for row in rows:
                 lease = _parse_time(row["lease_expires_at"])

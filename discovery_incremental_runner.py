@@ -288,11 +288,18 @@ def run_incremental_discovery(
             if observation.get("fee_status") == "valid":
                 _sync_observation_fee_fields(observation)
         store.upsert_observations(job_id, pending)
+        if progress:
+            progress("fees", {
+                "progress_phase": "fees",
+                "progress_current": selected,
+                "progress_total": selected,
+            })
         if fee_batch_interval:
             sleep_func(fee_batch_interval)
 
     if store.summary(job_id)["phase"] == "fees_complete":
         final_products = 0
+        economics_processed = 0
         transformed = []
         coverage_observations = {}
         for candidate in store.iter_candidates(job_id):
@@ -315,11 +322,18 @@ def run_incremental_discovery(
             )
             candidate["is_final_result"] = bool(passed)
             final_products += int(bool(passed))
+            economics_processed += 1
             transformed.append(candidate)
             if len(transformed) == 250:
                 store.update_candidates(job_id, transformed, replace_scenarios=True)
                 transformed = []
                 governor.before_next_batch()
+                if progress:
+                    progress("economics", {
+                        "progress_phase": "economics",
+                        "progress_current": economics_processed,
+                        "progress_total": selected,
+                    })
         if transformed:
             store.update_candidates(job_id, transformed, replace_scenarios=True)
         coverage = fee_coverage(coverage_observations.values())

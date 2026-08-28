@@ -21,8 +21,6 @@ from discovery_amazon import (
 from discovery_excel import write_discovery_excel
 from discovery_incremental import (
     DiscoveryIncrementalStore,
-    IncrementalCandidateCollection,
-    IncrementalObservationCollection,
     LightweightCheckpointStore,
     prepare_incremental_job,
 )
@@ -155,21 +153,25 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
                 job_id=job_id, selected_suppliers=state.get("selected_suppliers"),
                 run_budget=state.get("run_budget"), progress=progress,
             )
+        if incremental and result.get("status") == "completed":
+            # Persist a small hand-off and let a clean interpreter perform the
+            # export.  The computation process can then exit and the OS releases
+            # every Catalog/economics object before workbook generation starts.
+            result.update({"status": "computed", "phase": "export_pending"})
+            incremental_store.set_phase(job_id, "export_pending", status="computed")
+            LightweightCheckpointStore().save(result)
+            registry.prepare_finalization(job_id, result)
+            finalizer_pid = registry.launch_finalizer(job_id)
+            logger.info(
+                "DISCOVERY COMPUTATION HANDED OFF | job_id=%s finalizer_pid=%s",
+                job_id, finalizer_pid,
+            )
+            return result
+
         output_path = None
         if result.get("status") == "completed":
             output_path = PROJECT_ROOT / "data" / "discovery_jobs" / f"{job_id}.xlsx"
             export_result = result
-            if incremental:
-                export_result = {
-                    **result,
-                    "candidates": IncrementalCandidateCollection(incremental_store, job_id),
-                    "results": IncrementalCandidateCollection(
-                        incremental_store, job_id, final_only=True,
-                    ),
-                    "amazon_observations": IncrementalObservationCollection(
-                        incremental_store, job_id,
-                    ),
-                }
             write_discovery_excel(export_result, str(output_path))
             result["export_state"] = _export_metadata(output_path, result)
         else:

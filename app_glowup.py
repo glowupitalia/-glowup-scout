@@ -803,7 +803,10 @@ def _render_discovery_runtime(job_id):
     if not runtime:
         ui_alert("Stato Discovery non disponibile.", "warning")
         return
-    if runtime["status"] in {"launching", "running"}:
+    if runtime["status"] in {
+        "launching", "running", "computed", "export_pending",
+        "export_running", "notification_pending",
+    }:
         current = int(runtime.get("progress_current") or 0)
         total = int(runtime.get("progress_total") or 0)
         progress_value = min(1.0, current / total) if total else 0.02
@@ -813,12 +816,17 @@ def _render_discovery_runtime(job_id):
             f"{current:,} / {total:,} · ultimo aggiornamento {runtime.get('updated_at') or '—'}"
             .replace(",", ".")
         )
-        st.info("La Discovery continua anche se torni alla Home o chiudi il browser.")
+        if runtime["status"] in {"computed", "export_pending", "export_running"}:
+            st.info("Calcolo completato. Generazione Excel in corso con memoria protetta.")
+        elif runtime["status"] == "notification_pending":
+            st.info("Excel completato. Preparazione della notifica finale in corso.")
+        else:
+            st.info("La Discovery continua anche se torni alla Home o chiudi il browser.")
         return
     if runtime["status"] == "completed":
         _load_discovery_result(runtime["job_id"], runtime)
         st.rerun(scope="app")
-    elif runtime["status"] == "resource_paused":
+    elif runtime["status"] in {"resource_paused", "export_resource_paused"}:
         state = DiscoveryCheckpointStore().load(runtime["job_id"])
         pause = state.get("resource_pause") or {}
         st.warning("Discovery sospesa per proteggere HomeServer")
@@ -828,7 +836,10 @@ def _render_discovery_runtime(job_id):
             "il job e il campione restano riprendibili."
         )
         if st.button("Riprendi Discovery", key="resume_resource_paused", type="primary"):
-            _start_discovery_worker(state)
+            if runtime["status"] == "export_resource_paused":
+                registry.launch_finalizer(runtime["job_id"])
+            else:
+                _start_discovery_worker(state)
             st.rerun(scope="app")
     elif runtime.get("resumable"):
         state = DiscoveryCheckpointStore().load(runtime["job_id"])

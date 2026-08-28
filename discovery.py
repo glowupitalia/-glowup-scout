@@ -186,7 +186,8 @@ class DiscoveryCheckpointStore:
             if state.get("status") in {
                 "running", "failed", "interrupted", "waiting_retry",
                 "qogita_refresh_failed", "supplier_preparation_failed",
-                "resource_paused",
+                "resource_paused", "computed", "export_pending",
+                "export_running", "export_resource_paused", "notification_pending",
             }:
                 states.append(state)
         latest = max(states, key=lambda row: row.get("updated_at", ""), default=None)

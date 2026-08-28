@@ -13,6 +13,7 @@ import mmap
 import os
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -231,7 +232,7 @@ class DiscoveryIncrementalStore:
         configured = path or os.environ.get("DISCOVERY_INCREMENTAL_DATABASE")
         self.path = Path(configured or DEFAULT_DATABASE).expanduser().resolve()
 
-    def _connect(self):
+    def _new_connection(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
@@ -240,6 +241,20 @@ class DiscoveryIncrementalStore:
         connection.execute("PRAGMA synchronous=NORMAL")
         connection.execute("PRAGMA busy_timeout=30000")
         return connection
+
+    @contextmanager
+    def _connect(self):
+        """Yield one connection and always close it after the unit of work.
+
+        ``sqlite3.Connection.__exit__`` commits or rolls back but deliberately
+        does not close the connection.  The old ``with self._connect()`` usage
+        therefore retained thousands of connections until cyclic GC ran.
+        """
+        connection = self._new_connection()
+        try:
+            yield connection
+        finally:
+            connection.close()
 
     def initialize(self):
         with self._connect() as connection:
@@ -366,7 +381,7 @@ class DiscoveryIncrementalStore:
     def summary(self, job_id: str, *, connection=None) -> dict[str, Any]:
         self.initialize()
         owns = connection is None
-        connection = connection or self._connect()
+        connection = connection or self._new_connection()
         try:
             job = connection.execute(
                 "SELECT * FROM discovery_incremental_jobs WHERE job_id=?", (job_id,)
@@ -484,6 +499,112 @@ class DiscoveryIncrementalStore:
                 hydrated = [self._hydrate_item(connection, row) for row in rows]
             if not hydrated:
                 return
+            yield from hydrated
+            offset += len(hydrated)
+
+    def iter_export_candidates(
+        self, job_id: str, *, batch_size: int = 250, final_only: bool = False,
+    ) -> Iterator[dict[str, Any]]:
+        """Stream fully hydrated export rows with bounded SQL prefetches.
+
+        Export needs scenarios, listings, observations and combinations, but
+        opening a connection for every product caused tens of thousands of
+        live sqlite handles before cyclic GC.  This iterator owns exactly one
+        connection per bounded page and bulk-loads every related table.
+        """
+        self.initialize()
+        offset = 0
+        while True:
+            predicate = (
+                " AND json_extract(product_json,'$.is_final_result')=1"
+                if final_only else ""
+            )
+            with self._connect() as connection:
+                item_rows = connection.execute(
+                    f"""SELECT * FROM discovery_job_items WHERE job_id=?{predicate}
+                        ORDER BY sequence_no LIMIT ? OFFSET ?""",
+                    (job_id, int(batch_size), offset),
+                ).fetchall()
+                if not item_rows:
+                    return
+                identifiers = [str(row["canonical_identifier"]) for row in item_rows]
+                placeholders = ",".join("?" for _ in identifiers)
+                parameters = (job_id, *identifiers)
+                scenario_rows = connection.execute(
+                    f"""SELECT canonical_identifier,scenario_json
+                        FROM discovery_purchase_scenarios
+                        WHERE job_id=? AND canonical_identifier IN ({placeholders})
+                        ORDER BY canonical_identifier,scenario_id""", parameters,
+                ).fetchall()
+                listing_rows = connection.execute(
+                    f"""SELECT canonical_identifier,listing_json
+                        FROM discovery_listings
+                        WHERE job_id=? AND canonical_identifier IN ({placeholders})
+                        ORDER BY canonical_identifier,asin""", parameters,
+                ).fetchall()
+                combination_rows = connection.execute(
+                    f"""SELECT canonical_identifier,combination_json
+                        FROM discovery_combinations
+                        WHERE job_id=? AND canonical_identifier IN ({placeholders})
+                        ORDER BY canonical_identifier,combination_id""", parameters,
+                ).fetchall()
+
+                scenarios: dict[str, list[dict[str, Any]]] = {}
+                for row in scenario_rows:
+                    scenarios.setdefault(str(row["canonical_identifier"]), []).append(
+                        json.loads(row["scenario_json"])
+                    )
+                listings: dict[str, list[dict[str, Any]]] = {}
+                observation_ids: set[str] = set()
+                for row in listing_rows:
+                    identifier = str(row["canonical_identifier"])
+                    listing = json.loads(row["listing_json"])
+                    listings.setdefault(identifier, []).append(listing)
+                    if listing.get("amazon_observation_id"):
+                        observation_ids.add(str(listing["amazon_observation_id"]))
+                combinations: dict[str, list[dict[str, Any]]] = {}
+                for row in combination_rows:
+                    identifier = str(row["canonical_identifier"])
+                    combination = json.loads(row["combination_json"])
+                    combinations.setdefault(identifier, []).append(combination)
+                    if combination.get("amazon_observation_id"):
+                        observation_ids.add(str(combination["amazon_observation_id"]))
+
+                observations: dict[str, dict[str, Any]] = {}
+                if observation_ids:
+                    observation_placeholders = ",".join("?" for _ in observation_ids)
+                    for row in connection.execute(
+                        f"""SELECT observation_id,observation_json
+                            FROM discovery_observations
+                            WHERE job_id=? AND observation_id IN ({observation_placeholders})""",
+                        (job_id, *sorted(observation_ids)),
+                    ):
+                        observations[str(row["observation_id"])] = json.loads(
+                            row["observation_json"]
+                        )
+
+                hydrated = []
+                for row in item_rows:
+                    identifier = str(row["canonical_identifier"])
+                    product = json.loads(row["product_json"])
+                    product["scenarios"] = scenarios.get(identifier, [])
+                    product["amazon_listings"] = listings.get(identifier, [])
+                    product["opportunity_combinations"] = combinations.get(identifier, [])
+                    related_ids = {
+                        str(value.get("amazon_observation_id"))
+                        for value in (
+                            product["amazon_listings"]
+                            + product["opportunity_combinations"]
+                        )
+                        if value.get("amazon_observation_id")
+                    }
+                    product["amazon_observations"] = [
+                        observations[value] for value in sorted(related_ids)
+                        if value in observations
+                    ]
+                    if row["catalog_status"]:
+                        product["catalog_status"] = row["catalog_status"]
+                    hydrated.append(product)
             yield from hydrated
             offset += len(hydrated)
 
@@ -811,9 +932,9 @@ class IncrementalCandidateCollection:
         self.final_only = final_only
 
     def __iter__(self):
-        for candidate in self.store.iter_candidates(self.job_id):
-            if not self.final_only or candidate.get("is_final_result"):
-                yield candidate
+        yield from self.store.iter_export_candidates(
+            self.job_id, final_only=self.final_only,
+        )
 
     def __len__(self):
         if not self.final_only:

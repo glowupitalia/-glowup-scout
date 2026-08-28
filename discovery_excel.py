@@ -8,6 +8,7 @@ import tempfile
 from decimal import Decimal
 
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill, Protection
 from openpyxl.utils import get_column_letter
@@ -79,6 +80,15 @@ def _as_decimal(value):
 
 def _export_context(payload):
     if isinstance(payload, dict):
+        raw_candidates = payload.get("candidates") or []
+        raw_final_products = payload.get("results") or []
+        # Incremental rows were normalized before being persisted.  Running
+        # normalize_discovery_state here would iterate both SQL views and keep
+        # every hydrated product in its ``normalized_products`` list before a
+        # temporary workbook even exists, recreating the multi-gigabyte graph
+        # that incremental persistence was designed to avoid.
+        if getattr(raw_candidates, "store", None) is not None:
+            return dict(payload), raw_candidates, raw_final_products
         state = normalize_discovery_state(payload)
         candidates = state.get("candidates") or []
         final_products = state.get("results") or []
@@ -495,8 +505,12 @@ def _run_metadata(state, candidates, final_products):
     ]
 
 
-def write_discovery_excel(results, output_file):
+def write_discovery_excel(results, output_file, *, progress=None):
     state, candidates, final_products = _export_context(results)
+    if getattr(candidates, "store", None) is not None:
+        return _write_incremental_discovery_excel(
+            state, candidates, final_products, output_file, progress=progress,
+        )
     output_path = os.path.abspath(output_file)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     descriptor, temporary_path = tempfile.mkstemp(
@@ -783,6 +797,319 @@ def write_discovery_excel(results, output_file):
         workbook.calculation.fullCalcOnLoad = True
         workbook.calculation.forceFullCalc = True
         workbook.calculation.calcOnSave = True
+        workbook.save(temporary_path)
+        os.replace(temporary_path, output_path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+    return output_path
+
+
+def _stream_cell(ws, value, *, header=False, number_format=None, unlocked=False,
+                 hyperlink=None):
+    cell = WriteOnlyCell(ws, value=_value(value))
+    if header:
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    if number_format:
+        cell.number_format = number_format
+    if unlocked:
+        cell.protection = Protection(locked=False)
+        cell.fill = PatternFill("solid", fgColor="EAF2FE")
+    if hyperlink:
+        cell.hyperlink = str(hyperlink)
+        cell.style = "Hyperlink"
+    return cell
+
+
+def _stream_append(ws, values, *, header=False, currency_columns=(),
+                   percent_columns=(), integer_columns=(), text_columns=(),
+                   unlocked_columns=(), hyperlink_columns=()):
+    cells = []
+    for index, value in enumerate(values, start=1):
+        fmt = None
+        if index in currency_columns:
+            fmt = '€ #,##0.00'
+        elif index in percent_columns:
+            fmt = '0.00%'
+        elif index in integer_columns:
+            fmt = '#,##0'
+        elif index in text_columns:
+            fmt = '@'
+        hyperlink = value if index in hyperlink_columns and value else None
+        cells.append(_stream_cell(
+            ws, value, header=header, number_format=fmt,
+            unlocked=index in unlocked_columns, hyperlink=hyperlink,
+        ))
+    ws.append(cells)
+
+
+def _configure_stream_sheet(ws, widths, *, visible_columns=None,
+                            hidden_columns=(), protected=False):
+    for index, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(index)].width = width
+    for column in hidden_columns:
+        ws.column_dimensions[column].hidden = True
+    ws.freeze_panes = "A2"
+    ws.sheet_view.showGridLines = False
+    if protected:
+        ws.protection.sheet = True
+        ws.protection.autoFilter = False
+        ws.protection.sort = False
+        ws.protection.selectUnlockedCells = False
+
+
+def _write_incremental_discovery_excel(
+    state, candidates, final_products, output_file, *, progress=None,
+):
+    """Write a large incremental job without retaining worksheet cells.
+
+    The collections are repeatable, bounded SQLite views.  openpyxl's
+    write-only worksheets keep only the current row in memory while retaining
+    formulas, filters, hyperlinks, hidden technical columns and run metadata.
+    """
+    output_path = os.path.abspath(output_file)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".glowup_discovery_", suffix=".xlsx",
+        dir=os.path.dirname(output_path) or ".",
+    )
+    os.close(descriptor)
+    try:
+        workbook = Workbook(write_only=True)
+        opportunities = workbook.create_sheet("Opportunità")
+        all_results_ws = workbook.create_sheet("Tutti i risultati")
+        listings_ws = workbook.create_sheet("Listing Amazon")
+        scenarios_ws = workbook.create_sheet("Scenari")
+        data_ws = workbook.create_sheet("Dati")
+        run_ws = workbook.create_sheet("Parametri run")
+
+        opportunity_widths = [16, 20, 45, 12, 22, 18, 12, 14, 12, 18, 14, 15, 17, 12, 12, 12, 9, 20, 16, 16, 42]
+        scenario_widths = [16, 20, 45, 14, 12, 16, 22, 18, 12, 18, 12, 14, 15, 17, 12, 12, 12, 9, 20, 16, 20, 10, 32, 14, 20]
+        _configure_stream_sheet(
+            opportunities, opportunity_widths, visible_columns=len(OPPORTUNITY_COLUMNS),
+            hidden_columns=("V", "W", "X", "Y"), protected=True,
+        )
+        _configure_stream_sheet(
+            scenarios_ws, scenario_widths, visible_columns=len(SCENARIO_COLUMNS),
+            hidden_columns=("Z", "AA", "AB", "AC"), protected=True,
+        )
+        _configure_stream_sheet(
+            all_results_ws,
+            [16, 20, 42, 28, 14, 14, 44, 18, 10, 12, 16, 16, 12, 12,
+             14, 15, 18, 18, 16, 24, 48, 28, 42],
+        )
+        _configure_stream_sheet(
+            listings_ws,
+            [16, 14, 46, 20, 20, 42, 10, 32, 12, 18, 12, 12, 12, 16,
+             14, 15, 18, 20, 16, 12, 44, 42],
+        )
+        _configure_stream_sheet(data_ws, [28] * len(TECHNICAL_COLUMNS))
+        _configure_stream_sheet(run_ws, [28, 54])
+        data_ws.sheet_state = "hidden"
+
+        _stream_append(opportunities, OPPORTUNITY_COLUMNS + [
+            "ProductRowID", "ScenarioRowID", "ObservationRowID", "CombinationRowID"
+        ], header=True)
+        _stream_append(all_results_ws, ALL_RESULTS_COLUMNS, header=True)
+        _stream_append(listings_ws, LISTING_COLUMNS, header=True)
+        _stream_append(scenarios_ws, SCENARIO_COLUMNS + [
+            "ProductRowID", "ScenarioRowID", "ObservationRowID", "CombinationRowID"
+        ], header=True)
+        _stream_append(data_ws, TECHNICAL_COLUMNS, header=True)
+        _stream_append(run_ws, RUN_COLUMNS, header=True)
+
+        observations = {}
+        for observation in state.get("amazon_observations") or []:
+            observation_id = observation.get("observation_id")
+            if observation_id:
+                keys = (observation.get("diagnostics") or {}).get("product_keys") or []
+                observations.setdefault(observation_id, (keys[0] if keys else "", observation))
+        final_product_keys = {
+            row.get("product_key") for row in final_products if row.get("product_key")
+        }
+        last_data_row = max(2, len(observations) + 1)
+
+        opportunity_row = 1
+        for product in final_products:
+            product_id = product.get("product_key") or f"product-{_product_ean(product)}"
+            recommended_pair = recommended_combination(product)
+            scenario_by_id = {
+                row.get("scenario_id"): row for row in product.get("scenarios") or []
+            }
+            recommended = scenario_by_id.get(
+                (recommended_pair or {}).get("scenario_id")
+            ) or _recommended(product)
+            if not recommended:
+                continue
+            if recommended_pair:
+                observation = next(
+                    (row for row in _observations(product)
+                     if row.get("observation_id") == recommended_pair.get("amazon_observation_id")),
+                    product.get("amazon_observation") or {},
+                )
+            else:
+                observation = product.get("amazon_observation") or {}
+                recommended_pair = {
+                    "combination_id": f"legacy|{recommended.get('scenario_id')}",
+                    "scenario_id": recommended.get("scenario_id"),
+                    "asin": observation.get("asin"),
+                    "amazon_observation_id": observation.get("observation_id") or product_id,
+                }
+            opportunity_row += 1
+            margin, targets, score, opportunity = _economic_formulas(
+                opportunity_row, cost_col="G", margin_col="M", target_cols=("N", "O", "P"),
+                score_col="Q", opportunity_col="R", observation_id_col="X",
+                last_data_row=last_data_row,
+            )
+            link = product.get("amazon_offers_url")
+            values = [
+                _product_ean(product), observation.get("amazon_brand") or product.get("brand"),
+                observation.get("amazon_title") or product.get("title"),
+                str(recommended.get("supplier") or "").upper(),
+                recommended.get("scenario_label"), scenario_requirement_label(recommended),
+                recommended.get("cost_gross_unit_eur"), recommended_pair.get("asin"),
+                observation.get("bsr_beauty"), observation.get("reference_price"),
+                observation.get("fba_sellers"), observation.get("total_sellers"),
+                margin, targets["N"], targets["O"], targets["P"], score, opportunity,
+                len(product.get("scenarios") or []),
+                len(product.get("amazon_listings") or [observation]), link, product_id,
+                recommended.get("scenario_id"), recommended_pair.get("amazon_observation_id"),
+                recommended_pair.get("combination_id"),
+            ]
+            _stream_append(
+                opportunities, values, currency_columns=(7, 10, 14, 15, 16),
+                percent_columns=(13,), text_columns=(1, 8), unlocked_columns=(7,),
+                hyperlink_columns=(21,),
+            )
+
+        scenario_row = all_results_row = listing_row = 1
+        processed = 0
+        for product in candidates:
+            product_id = product.get("product_key") or f"product-{_product_ean(product)}"
+            recommended_pair = recommended_combination(product)
+            if not recommended_pair:
+                legacy_recommended = _recommended(product) or {}
+                legacy_observation = product.get("amazon_observation") or {}
+                recommended_pair = {
+                    "combination_id": f"legacy|{legacy_recommended.get('scenario_id')}",
+                    "scenario_id": legacy_recommended.get("scenario_id"),
+                    "asin": legacy_observation.get("asin"),
+                    "amazon_observation_id": legacy_observation.get("observation_id") or product_id,
+                }
+            scenario_by_id = {row.get("scenario_id"): row for row in product.get("scenarios") or []}
+            observation_by_id = {row.get("observation_id"): row for row in _observations(product)}
+            for combination in _combinations(product):
+                scenario = scenario_by_id.get(combination.get("scenario_id"), {})
+                combination_observation = observation_by_id.get(
+                    combination.get("amazon_observation_id"), {}
+                ) or observations.get(combination.get("amazon_observation_id"), (None, {}))[1]
+                scenario_row += 1
+                margin, targets, score, opportunity = _economic_formulas(
+                    scenario_row, cost_col="I", margin_col="N", target_cols=("O", "P", "Q"),
+                    score_col="R", opportunity_col="S", observation_id_col="AB",
+                    last_data_row=last_data_row,
+                )
+                _stream_append(scenarios_ws, [
+                    _product_ean(product), combination_observation.get("amazon_brand") or product.get("brand"),
+                    combination_observation.get("amazon_title") or product.get("title"),
+                    combination.get("asin"), str(scenario.get("supplier") or "").upper(),
+                    scenario.get("supplier_alias"), scenario.get("scenario_label"),
+                    scenario_requirement_label(scenario), scenario.get("cost_gross_unit_eur"),
+                    combination_observation.get("reference_price"), combination_observation.get("bsr_beauty"),
+                    combination_observation.get("fba_sellers"), combination_observation.get("total_sellers"),
+                    margin, targets["O"], targets["P"], targets["Q"], score, opportunity,
+                    "Raccomandata" if combination.get("combination_id") == recommended_pair.get("combination_id") else "",
+                    combination.get("evaluation_status"), scenario.get("stock"),
+                    f"{scenario.get('lead_time') or '—'} · {scenario.get('snapshot_at') or ''} · {scenario.get('freshness_status') or ''}",
+                    scenario.get("warehouse"), scenario.get("availability_text") or scenario.get("availability_status"),
+                    product_id, scenario.get("scenario_id"), combination.get("amazon_observation_id"),
+                    combination.get("combination_id"),
+                ], currency_columns=(9, 10, 15, 16, 17), percent_columns=(14,),
+                    text_columns=(1, 4), unlocked_columns=(9,))
+
+            listings = product.get("amazon_listings") or []
+            if not listings:
+                technical, label, reason, threshold, detail = _status_detail(
+                    product, None, state.get("filters") or {}, final_product_keys,
+                )
+                all_results_row += 1
+                _stream_append(all_results_ws, [
+                    _product_ean(product), product.get("brand"), product.get("title"),
+                    _supplier_names(product), len(product.get("scenarios") or []),
+                    None, None, None, None, None, None, None, None, None, None, None,
+                    _best_cost(product), None, None, label, reason, threshold,
+                    f"{technical} · {detail}".strip(" ·"),
+                ], currency_columns=(11, 13, 14, 17), percent_columns=(18,),
+                    integer_columns=(5, 10, 15, 16, 19), text_columns=(1, 6))
+            for listing in listings:
+                combinations = _listing_combinations(product, listing)
+                best = _best_combination(combinations)
+                technical, label, reason, threshold, detail = _status_detail(
+                    product, listing, state.get("filters") or {}, final_product_keys,
+                )
+                all_results_row += 1
+                _stream_append(all_results_ws, [
+                    _product_ean(product), product.get("brand"), product.get("title"),
+                    _supplier_names(product), len(product.get("scenarios") or []),
+                    listing.get("asin"), listing.get("title"), listing.get("compatibility_status"),
+                    "Sì" if listing.get("beauty_status") == "display_group_beauty" else "No",
+                    listing.get("bsr_beauty"), listing.get("reference_price"), listing.get("price_source"),
+                    listing.get("min_fba_price"), listing.get("min_fbm_price"), listing.get("fba_sellers"),
+                    listing.get("total_sellers"), _best_cost(product),
+                    (_as_decimal((best or {}).get("margin_percent")) / Decimal("100")
+                     if (best or {}).get("margin_percent") is not None else None),
+                    (best or {}).get("score"), label, reason, threshold,
+                    f"{technical} · {detail}".strip(" ·"),
+                ], currency_columns=(11, 13, 14, 17), percent_columns=(18,),
+                    integer_columns=(5, 10, 15, 16, 19), text_columns=(1, 6))
+                listing_row += 1
+                link = f"https://www.amazon.it/gp/offer-listing/{listing.get('asin')}" if listing.get("asin") else None
+                buy_box = listing.get("reference_price") if listing.get("price_source") == "buy_box" else listing.get("buy_box_price")
+                _stream_append(listings_ws, [
+                    _product_ean(product), listing.get("asin"), listing.get("title"), listing.get("brand"),
+                    listing.get("compatibility_status"), _detail_text(listing.get("compatibility_reason")),
+                    "Sì" if listing.get("beauty_status") == "display_group_beauty" else "No",
+                    listing.get("display_group"), listing.get("bsr_beauty"), listing.get("catalog_status"),
+                    buy_box, listing.get("min_fba_price"), listing.get("min_fbm_price"),
+                    listing.get("price_source"), listing.get("fba_sellers"), listing.get("total_sellers"),
+                    listing.get("pricing_status"), listing.get("competition_status"), listing.get("fee_status"),
+                    listing.get("fee_attempts"), listing.get("exclusion_reason") or reason, link,
+                ], currency_columns=(11, 12, 13), integer_columns=(9, 15, 16, 20),
+                    text_columns=(1, 2), hyperlink_columns=(22,))
+            processed += 1
+            if progress and processed % 250 == 0:
+                progress("export_rows", processed, len(candidates))
+
+        for observation_id, (product_id, observation) in observations.items():
+            fee = observation.get("fee_estimate") or {}
+            _stream_append(data_ws, [
+                observation_id, product_id, observation.get("asin"), observation.get("bsr_beauty"),
+                observation.get("reference_price"), observation.get("fba_sellers"),
+                observation.get("total_sellers"), fee.get("fba_fee_net"), fee.get("fba_fee_gross"),
+                fee.get("referral_fee"), observation.get("referral_rate") or fee.get("referral_rate"),
+                observation.get("referral_source"), observation.get("price_source"),
+                observation.get("seller_count_source"), observation.get("observed_at"),
+                observation.get("min_fba_price"), observation.get("min_fbm_price"),
+            ], text_columns=(1, 2, 3), currency_columns=(5, 8, 9, 10, 16, 17))
+        for label, value in _run_metadata(state, candidates, final_products):
+            _stream_append(run_ws, [label, value])
+
+        opportunities.auto_filter.ref = f"A1:{get_column_letter(len(OPPORTUNITY_COLUMNS))}{opportunity_row}"
+        scenarios_ws.auto_filter.ref = f"A1:{get_column_letter(len(SCENARIO_COLUMNS))}{scenario_row}"
+        all_results_ws.auto_filter.ref = f"A1:{get_column_letter(len(ALL_RESULTS_COLUMNS))}{all_results_row}"
+        listings_ws.auto_filter.ref = f"A1:{get_column_letter(len(LISTING_COLUMNS))}{listing_row}"
+        data_ws.auto_filter.ref = f"A1:{get_column_letter(len(TECHNICAL_COLUMNS))}{max(2, len(observations)+1)}"
+        workbook.calculation.calcMode = "auto"
+        workbook.calculation.fullCalcOnLoad = True
+        workbook.calculation.forceFullCalc = True
+        workbook.calculation.calcOnSave = True
+        if progress:
+            progress("saving", processed, len(candidates))
         workbook.save(temporary_path)
         os.replace(temporary_path, output_path)
     except Exception:
