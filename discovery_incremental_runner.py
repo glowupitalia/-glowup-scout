@@ -8,12 +8,14 @@ from decimal import Decimal
 from typing import Any
 
 from discovery import (
+    FeeSystemicOutage,
     _build_amazon_observations,
     _call_catalog_batch,
     _ensure_product_listings,
     _evaluate_product_combinations,
     _process_fee_batch,
     _sync_observation_fee_fields,
+    fee_coverage,
 )
 from discovery_incremental import (
     DiscoveryIncrementalStore,
@@ -60,6 +62,10 @@ def run_incremental_discovery(
     governor = resource_governor or DiscoveryResourceGovernor(database_path=store.path)
     selected = int(state["selected_count"])
     batch_number = int(state.get("last_completed_batch") or 0)
+
+    if state.get("phase") == "fees_pending":
+        store.set_phase(job_id, "competition_filtered", status="running")
+        state = store.summary(job_id)
 
     # Catalog and rotation use separate SQLite stores. Reconcile committed
     # definitive results before claiming more work so a process death between
@@ -261,30 +267,49 @@ def run_incremental_discovery(
             "asin": row["asin"], "price": float(row["reference_price"]),
             "identifier": f"discovery|{job_id}|{row['observation_id']}|{row['asin']}",
         } for row in pending]
-        _process_fee_batch(
-            pending, requests_, fees_batch=fees_batch, token_provider=token_provider,
-            job_id=job_id, sleep_func=sleep_func,
-            save_progress=lambda: store.upsert_observations(job_id, pending),
-        )
+        try:
+            _process_fee_batch(
+                pending, requests_, fees_batch=fees_batch, token_provider=token_provider,
+                job_id=job_id, sleep_func=sleep_func,
+                save_progress=lambda: store.upsert_observations(job_id, pending),
+            )
+        except FeeSystemicOutage as exc:
+            store.set_phase(job_id, "fees_pending", status="waiting_retry")
+            return _checkpoint(
+                store, metadata_store, job_id, progress_phase="fees_pending",
+                progress_current=selected - len(pending), progress_total=selected,
+                extra={
+                    "resumable": True,
+                    "fee_outage_reason": exc.reason,
+                    "fee_outage_status_code": exc.status_code,
+                },
+            )
         for observation in pending:
             if observation.get("fee_status") == "valid":
                 _sync_observation_fee_fields(observation)
         store.upsert_observations(job_id, pending)
-        if any(row.get("fee_status") == "fee_pending" for row in pending):
-            store.set_phase(job_id, "fees_pending", status="waiting_retry")
-            _checkpoint(
-                store, metadata_store, job_id, progress_phase="fees_pending",
-                progress_current=selected - len(pending), progress_total=selected,
-            )
-            break
         if fee_batch_interval:
             sleep_func(fee_batch_interval)
 
     if store.summary(job_id)["phase"] == "fees_complete":
         final_products = 0
         transformed = []
+        coverage_observations = {}
         for candidate in store.iter_candidates(job_id):
             observations = store.observations_for_candidate(job_id, candidate)
+            coverage_observations.update(observations)
+            for listing in candidate.get("amazon_listings") or []:
+                observation = observations.get(listing.get("amazon_observation_id"))
+                if not observation:
+                    continue
+                for key in (
+                    "fee_status", "fee_estimate", "fee_attempts", "fee_error",
+                    "fee_error_status", "fee_error_code", "fee_error_type",
+                    "fee_pending_at", "fee_phase", "fee_unavailable_reason",
+                    "fee_retry_count", "fee_last_attempt_at",
+                ):
+                    if key in observation:
+                        listing[key] = observation[key]
             passed = _evaluate_product_combinations(
                 candidate, observations, filters["minimum_margin"]
             )
@@ -297,13 +322,19 @@ def run_incremental_discovery(
                 governor.before_next_batch()
         if transformed:
             store.update_candidates(job_id, transformed, replace_scenarios=True)
+        coverage = fee_coverage(coverage_observations.values())
         store.set_phase(job_id, "completed", status="completed")
         state = _checkpoint(
             store, metadata_store, job_id, progress_phase="completed",
             progress_current=selected, progress_total=selected,
             extra={"completed_at": state.get("completed_at") or
                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                   "final_products": final_products},
+                   "final_products": final_products,
+                   "fee_completion_status": (
+                       "fees_complete_with_partial_failures"
+                       if coverage["fee_coverage_partial"] else "fees_complete"
+                   ),
+                   **coverage},
         )
         return state
 

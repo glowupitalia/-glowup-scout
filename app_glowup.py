@@ -1665,6 +1665,26 @@ elif ui_state == "discovery_result":
                 "Scenari acquisto", funnel["suppliers"]["supplier_scenarios_total"]
             )
             summary_columns[3].metric("Opportunità finali", result_count)
+            fee_target = int(
+                state.get("fee_target_count")
+                or (state.get("funnel") or {}).get("fee_target_count")
+                or 0
+            )
+            fee_unavailable = int(
+                state.get("fee_unavailable_count")
+                or (state.get("funnel") or {}).get("fee_unavailable_count")
+                or 0
+            )
+            if fee_target and fee_unavailable:
+                fee_valid = int(
+                    state.get("fee_valid_count")
+                    or (state.get("funnel") or {}).get("fee_valid_count")
+                    or 0
+                )
+                st.warning(
+                    f"{fee_valid}/{fee_target} Fee Amazon disponibili · "
+                    f"{fee_unavailable} escluse dal ranking economico"
+                )
             st.caption("Prodotti")
             product_labels = [
                 ("Prodotti supplier", "supplier_products_total"),

@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 import sqlite3
+import requests
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -102,6 +103,15 @@ def qogita_row(
     }
 
 
+def test_ean(index):
+    body = f"5901234{int(index):05d}"
+    total = sum(
+        int(value) * (1 if position % 2 == 0 else 3)
+        for position, value in enumerate(body)
+    )
+    return body + str((-total) % 10)
+
+
 def catalog_mapping(gtins, _job_id):
     return {
         gtin: {
@@ -114,6 +124,19 @@ def catalog_mapping(gtins, _job_id):
             "product_type": "BEAUTY",
         }
         for index, gtin in enumerate(gtins, start=1)
+    }
+
+
+def unique_catalog_mapping(gtins, _job_id):
+    return {
+        gtin: {
+            "status": "resolved",
+            "asin": f"B{int(gtin[7:12]) + 1:09d}",
+            "amazon_title": f"Amazon {gtin}", "amazon_brand": "Brand",
+            "bsr_beauty": 5000, "beauty_status": "display_group_beauty",
+            "product_type": "BEAUTY",
+        }
+        for gtin in gtins
     }
 
 
@@ -825,8 +848,12 @@ class AmazonDiscoveryTests(unittest.TestCase):
         entries = ProductFeeBatchResults(
             [], retry_after="3", rate_limit="0.5"
         )
-        self.assertEqual(_fee_element_retry_delay(entries, 1), 3)
-        self.assertEqual(_fee_element_retry_delay(entries, 2), 4)
+        first = _fee_element_retry_delay(entries, 1)
+        second = _fee_element_retry_delay(entries, 2)
+        self.assertGreaterEqual(first, 3)
+        self.assertLessEqual(first, 3.3)
+        self.assertGreaterEqual(second, 4)
+        self.assertLessEqual(second, 4.4)
 
 
 class DiscoveryPipelineTests(unittest.TestCase):
@@ -1730,6 +1757,7 @@ class MultiScenarioDiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = self.run_pipeline(
                 directory, qogita_loader=lambda: rows, fees_batch=fees,
+                catalog_batch=unique_catalog_mapping,
             )
             self.assertEqual(state["status"], "completed")
             self.assertEqual([len(call) for call in calls], [2, 1])
@@ -1763,6 +1791,7 @@ class MultiScenarioDiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = self.run_pipeline(
                 directory, qogita_loader=lambda: rows, fees_batch=fees,
+                catalog_batch=unique_catalog_mapping,
             )
 
         self.assertEqual([len(call) for call in calls], [6, 1, 1, 1, 1, 1, 1])
@@ -1778,7 +1807,7 @@ class MultiScenarioDiscoveryTests(unittest.TestCase):
             for row in state["amazon_observations"]
         ))
 
-    def test_persistent_internal_error_becomes_waiting_retry_checkpoint(self):
+    def test_persistent_internal_error_becomes_unavailable_without_stopping_job(self):
         calls = []
         sleeps = []
 
@@ -1796,15 +1825,119 @@ class MultiScenarioDiscoveryTests(unittest.TestCase):
                 sleep_func=sleeps.append,
             )
             self.assertEqual([len(call) for call in calls], [1, 1, 1])
-            self.assertEqual(sleeps, [2, 4])
+            self.assertEqual(len(sleeps), 2)
+            self.assertTrue(2 <= sleeps[0] <= 2.2)
+            self.assertTrue(4 <= sleeps[1] <= 4.4)
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(state["phase"], "completed")
+            self.assertEqual(state["funnel"]["fee_valid"], 0)
+            self.assertEqual(state["funnel"]["fee_pending"], 0)
+            self.assertEqual(state["funnel"]["fee_unavailable"], 1)
+            self.assertEqual(state["funnel"]["fee_invalid"], 0)
+            self.assertEqual(state["candidates"][0]["fee_status"], "unavailable")
+            self.assertEqual(
+                state["candidates"][0]["fee_unavailable_reason"],
+                "amazon_internal_error",
+            )
+            self.assertEqual(state["candidates"][0]["fee_attempts"], 3)
+            self.assertIsNone(store.latest_incomplete())
+
+    def test_ten_fee_targets_complete_with_one_unavailable(self):
+        rows = [qogita_row(gtin=test_ean(index)) for index in range(10)]
+        failed_asin = "B000000001"
+
+        def fees(requests_, _token):
+            return [
+                fee_error_result(row["asin"], row["identifier"])
+                if row["asin"] == failed_asin
+                else fee_result(row["asin"], row["identifier"])
+                for row in requests_
+            ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.run_pipeline(
+                directory, qogita_loader=lambda: rows, fees_batch=fees,
+                catalog_batch=unique_catalog_mapping,
+            )
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["fee_target_count"], 10)
+        self.assertEqual(state["fee_valid_count"], 9)
+        self.assertEqual(state["fee_unavailable_count"], 1)
+        self.assertTrue(state["fee_coverage_partial"])
+        self.assertEqual(len(state["results"]), 9)
+        unavailable = next(
+            row for row in state["amazon_observations"]
+            if row["fee_status"] == "unavailable"
+        )
+        self.assertNotIn("fee_estimate", unavailable)
+
+    def test_hundred_fee_targets_complete_with_five_unavailable(self):
+        rows = [qogita_row(gtin=test_ean(index)) for index in range(100)]
+        failed_asins = {f"B{index:09d}" for index in range(1, 6)}
+
+        def fees(requests_, _token):
+            return [
+                fee_error_result(row["asin"], row["identifier"])
+                if row["asin"] in failed_asins
+                else fee_result(row["asin"], row["identifier"])
+                for row in requests_
+            ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.run_pipeline(
+                directory, qogita_loader=lambda: rows, fees_batch=fees,
+                catalog_batch=unique_catalog_mapping,
+            )
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["fee_target_count"], 100)
+        self.assertEqual(state["fee_valid_count"], 95)
+        self.assertEqual(state["fee_unavailable_count"], 5)
+        self.assertEqual(len(state["results"]), 95)
+
+    def test_request_level_fee_outage_pauses_whole_job(self):
+        def outage(*_):
+            raise requests.ConnectionError("offline diagnostic detail")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.run_pipeline(directory, fees_batch=outage)
             self.assertEqual(state["status"], "waiting_retry")
             self.assertEqual(state["phase"], "fees_pending")
-            self.assertEqual(state["funnel"]["fee_valid"], 0)
-            self.assertEqual(state["funnel"]["fee_pending"], 1)
-            self.assertEqual(state["funnel"]["fee_invalid"], 0)
-            self.assertEqual(state["candidates"][0]["fee_status"], "fee_pending")
-            self.assertEqual(state["candidates"][0]["fee_attempts"], 3)
-            self.assertEqual(store.latest_incomplete()["job_id"], state["job_id"])
+            self.assertTrue(state["resumable"])
+            self.assertEqual(state["fee_outage_reason"], "ConnectionError")
+            resumed = run_discovery(
+                state["filters"], checkpoint_store=DiscoveryCheckpointStore(directory),
+                catalog_batch=lambda *_: self.fail("Catalog must not repeat"),
+                pricing_batch=lambda *_: self.fail("Pricing must not repeat"),
+                fees_batch=fee_batch,
+                token_provider=RefreshingTokenProvider(lambda: "token"),
+                qogita_loader=lambda: self.fail("Supplier must not reload"),
+                job_id=state["job_id"], sleep_func=lambda *_: None,
+                pricing_batch_interval=0, fee_batch_interval=0,
+            )
+        self.assertEqual(resumed["status"], "completed")
+        self.assertEqual(resumed["fee_valid_count"], 1)
+
+    def test_high_element_failure_rate_opens_systemic_circuit(self):
+        rows = [qogita_row(gtin=test_ean(index)) for index in range(10)]
+
+        def fees(requests_, _token):
+            return [
+                fee_error_result(row["asin"], row["identifier"])
+                for row in requests_
+            ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.run_pipeline(
+                directory, qogita_loader=lambda: rows,
+                catalog_batch=unique_catalog_mapping, fees_batch=fees,
+            )
+        self.assertEqual(state["status"], "waiting_retry")
+        self.assertEqual(state["phase"], "fees_pending")
+        self.assertEqual(state["fee_outage_reason"], "ElementFailureRate")
+        self.assertTrue(all(
+            row["fee_status"] == "retryable_error"
+            for row in state["amazon_observations"]
+        ))
 
     def test_resume_retries_only_pending_fees_without_catalog_or_pricing(self):
         def persistent(requests_, _token):
@@ -1818,6 +1951,7 @@ class MultiScenarioDiscoveryTests(unittest.TestCase):
             pending = self.run_pipeline(
                 directory, checkpoint_store=store, fees_batch=persistent,
             )
+            self.assertEqual(pending["candidates"][0]["fee_status"], "unavailable")
             fee_calls = []
 
             def succeeds(requests_, _token):
@@ -2357,6 +2491,50 @@ class DiscoveryExcelTests(unittest.TestCase):
         self.assertGreater(workbook["Listing Amazon"].max_row, 1)
         self.assertGreater(workbook["Scenari"].max_row, 1)
 
+    def test_unavailable_fee_is_preserved_and_excluded_from_opportunities(self):
+        product = self._result()
+        product["product_key"] = "fee-unavailable-product"
+        product["opportunity_combinations"] = []
+        product["evaluation_status"] = "economics_unavailable"
+        product["exclusion_reason"] = "amazon_fee_unavailable"
+        product["amazon_listings"] = [{
+            "asin": "B000000001", "title": "Crema", "brand": "Brand",
+            "amazon_observation_id": "fee-unavailable-observation",
+            "compatibility_status": "compatible",
+            "beauty_status": "display_group_beauty", "bsr_beauty": 5000,
+            "catalog_status": "resolved", "pricing_status": "success",
+            "competition_status": "passed", "evaluation_status": "economics_unavailable",
+            "reference_price": Decimal("30"), "fba_sellers": 2,
+            "total_sellers": 4, "fee_status": "unavailable",
+            "fee_attempts": 3, "fee_unavailable_reason": "amazon_internal_error",
+            "exclusion_reason": "amazon_fee_unavailable",
+        }]
+        state = {
+            "job_id": "fee-partial", "status": "completed", "phase": "completed",
+            "filters": {"minimum_margin": 15}, "candidates": [product], "results": [],
+            "fee_target_count": 1, "fee_valid_count": 0,
+            "fee_unavailable_count": 1, "fee_invalid_count": 0,
+            "fee_coverage_partial": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "partial-fees.xlsx"
+            write_discovery_excel(state, path)
+            workbook = load_workbook(path, data_only=False)
+        listing_headers = {
+            cell.value: cell.column for cell in workbook["Listing Amazon"][1]
+        }
+        self.assertEqual(
+            workbook["Listing Amazon"].cell(2, listing_headers["Fee status"]).value,
+            "unavailable",
+        )
+        self.assertEqual(workbook["Opportunità"].max_row, 1)
+        metadata = {
+            row[0].value: row[1].value
+            for row in workbook["Parametri run"].iter_rows(min_row=2)
+        }
+        self.assertEqual(metadata["Fee Amazon non disponibili"], 1)
+        self.assertTrue(metadata["Copertura Fee parziale"])
+
     def test_large_multiscenario_export(self):
         template = self._result()
         products = []
@@ -2415,6 +2593,27 @@ class DiscoveryUITests(unittest.TestCase):
             0,
         )
         self.assertEqual(len(app.metric), 0)
+
+    def test_partial_fee_coverage_shows_warning(self):
+        app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
+        state = {
+            "discovery_schema_version": DISCOVERY_SCHEMA_VERSION,
+            "job_id": "partial-fees", "status": "completed", "phase": "completed",
+            "candidates": [], "results": [], "amazon_observations": [],
+            "fee_target_count": 843, "fee_valid_count": 842,
+            "fee_unavailable_count": 1, "fee_coverage_partial": True,
+            "funnel": {
+                "qogita_products": 0, "qogita_scenarios": 0,
+                "fee_target_count": 843, "fee_valid_count": 842,
+                "fee_unavailable_count": 1,
+            },
+        }
+        self._load_result(app, state)
+        self.assertFalse(app.exception)
+        self.assertTrue(any(
+            "842/843 Fee Amazon disponibili" in warning.value
+            for warning in app.warning
+        ))
 
     def test_one_product_card_and_local_scenario_detail_toggle(self):
         app = AppTest.from_file("app_glowup.py", default_timeout=20).run()

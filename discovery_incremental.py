@@ -683,7 +683,7 @@ class DiscoveryIncrementalStore:
         pending = []
         for row in rows:
             value = json.loads(row[0])
-            if value.get("fee_status") in {None, "", "fee_pending"}:
+            if value.get("fee_status") in {None, "", "fee_pending", "retryable_error"}:
                 pending.append(value)
                 if len(pending) >= limit:
                     break

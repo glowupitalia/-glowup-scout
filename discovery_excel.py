@@ -216,6 +216,15 @@ def _status_detail(product, listing, filters, final_product_keys):
             "fee_pending", "Fee in attesa", "Product Fees temporaneamente non disponibile",
             "Retry Product Fees", _detail_text(listing.get("fee_error")),
         )
+    if listing.get("fee_status") == "unavailable":
+        return (
+            "fee_unavailable", "Fee non disponibile",
+            "Amazon non ha restituito una Fee valida",
+            "Escluso dal ranking economico",
+            _detail_text(
+                listing.get("fee_unavailable_reason") or listing.get("fee_error")
+            ),
+        )
     if listing.get("fee_status") in {"invalid", "fee_invalid"}:
         return (
             "fee_invalid", "Fee non valida", "Product Fees non valida",
@@ -477,6 +486,11 @@ def _run_metadata(state, candidates, final_products):
             "Pagine Amazon con concorrenza valida",
             funnel.get("competition_passed_listings"),
         ),
+        ("Fee Amazon target", state.get("fee_target_count") or funnel.get("fee_target_count")),
+        ("Fee Amazon valide", state.get("fee_valid_count") or funnel.get("fee_valid_count")),
+        ("Fee Amazon non disponibili", state.get("fee_unavailable_count") or funnel.get("fee_unavailable_count")),
+        ("Fee Amazon non valide", state.get("fee_invalid_count") or funnel.get("fee_invalid_count")),
+        ("Copertura Fee parziale", bool(state.get("fee_coverage_partial") or funnel.get("fee_coverage_partial"))),
         ("Opportunità finali", len(final_products)),
     ]
 

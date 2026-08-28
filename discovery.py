@@ -6,6 +6,7 @@ import json
 import inspect
 import logging
 import os
+import random
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -57,6 +58,8 @@ logger = logging.getLogger(__name__)
 MAX_BATCH_SIZE = 20
 FEE_ELEMENT_MAX_RETRIES = 2
 FEE_ELEMENT_BACKOFF_SECONDS = 2
+FEE_SYSTEMIC_MIN_FAILED_ITEMS = 10
+FEE_SYSTEMIC_FAILURE_RATIO = Decimal("0.80")
 TRANSIENT_FEE_STATUSES = {"servererror"}
 TRANSIENT_FEE_CODES = {
     "internalerror", "serviceunavailable", "requestthrottled",
@@ -69,6 +72,15 @@ LEGACY_CHECKPOINT_MESSAGE = (
     "Questo risultato è stato creato con una versione precedente della "
     "Discovery. Avvia una nuova ricerca per utilizzare l'analisi multi-scenario."
 )
+
+
+class FeeSystemicOutage(RuntimeError):
+    """A request-level Product Fees outage that must pause the whole job."""
+
+    def __init__(self, reason, *, status_code=None):
+        super().__init__(_sanitized_fee_text(reason))
+        self.reason = _sanitized_fee_text(reason)
+        self.status_code = status_code
 
 
 def _chunks(values, size=MAX_BATCH_SIZE):
@@ -249,11 +261,26 @@ def _fees_batch_with_retry(
                 job_id, attempt, status, delay,
             )
             sleep_func(delay)
-    raise last_error or RuntimeError("Product Fees batch failed")
+    status_code = None
+    if isinstance(last_error, requests.HTTPError) and last_error.response is not None:
+        status_code = last_error.response.status_code
+    cause = type(last_error).__name__ if last_error else "ProductFeesBatchFailure"
+    raise FeeSystemicOutage(cause, status_code=status_code) from last_error
 
 
 def _sanitized_fee_text(value):
     return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())[:300]
+
+
+def _fee_unavailable_reason(diagnostics):
+    code = str(diagnostics.get("error_code") or "").casefold()
+    if code == "internalerror":
+        return "amazon_internal_error"
+    if code in {"requestthrottled", "throttling", "toomanyrequests"}:
+        return "amazon_throttled"
+    if code == "serviceunavailable":
+        return "amazon_service_unavailable"
+    return "amazon_transient_error"
 
 
 def classify_product_fee_entry(entry):
@@ -328,7 +355,7 @@ def _fee_element_retry_delay(entries, retry_number):
         rate_limit = 0
     if rate_limit > 0:
         delay = max(delay, 1.0 / rate_limit)
-    return delay
+    return delay + random.uniform(0, max(0.1, delay * 0.10))
 
 
 def _log_fee_element(job_id, row, diagnostics, *, attempt, retry, backoff, outcome):
@@ -428,11 +455,13 @@ def _process_fee_batch(
             diagnostics = classify_product_fee_entry(entry)
             total_attempt = int(row.get("fee_attempts") or 0) + 1
             row["fee_attempts"] = total_attempt
+            row["fee_last_attempt_at"] = _now()
             row["fee_phase"] = "product_fees"
             if diagnostics["classification"] == "success":
                 for key in (
                     "fee_error", "fee_error_status", "fee_error_code",
-                    "fee_error_type", "fee_pending_at",
+                    "fee_error_type", "fee_pending_at", "fee_unavailable_reason",
+                    "fee_retry_count", "fee_retryable_reason",
                 ):
                     row.pop(key, None)
                 try:
@@ -460,13 +489,16 @@ def _process_fee_batch(
                 "fee_error_type": diagnostics["error_type"],
             })
             if diagnostics["classification"] == "transient":
-                row["fee_status"] = "fee_pending"
+                row["fee_status"] = "retryable_error"
                 row["fee_pending_at"] = _now()
                 if cycle_attempt <= max_retries:
                     retry_rows.append((row, request))
                     transient_diagnostics.append((row, diagnostics, total_attempt))
                     continue
-                outcome = "fee_pending"
+                row["fee_status"] = "unavailable"
+                row["fee_unavailable_reason"] = _fee_unavailable_reason(diagnostics)
+                row["fee_retry_count"] = max(0, total_attempt - 1)
+                outcome = "unavailable"
             else:
                 row["fee_status"] = "invalid"
                 outcome = "invalid"
@@ -475,6 +507,21 @@ def _process_fee_batch(
                 retry=False, backoff=0, outcome=outcome,
             )
 
+        unavailable_rows = [
+            row for row, _ in pending if row.get("fee_status") == "unavailable"
+        ]
+        if (
+            len(unavailable_rows) >= FEE_SYSTEMIC_MIN_FAILED_ITEMS
+            and Decimal(len(unavailable_rows)) / Decimal(len(pending))
+            >= FEE_SYSTEMIC_FAILURE_RATIO
+        ):
+            for row in unavailable_rows:
+                row["fee_status"] = "retryable_error"
+                row["fee_retryable_reason"] = row.pop(
+                    "fee_unavailable_reason", "amazon_transient_error"
+                )
+            save_progress()
+            raise FeeSystemicOutage("ElementFailureRate")
         save_progress()
         if not retry_rows:
             return
@@ -491,7 +538,12 @@ def _process_fee_batch(
 
 
 def _legacy_transient_fee_row(row):
-    if row.get("fee_status") == "fee_pending":
+    if row.get("fee_status") in {"fee_pending", "retryable_error"}:
+        return True
+    if (
+        row.get("fee_status") == "unavailable"
+        and row.get("fee_unavailable_reason") == "amazon_internal_error"
+    ):
         return True
     if row.get("fee_status") != "invalid":
         return False
@@ -515,7 +567,10 @@ def _legacy_transient_fee_row(row):
 def _prepare_fee_resume(state):
     fee_rows = state.get("amazon_observations") or state.get("candidates") or []
     if state.get("phase") == "fees_pending":
-        rows = [row for row in fee_rows if row.get("fee_status") == "fee_pending"]
+        rows = [
+            row for row in fee_rows
+            if row.get("fee_status") in {None, "", "fee_pending", "retryable_error"}
+        ]
     elif state.get("phase") == "completed":
         rows = [row for row in fee_rows if _legacy_transient_fee_row(row)]
         legacy_rows = [
@@ -542,6 +597,32 @@ def _prepare_fee_resume(state):
     state["phase"] = "competition_filtered"
     state["results"] = []
     return True
+
+
+def fee_coverage(rows):
+    """Return mutually exclusive Product Fees coverage counters."""
+    values = list(rows or [])
+    counts = {
+        "fee_target_count": len(values),
+        "fee_valid_count": 0,
+        "fee_unavailable_count": 0,
+        "fee_invalid_count": 0,
+        "fee_pending_count": 0,
+    }
+    for row in values:
+        status = row.get("fee_status")
+        if status == "valid":
+            counts["fee_valid_count"] += 1
+        elif status == "unavailable":
+            counts["fee_unavailable_count"] += 1
+        elif status in {"invalid", "fee_invalid"}:
+            counts["fee_invalid_count"] += 1
+        else:
+            counts["fee_pending_count"] += 1
+    counts["fee_coverage_partial"] = bool(
+        counts["fee_unavailable_count"] or counts["fee_invalid_count"]
+    )
+    return counts
 
 
 def _unique(values, key):
@@ -620,7 +701,7 @@ def discovery_funnel_view(state):
     product_keys = (
         "supplier_products_total", "qogita_products", "amazon_found",
         "beauty_valid", "bsr_passed", "competition_passed", "fee_valid",
-        "final_opportunities", "final_products",
+        "fee_unavailable", "final_opportunities", "final_products",
     )
     scenario_keys = (
         "supplier_scenarios_total", "qogita_scenarios", "scenarios_evaluated",
@@ -629,7 +710,7 @@ def discovery_funnel_view(state):
     listing_keys = (
         "amazon_listings_found", "compatible_listings", "beauty_listings",
         "bsr_passed_listings", "competition_passed_listings",
-        "fee_valid_listings", "excluded_listings",
+        "fee_valid_listings", "fee_unavailable_count", "excluded_listings",
     )
     combination_keys = (
         "combinations_evaluated", "combinations_margin_passed",
@@ -1292,7 +1373,16 @@ def _evaluate_product_combinations(product, observation_by_id, minimum_margin):
     }
     for listing in product.get("amazon_listings") or []:
         observation = observation_by_id.get(listing.get("amazon_observation_id"))
-        if not observation or observation.get("fee_status") != "valid":
+        if not observation:
+            continue
+        if observation.get("fee_status") == "unavailable":
+            listing["evaluation_status"] = "economics_unavailable"
+            listing["exclusion_reason"] = "amazon_fee_unavailable"
+            listing["fee_unavailable_reason"] = observation.get(
+                "fee_unavailable_reason"
+            ) or "amazon_internal_error"
+            continue
+        if observation.get("fee_status") != "valid":
             continue
         shared_bsr = bsr_points(observation.get("bsr_beauty"))
         shared_fba = fba_seller_points(
@@ -1370,6 +1460,12 @@ def _evaluate_product_combinations(product, observation_by_id, minimum_margin):
             product["exclusion_reason"] = ",".join(reasons)
         else:
             product["evaluation_status"] = "economics_unavailable"
+            if any(
+                row.get("fee_status") == "unavailable"
+                for row in product.get("amazon_listings") or []
+            ):
+                product["exclusion_reason"] = "amazon_fee_unavailable"
+                product["exclusion_reasons"] = ["amazon_fee_unavailable"]
         product["combination_roles"] = {
             "recommended_combination": None, "best_listing": None,
             "best_purchase_scenario": None,
@@ -2067,23 +2163,28 @@ def run_discovery(
         if state["phase"] == "competition_filtered":
             pending = [
                 row for row in state.get("amazon_observations") or []
-                if row.get("fee_status") in {None, "", "fee_pending"}
+                if row.get("fee_status") in {None, "", "fee_pending", "retryable_error"}
             ]
             fees_total = len(pending)
             fees_completed = 0
             batches = list(_chunks(pending))
+            fee_systemic_outage = None
             for batch_number, batch in enumerate(batches, start=1):
                 requests_ = [{
                     "asin": row["asin"],
                     "price": float(row["reference_price"]),
                     "identifier": f"discovery|{job_id}|{row['observation_id']}|{row['asin']}",
                 } for row in batch]
-                _process_fee_batch(
-                    batch, requests_, fees_batch=fees_batch,
-                    token_provider=token_provider, job_id=job_id,
-                    sleep_func=sleep_func,
-                    save_progress=lambda: checkpoint_store.save(state),
-                )
+                try:
+                    _process_fee_batch(
+                        batch, requests_, fees_batch=fees_batch,
+                        token_provider=token_provider, job_id=job_id,
+                        sleep_func=sleep_func,
+                        save_progress=lambda: checkpoint_store.save(state),
+                    )
+                except FeeSystemicOutage as exc:
+                    fee_systemic_outage = exc
+                    break
                 fees_completed += len(batch)
                 state.update({
                     "progress_phase": "fees",
@@ -2096,6 +2197,13 @@ def run_discovery(
                 logger.info("DISCOVERY FEES BATCH | job_id=%s batch=%s size=%s", job_id, batch_number, len(batch))
                 if batch_number < len(batches) and fee_batch_interval:
                     sleep_func(fee_batch_interval)
+            if fee_systemic_outage is not None:
+                state["status"] = "waiting_retry"
+                state["resumable"] = True
+                state["fee_outage_reason"] = fee_systemic_outage.reason
+                state["duration_seconds"] = time.monotonic() - started
+                _checkpoint(checkpoint_store, state, "fees_pending", progress=progress)
+                return state
             for observation in state.get("amazon_observations") or []:
                 if observation.get("fee_status") == "valid":
                     _sync_observation_fee_fields(observation)
@@ -2110,7 +2218,8 @@ def run_discovery(
                     for key in (
                         "fee_status", "fee_estimate", "fee_attempts", "fee_error",
                         "fee_error_status", "fee_error_code", "fee_error_type",
-                        "fee_pending_at", "fee_phase",
+                        "fee_pending_at", "fee_phase", "fee_unavailable_reason",
+                        "fee_retry_count", "fee_last_attempt_at",
                     ):
                         if key in observation:
                             listing[key] = observation[key]
@@ -2118,7 +2227,8 @@ def run_discovery(
                         for key in (
                             "fee_status", "fee_estimate", "fee_attempts", "fee_error",
                             "fee_error_status", "fee_error_code", "fee_error_type",
-                            "fee_pending_at", "fee_phase",
+                            "fee_pending_at", "fee_phase", "fee_unavailable_reason",
+                            "fee_retry_count", "fee_last_attempt_at",
                         ):
                             if key in observation:
                                 product[key] = observation[key]
@@ -2139,7 +2249,14 @@ def run_discovery(
                 row.get("fee_status") == "valid"
                 for row in state.get("amazon_observations") or []
             )
-            state["funnel"]["fee_pending"] = product_count_for_fee_status("fee_pending")
+            coverage = fee_coverage(state.get("amazon_observations") or [])
+            state.update(coverage)
+            state["funnel"].update(coverage)
+            state["funnel"]["fee_pending"] = (
+                product_count_for_fee_status("fee_pending")
+                + product_count_for_fee_status("retryable_error")
+            )
+            state["funnel"]["fee_unavailable"] = product_count_for_fee_status("unavailable")
             state["funnel"]["fee_invalid"] = product_count_for_fee_status("invalid")
             if state["funnel"]["fee_pending"]:
                 _evaluate_available_combinations(state, filters)
@@ -2209,6 +2326,7 @@ def run_discovery(
                     "competition_filtered",
                 }
                 or row.get("fee_status") == "invalid"
+                or row.get("fee_status") == "unavailable"
                 for product in state["candidates"]
                 for row in product.get("amazon_listings") or []
             )

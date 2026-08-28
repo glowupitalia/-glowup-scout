@@ -566,7 +566,7 @@ def _summary_rows(state: dict[str, Any]) -> list[tuple[str, object]]:
         or funnel.get("unique_supplier_eans")
         or len(state.get("candidates") or [])
     )
-    return [
+    rows = [
         ("Job ID", state.get("job_id") or "—"),
         ("Completata", _rome_timestamp(state.get("completed_at") or state.get("updated_at"))),
         ("Durata", _duration(state)),
@@ -582,6 +582,17 @@ def _summary_rows(state: dict[str, Any]) -> list[tuple[str, object]]:
         ("Combinazioni valutate", int(funnel.get("combinations_evaluated") or 0)),
         ("Opportunità finali", len(state.get("results") or [])),
     ]
+    target = int(state.get("fee_target_count") or funnel.get("fee_target_count") or 0)
+    unavailable = int(
+        state.get("fee_unavailable_count") or funnel.get("fee_unavailable_count") or 0
+    )
+    if target:
+        valid = int(state.get("fee_valid_count") or funnel.get("fee_valid_count") or 0)
+        rows.extend([
+            ("Copertura Fee Amazon", f"{valid}/{target}"),
+            ("Fee Amazon non disponibili", unavailable),
+        ])
+    return rows
 
 
 def _best_opportunity(state: dict[str, Any]):
@@ -665,6 +676,16 @@ def render_discovery_notification(state: dict[str, Any], event_type: str | None 
     else:
         raise ValueError("Discovery state is not terminal or notification type is unsupported")
 
+    unavailable = int(
+        state.get("fee_unavailable_count")
+        or (state.get("funnel") or {}).get("fee_unavailable_count")
+        or 0
+    )
+    if unavailable and event_type in {DISCOVERY_COMPLETED, DISCOVERY_COMPLETED_ZERO_RESULTS}:
+        closing = (
+            f"Attenzione: {unavailable} Fee Amazon non disponibili sono state "
+            "escluse dal ranking economico. " + closing
+        )
     text_rows = "\n".join(f"{label}: {value}" for label, value in rows)
     best_text = ""
     if best:

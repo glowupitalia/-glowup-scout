@@ -455,7 +455,7 @@ class MultiListingPipelineTests(unittest.TestCase):
         self.assertEqual(calls["pricing"], [["B0DL92QM79"]])
         self.assertEqual(len(state["results"][0]["opportunity_combinations"]), 3)
 
-    def test_fee_pending_listing_is_resumed_without_repeating_success(self):
+    def test_fee_unavailable_listing_can_be_retried_without_repeating_success(self):
         def partial(requests_):
             return [
                 (
@@ -469,7 +469,12 @@ class MultiListingPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = DiscoveryCheckpointStore(directory)
             state, calls = self.run_pipeline(directory, fees_override=partial)
-            self.assertEqual(state["status"], "waiting_retry")
+            self.assertEqual(state["status"], "completed")
+            unavailable = next(
+                row for row in state["amazon_observations"]
+                if row["asin"] == "B0DL92QM79"
+            )
+            self.assertEqual(unavailable["fee_status"], "unavailable")
             self.assertEqual(len(state["results"]), 1)
             self.assertEqual(
                 {row["asin"] for row in state["results"][0]["opportunity_combinations"]},

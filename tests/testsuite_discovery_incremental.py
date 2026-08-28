@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+import requests
 from pathlib import Path
 
 from discovery_incremental import (
@@ -18,6 +19,57 @@ from discovery_resources import (
     ResourceSnapshot,
 )
 from discovery_incremental_runner import run_incremental_discovery
+
+
+def catalog_success(identifiers, *_):
+    return {
+        value: {
+            "status": "resolved", "asin": f"B{index:09d}",
+            "amazon_title": f"Amazon {value}", "amazon_brand": "Brand",
+            "bsr_beauty": 5000, "beauty_status": "display_group_beauty",
+            "product_type": "BEAUTY",
+        }
+        for index, value in enumerate(identifiers, start=1)
+    }
+
+
+def pricing_success(asins, *_):
+    return {
+        asin: {
+            "status": "success", "Venditori FBA": 1, "Venditori totali": 2,
+            "reference_price": 30, "price_source": "buy_box",
+        }
+        for asin in asins
+    }
+
+
+def fee_success(asin, identifier):
+    return {"FeesEstimateResult": {
+        "Status": "Success",
+        "FeesEstimateIdentifier": {
+            "IdValue": asin, "SellerInputIdentifier": identifier,
+            "PriceToEstimateFees": {
+                "ListingPrice": {"Amount": 30, "CurrencyCode": "EUR"}
+            },
+        },
+        "FeesEstimate": {"FeeDetailList": [
+            {"FeeType": "ReferralFee", "FinalFee": {"Amount": 4.5}},
+            {"FeeType": "FBAFees", "FinalFee": {"Amount": 4}},
+        ]},
+    }}
+
+
+def fee_internal_error(asin, identifier):
+    return {"FeesEstimateResult": {
+        "Status": "ServerError",
+        "FeesEstimateIdentifier": {
+            "IdValue": asin, "SellerInputIdentifier": identifier,
+        },
+        "Error": {
+            "Code": "InternalError", "Type": "Receiver",
+            "Message": "There is an internal service failure.",
+        },
+    }}
 
 
 def candidate(index, status=None, listings=0):
@@ -176,6 +228,95 @@ class IncrementalStoreTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(self.store.summary("job")["catalog_pending_count"], 0)
+
+    def test_http_200_element_failure_isolated_and_job_completes(self):
+        filters = {
+            "bsr_min": 1, "bsr_max": 30_000,
+            "max_fba_sellers": 15, "max_total_sellers": 25,
+            "minimum_margin": 10,
+        }
+        self.store.create_job(
+            {"job_id": "job", "filters": filters, "phase": "suppliers_loaded"},
+            [candidate(index) for index in range(1, 21)],
+        )
+
+        def fees(requests_, _token):
+            return [
+                fee_internal_error(row["asin"], row["identifier"])
+                if row["asin"] == "B000000001"
+                else fee_success(row["asin"], row["identifier"])
+                for row in requests_
+            ]
+
+        class Token:
+            def get(self):
+                return "token"
+
+        result = run_incremental_discovery(
+            "job", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=catalog_success, pricing_batch=pricing_success,
+            fees_batch=fees, token_provider=Token(), sleep_func=lambda *_: None,
+            catalog_batch_interval=0, pricing_batch_interval=0,
+            fee_batch_interval=0,
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["fee_target_count"], 20)
+        self.assertEqual(result["fee_valid_count"], 19)
+        self.assertEqual(result["fee_unavailable_count"], 1)
+        self.assertEqual(
+            result["fee_completion_status"],
+            "fees_complete_with_partial_failures",
+        )
+        unavailable = [
+            row for row in self.store.iter_candidates("job")
+            for row in row.get("amazon_listings") or []
+            if row.get("fee_status") == "unavailable"
+        ]
+        self.assertEqual(len(unavailable), 1)
+        self.assertEqual(unavailable[0]["exclusion_reason"], "amazon_fee_unavailable")
+
+    def test_request_level_fee_connection_outage_waits_for_retry(self):
+        filters = {
+            "bsr_min": 1, "bsr_max": 30_000,
+            "max_fba_sellers": 15, "max_total_sellers": 25,
+            "minimum_margin": 10,
+        }
+        self.store.create_job(
+            {"job_id": "job", "filters": filters, "phase": "suppliers_loaded"},
+            [candidate(1)],
+        )
+
+        class Token:
+            def get(self):
+                return "token"
+
+        result = run_incremental_discovery(
+            "job", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=catalog_success, pricing_batch=pricing_success,
+            fees_batch=lambda *_: (_ for _ in ()).throw(
+                requests.ConnectionError("offline detail")
+            ),
+            token_provider=Token(), sleep_func=lambda *_: None,
+            catalog_batch_interval=0, pricing_batch_interval=0,
+            fee_batch_interval=0,
+        )
+        self.assertEqual(result["status"], "waiting_retry")
+        self.assertEqual(result["progress_phase"], "fees_pending")
+        self.assertTrue(result["resumable"])
+        self.assertEqual(result["fee_outage_reason"], "ConnectionError")
+        resumed = run_incremental_discovery(
+            "job", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=lambda *_: self.fail("Catalog must not repeat"),
+            pricing_batch=lambda *_: self.fail("Pricing must not repeat"),
+            fees_batch=lambda requests_, _token: [
+                fee_success(row["asin"], row["identifier"]) for row in requests_
+            ],
+            token_provider=Token(), sleep_func=lambda *_: None,
+            catalog_batch_interval=0, pricing_batch_interval=0,
+            fee_batch_interval=0,
+        )
+        self.assertEqual(resumed["status"], "completed")
+        self.assertEqual(resumed["fee_valid_count"], 1)
 
     def test_incremental_runner_commits_each_catalog_batch_to_rotation(self):
         filters = {

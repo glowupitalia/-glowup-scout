@@ -269,6 +269,18 @@ class NotificationTests(unittest.TestCase):
         self.assertIn("senza opportunità", content.subject)
         self.assertIn("Opportunità finali: 0", content.text)
 
+    def test_completed_partial_fee_coverage_warns_without_becoming_failure(self):
+        state = completed_state()
+        state.update({
+            "fee_target_count": 843, "fee_valid_count": 842,
+            "fee_unavailable_count": 1, "fee_coverage_partial": True,
+        })
+        content = render_discovery_notification(state)
+        self.assertEqual(content.event_type, DISCOVERY_COMPLETED)
+        self.assertIn("Copertura Fee Amazon: 842/843", content.text)
+        self.assertIn("1 Fee Amazon non disponibili", content.text)
+        self.assertIn("escluse dal ranking economico", content.text)
+
     def test_terminal_failed_sends_but_retryable_failure_does_not(self):
         state = completed_state(False)
         state.update({"status": "failed", "phase": "catalog", "errors": [{"message": "boom"}]})
