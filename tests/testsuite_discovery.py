@@ -598,6 +598,51 @@ class AmazonDiscoveryTests(unittest.TestCase):
         self.assertFalse(result.batch_diagnostics[0]["complete"])
         self.assertEqual(result.batch_diagnostics[0]["page_count"], 1)
 
+    def test_lwa_connection_error_is_retried_inside_request_boundary(self):
+        import requests
+
+        token_attempts = []
+        sleeps = []
+
+        def token():
+            token_attempts.append(len(token_attempts) + 1)
+            if len(token_attempts) < 3:
+                raise requests.ConnectionError("diagnostic detail must not be logged")
+            return "token"
+
+        response = _request_with_retry(
+            "GET", "https://example.invalid",
+            token_provider=RefreshingTokenProvider(token),
+            request_func=lambda *_args, **_kwargs: FakeResponse({}),
+            sleep_func=sleeps.append,
+            random_func=lambda: 0,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(token_attempts, [1, 2, 3])
+        self.assertEqual(sleeps, [2, 4])
+
+    def test_catalog_connection_outage_opens_circuit_for_remaining_types(self):
+        import requests
+
+        calls = []
+
+        def request(*_args, **_kwargs):
+            calls.append(True)
+            raise requests.ConnectionError("offline")
+
+        ean = "8809532221523"
+        upc = "012345678905"
+        result = search_catalog_by_gtins_batch(
+            [ean, upc], RefreshingTokenProvider(lambda: "token"),
+            marketplace_id="IT", request_func=request,
+            sleep_func=lambda _: None,
+        )
+        mapping = correlate_catalog_items([ean, upc], result)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(mapping[ean]["status"], "catalog_incomplete")
+        self.assertEqual(mapping[upc]["status"], "catalog_incomplete")
+        self.assertEqual(result.batch_diagnostics[1]["error"], "circuit_open")
+
     def test_no_next_token_is_one_page_and_not_found_is_final(self):
         ean = "8809532221523"
         result = search_catalog_by_gtins_batch(

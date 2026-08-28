@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 import time
 import urllib.parse
@@ -77,14 +78,18 @@ def _request_with_retry(
     sleep_func=time.sleep,
     job_id="",
     phase="",
+    random_func=random.random,
     **kwargs,
 ):
     last_error = None
     base_headers = dict(kwargs.pop("headers", {}) or {})
     for attempt in range(1, max_attempts + 1):
-        headers = dict(base_headers)
-        headers["x-amz-access-token"] = token_provider.get()
         try:
+            headers = dict(base_headers)
+            # Token acquisition is part of the logical Amazon request. Keeping
+            # it inside the retry boundary prevents a transient LWA outage from
+            # being misclassified as an immediate Catalog result.
+            headers["x-amz-access-token"] = token_provider.get()
             response = request_func(method, url, headers=headers, **kwargs)
         except requests.RequestException as exc:
             last_error = exc
@@ -107,12 +112,30 @@ def _request_with_retry(
             last_error = AmazonBatchError(f"Amazon temporary status {status}")
         if attempt < max_attempts:
             delay = backoff_seconds * (2 ** (attempt - 1))
+            delay += min(1.0, delay * 0.1) * random_func()
             logger.warning(
-                "DISCOVERY AMAZON RETRY | job_id=%s phase=%s attempt=%s status=%s delay=%s",
-                job_id, phase, attempt, status, delay,
+                "DISCOVERY AMAZON RETRY | job_id=%s phase=%s attempt=%s "
+                "status=%s error=%s cause=%s delay=%.3f",
+                job_id, phase, attempt, status,
+                type(last_error).__name__ if last_error else "none",
+                _request_exception_cause(last_error), delay,
             )
             sleep_func(delay)
     raise last_error or AmazonBatchError("Amazon request failed")
+
+
+def _request_exception_cause(error):
+    """Return only exception class names, never URLs, payloads or credentials."""
+    if error is None:
+        return "none"
+    names = []
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen and len(names) < 5:
+        seen.add(id(current))
+        names.append(type(current).__name__)
+        current = current.__cause__ or current.__context__
+    return ">".join(names)
 
 
 def classify_catalog_identifier(value):
@@ -235,8 +258,9 @@ def search_catalog_by_gtins_batch(
                 incomplete_identifiers.extend(identifiers)
                 logger.error(
                     "DISCOVERY CATALOG INCOMPLETE | job_id=%s batch=%s "
-                    "page=%s identifier_type=%s error=%s",
+                    "page=%s identifier_type=%s error=%s cause=%s",
                     job_id, batch_number, page_count + 1, identifier_type, error,
+                    _request_exception_cause(exc),
                 )
                 break
             payload = response.json()
@@ -262,6 +286,23 @@ def search_catalog_by_gtins_batch(
             "complete": complete,
             "error": error,
         })
+        if not complete:
+            # This logical lookup has demonstrated an outage. Do not continue
+            # with another identifier-type request; keep every unattempted
+            # identifier explicitly retryable instead.
+            for skipped_type, skipped_identifiers in batches[batch_number:]:
+                incomplete_identifiers.extend(skipped_identifiers)
+                batch_diagnostics.append({
+                    "identifier_type": skipped_type,
+                    "page_count": 0,
+                    "number_of_results": None,
+                    "had_next_token": False,
+                    "items_received": 0,
+                    "input_identifier_count": len(skipped_identifiers),
+                    "complete": False,
+                    "error": "circuit_open",
+                })
+            break
         if batch_number < len(batches):
             sleep_func(CATALOG_BATCH_INTERVAL_SECONDS)
     unique_items = {}

@@ -177,6 +177,170 @@ class IncrementalStoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(self.store.summary("job")["catalog_pending_count"], 0)
 
+    def test_incremental_runner_commits_each_catalog_batch_to_rotation(self):
+        filters = {
+            "bsr_min": 1, "bsr_max": 30_000,
+            "max_fba_sellers": 15, "max_total_sellers": 25,
+            "minimum_margin": 10,
+        }
+        self.store.create_job(
+            {
+                "job_id": "job", "filters": filters, "phase": "suppliers_loaded",
+                "rotation_scope": "supplier-scope-test",
+            },
+            [candidate(1), candidate(2)],
+        )
+
+        class Rotation:
+            def __init__(self):
+                self.commits = []
+
+            def commit_catalog_results(self, job_id, statuses):
+                self.commits.append((job_id, dict(statuses)))
+                return {}
+
+        rotation = Rotation()
+
+        run_incremental_discovery(
+            "job", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=lambda identifiers, *_: {
+                value: {"status": "not_found"} for value in identifiers
+            },
+            pricing_batch=lambda *_: self.fail("Pricing must not be called"),
+            fees_batch=lambda *_: self.fail("Fees must not be called"),
+            token_provider=object(), rotation_store=rotation,
+            sleep_func=lambda *_: None,
+            resource_governor=DiscoveryResourceGovernor(
+                policy=ResourcePolicy(
+                    rss_soft_bytes=10**15, rss_hard_bytes=10**16,
+                    available_soft_bytes=0, available_hard_bytes=0,
+                    disk_free_hard_bytes=0, wal_soft_bytes=10**15,
+                    wal_hard_bytes=10**16,
+                    write_rate_soft_bytes_per_second=10**15,
+                    write_rate_hard_bytes_per_second=10**16,
+                ),
+                database_path=self.store.path, sleep_func=lambda *_: None,
+            ),
+        )
+
+        self.assertEqual(len(rotation.commits), 1)
+        self.assertEqual(rotation.commits[0][0], "job")
+        self.assertEqual(set(rotation.commits[0][1].values()), {"not_found"})
+
+    def test_incremental_resume_reconciles_rotation_before_new_catalog_work(self):
+        filters = {
+            "bsr_min": 1, "bsr_max": 30_000,
+            "max_fba_sellers": 15, "max_total_sellers": 25,
+            "minimum_margin": 10,
+        }
+        self.store.create_job(
+            {
+                "job_id": "job", "filters": filters, "phase": "suppliers_loaded",
+                "rotation_scope": "supplier-scope-test",
+            },
+            [candidate(1), candidate(2)],
+        )
+        committed = self.store.pending_catalog_batch("job", 1)
+        committed[0]["catalog_status"] = "not_found"
+        self.store.commit_catalog_batch("job", committed, batch_number=1)
+
+        class Rotation:
+            def __init__(self):
+                self.commits = []
+
+            def commit_catalog_results(self, job_id, statuses):
+                self.commits.append(dict(statuses))
+                return {}
+
+        rotation = Rotation()
+        calls = []
+        run_incremental_discovery(
+            "job", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=lambda identifiers, *_: (
+                calls.extend(identifiers)
+                or {value: {"status": "not_found"} for value in identifiers}
+            ),
+            pricing_batch=lambda *_: self.fail("Pricing must not be called"),
+            fees_batch=lambda *_: self.fail("Fees must not be called"),
+            token_provider=object(), rotation_store=rotation,
+            sleep_func=lambda *_: None,
+            resource_governor=DiscoveryResourceGovernor(
+                policy=ResourcePolicy(
+                    rss_soft_bytes=10**15, rss_hard_bytes=10**16,
+                    available_soft_bytes=0, available_hard_bytes=0,
+                    disk_free_hard_bytes=0, wal_soft_bytes=10**15,
+                    wal_hard_bytes=10**16,
+                    write_rate_soft_bytes_per_second=10**15,
+                    write_rate_hard_bytes_per_second=10**16,
+                ),
+                database_path=self.store.path, sleep_func=lambda *_: None,
+            ),
+        )
+
+        self.assertEqual(calls, [candidate(2)["gtin"]])
+        self.assertEqual(rotation.commits[0], {candidate(1)["gtin"]: "not_found"})
+        self.assertEqual(rotation.commits[1], {candidate(2)["gtin"]: "not_found"})
+
+    def test_catalog_incomplete_stops_and_is_retried_once_on_resume(self):
+        filters = {
+            "bsr_min": 1, "bsr_max": 30_000,
+            "max_fba_sellers": 15, "max_total_sellers": 25,
+            "minimum_margin": 10,
+        }
+        self.store.create_job(
+            {"job_id": "job", "filters": filters, "phase": "suppliers_loaded"},
+            [candidate(1), candidate(2)],
+        )
+        calls = []
+
+        def incomplete(identifiers, *_):
+            calls.append(list(identifiers))
+            return {value: {"status": "catalog_incomplete"} for value in identifiers}
+
+        first = run_incremental_discovery(
+            "job", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=incomplete,
+            pricing_batch=lambda *_: self.fail("Pricing must not be called"),
+            fees_batch=lambda *_: self.fail("Fees must not be called"),
+            token_provider=object(), sleep_func=lambda *_: None,
+            resource_governor=DiscoveryResourceGovernor(
+                policy=ResourcePolicy(
+                    rss_soft_bytes=10**15, rss_hard_bytes=10**16,
+                    available_soft_bytes=0, available_hard_bytes=0,
+                    disk_free_hard_bytes=0, wal_soft_bytes=10**15,
+                    wal_hard_bytes=10**16,
+                    write_rate_soft_bytes_per_second=10**15,
+                    write_rate_hard_bytes_per_second=10**16,
+                ),
+                database_path=self.store.path, sleep_func=lambda *_: None,
+            ),
+        )
+        self.assertEqual(first["status"], "waiting_retry")
+        self.assertEqual(len(calls), 1)
+
+        second = run_incremental_discovery(
+            "job", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=lambda identifiers, *_: {
+                value: {"status": "not_found"} for value in identifiers
+            },
+            pricing_batch=lambda *_: self.fail("Pricing must not be called"),
+            fees_batch=lambda *_: self.fail("Fees must not be called"),
+            token_provider=object(), sleep_func=lambda *_: None,
+            resource_governor=DiscoveryResourceGovernor(
+                policy=ResourcePolicy(
+                    rss_soft_bytes=10**15, rss_hard_bytes=10**16,
+                    available_soft_bytes=0, available_hard_bytes=0,
+                    disk_free_hard_bytes=0, wal_soft_bytes=10**15,
+                    wal_hard_bytes=10**16,
+                    write_rate_soft_bytes_per_second=10**15,
+                    write_rate_hard_bytes_per_second=10**16,
+                ),
+                database_path=self.store.path, sleep_func=lambda *_: None,
+            ),
+        )
+        self.assertEqual(second["status"], "completed")
+        self.assertEqual(self.store.summary("job")["catalog_pending_count"], 0)
+
     def test_supplier_first_preparation_freezes_only_selected_payloads(self):
         class SupplierStore:
             def serving_generation_metadata(self, supplier):

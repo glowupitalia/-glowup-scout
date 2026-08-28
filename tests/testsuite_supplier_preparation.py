@@ -316,6 +316,62 @@ class SupplierPreparationTests(unittest.TestCase):
 
 
 class DiscoveryUiConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.catalog_path = root / "catalog.sqlite3"
+        self.rotation_path = root / "rotation.sqlite3"
+        self.environment = patch.dict(
+            os.environ,
+            {"DISCOVERY_ROTATION_DATABASE": str(self.rotation_path)},
+        )
+        self.environment.start()
+        original_init = SupplierCatalogStore.__init__
+
+        def isolated_catalog_init(instance, path=None):
+            original_init(instance, path or self.catalog_path)
+
+        self.catalog_init = patch.object(
+            SupplierCatalogStore, "__init__", isolated_catalog_init,
+        )
+        self.catalog_init.start()
+        store = SupplierCatalogStore()
+        for index, supplier in enumerate(("umma", "abw", "qudo"), start=1):
+            products, scenarios = candidates_to_cache_records([
+                candidate(supplier, valid_ean(index))
+            ])
+            generation = SupplierCatalogGeneration(
+                supplier=supplier,
+                coverage_type="full_relevant_catalog",
+                coverage_description="isolated UI fixture",
+                coverage_complete=True,
+                products=products,
+                scenarios=scenarios,
+                source_count=1,
+                enumerated_count=1,
+                unique_count=1,
+                completeness_status="full_relevant_catalog",
+                product_catalog_coverage_type="full_relevant_catalog",
+                product_catalog_coverage_complete=True,
+                scenario_enrichment_status="full",
+                scenario_enrichment_count=1,
+            )
+            run_id = store.start_run(
+                supplier,
+                coverage_type=generation.coverage_type,
+                coverage_description=generation.coverage_description,
+                coverage_complete=True,
+                sampled=False,
+            )
+            store.publish(run_id, generation, elapsed_seconds=0)
+        st.cache_data.clear()
+
+    def tearDown(self):
+        st.cache_data.clear()
+        self.catalog_init.stop()
+        self.environment.stop()
+        self.temporary.cleanup()
+
     def discovery_app(self):
         app = AppTest.from_file("app_glowup.py", default_timeout=10).run()
         app.session_state["ui_state"] = "discovery"
@@ -370,36 +426,32 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         self.assertTrue(values["Tutti"])
 
     def test_new_cycle_ui_requires_explicit_second_confirmation(self):
-        with tempfile.TemporaryDirectory() as temporary, patch.dict(
-            os.environ,
-            {"DISCOVERY_ROTATION_DATABASE": str(Path(temporary) / "rotation.sqlite3")},
-        ):
-            rotation = DiscoveryRotationStore()
-            ean = "8809562191179"
-            rotation.sync_universe(
-                [{
-                    "canonical_ean": ean,
-                    "scenarios": [
-                        {"supplier": supplier} for supplier in SUPPORTED_SUPPLIERS
-                    ],
-                }],
-                SUPPORTED_SUPPLIERS,
-            )
-            st.cache_data.clear()
-            app = self.discovery_app()
-            new_cycle = next(
-                row for row in app.button if row.label == "Nuovo ciclo Discovery"
-            )
-            self.assertFalse(new_cycle.disabled)
-            app = new_cycle.click().run()
-            self.assertEqual(rotation.status(SUPPORTED_SUPPLIERS)["rotation_cycle_id"], 1)
-            confirm = next(
-                row for row in app.button if row.label == "Conferma nuovo ciclo"
-            )
-            app = confirm.click().run()
-            self.assertEqual(len(app.exception), 0)
-            self.assertEqual(rotation.status(SUPPORTED_SUPPLIERS)["rotation_cycle_id"], 2)
-            st.cache_data.clear()
+        selected_suppliers = ("umma", "abw", "qudo")
+        rotation = DiscoveryRotationStore()
+        ean = "8809562191179"
+        rotation.sync_universe(
+            [{
+                "canonical_ean": ean,
+                "scenarios": [
+                    {"supplier": supplier} for supplier in selected_suppliers
+                ],
+            }],
+            selected_suppliers,
+        )
+        st.cache_data.clear()
+        app = self.discovery_app()
+        new_cycle = next(
+            row for row in app.button if row.label == "Nuovo ciclo Discovery"
+        )
+        self.assertFalse(new_cycle.disabled)
+        app = new_cycle.click().run()
+        self.assertEqual(rotation.status(selected_suppliers)["rotation_cycle_id"], 1)
+        confirm = next(
+            row for row in app.button if row.label == "Conferma nuovo ciclo"
+        )
+        app = confirm.click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(rotation.status(selected_suppliers)["rotation_cycle_id"], 2)
 
     def test_zero_suppliers_disables_start_before_any_api(self):
         app = self.discovery_app()

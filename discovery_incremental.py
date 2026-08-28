@@ -419,6 +419,38 @@ class DiscoveryIncrementalStore:
             ).fetchall()
             return [self._hydrate_item(connection, row) for row in rows]
 
+    def iter_definitive_catalog_status_batches(
+        self, job_id: str, batch_size: int = 500,
+    ) -> Iterator[dict[str, str]]:
+        """Stream committed Catalog statuses for idempotent rotation recovery."""
+        self.initialize()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """SELECT canonical_identifier,catalog_status
+                   FROM discovery_job_items
+                   WHERE job_id=? AND catalog_status IN
+                     ('resolved','ambiguous','not_found','invalid_identifier')
+                   ORDER BY sequence_no""",
+                (job_id,),
+            )
+            while rows := cursor.fetchmany(int(batch_size)):
+                yield {
+                    str(row["canonical_identifier"]): str(row["catalog_status"])
+                    for row in rows
+                }
+
+    def requeue_catalog_incomplete(self, job_id: str) -> int:
+        """Make prior incomplete Catalog results eligible for one resume attempt."""
+        observed = _now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE discovery_job_items SET catalog_status=NULL,updated_at=?
+                   WHERE job_id=? AND catalog_status='catalog_incomplete'""",
+                (observed, job_id),
+            )
+            connection.commit()
+            return int(cursor.rowcount)
+
     def _hydrate_item(self, connection, row) -> dict[str, Any]:
         product = json.loads(row["product_json"])
         product["scenarios"] = [

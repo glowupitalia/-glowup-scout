@@ -61,6 +61,14 @@ def run_incremental_discovery(
     selected = int(state["selected_count"])
     batch_number = int(state.get("last_completed_batch") or 0)
 
+    # Catalog and rotation use separate SQLite stores. Reconcile committed
+    # definitive results before claiming more work so a process death between
+    # those two idempotent commits cannot leave the cycle behind.
+    if rotation_store is not None and state.get("rotation_scope"):
+        for statuses in store.iter_definitive_catalog_status_batches(job_id):
+            rotation_store.commit_catalog_results(job_id, statuses)
+    store.requeue_catalog_incomplete(job_id)
+
     # Catalog commit is the rotation commit point. A crash before the SQLite
     # transaction may repeat only that in-flight batch; after it, it is skipped.
     while True:
@@ -92,6 +100,14 @@ def run_incremental_discovery(
         )
         if progress:
             progress("catalog", state)
+        if any(row.get("catalog_status") == "catalog_incomplete" for row in batch):
+            store.set_phase(job_id, "suppliers_loaded", status="waiting_retry")
+            return _checkpoint(
+                store, metadata_store, job_id, progress_phase="catalog",
+                progress_current=summary["catalog_completed_count"],
+                progress_total=selected,
+                extra={"status": "waiting_retry", "catalog_retry_pending": True},
+            )
         if catalog_batch_interval:
             sleep_func(catalog_batch_interval)
 

@@ -141,6 +141,7 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
                 metadata_store=LightweightCheckpointStore(),
                 catalog_batch=catalog_batch, pricing_batch=pricing_batch,
                 fees_batch=search_product_fees_batch, token_provider=token_provider,
+                rotation_store=DiscoveryRotationStore(),
                 progress=progress,
                 resource_governor=DiscoveryResourceGovernor(
                     database_path=incremental_store.path,
