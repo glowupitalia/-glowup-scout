@@ -387,7 +387,7 @@ class QudoIntegrationTests(unittest.TestCase):
         self.assertIn("MOV EUR 300", scenarios.cell(2, headers["Requisito"]).value)
         self.assertEqual(scenarios.cell(2, headers["Stock"]).value, 309)
         self.assertFalse(scenarios.cell(2, headers["Costo"]).protection.locked)
-        self.assertIn("MATCH($AB2", scenarios.cell(2, headers["Margine attuale %"]).value)
+        self.assertIn("MATCH($AC2", scenarios.cell(2, headers["Margine attuale %"]).value)
         self.assertTrue(scenarios.protection.sheet)
         self.assertEqual(workbook["Dati"].sheet_state, "hidden")
 

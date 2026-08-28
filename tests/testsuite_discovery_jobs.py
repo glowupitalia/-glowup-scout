@@ -10,6 +10,7 @@ from streamlit.testing.v1 import AppTest
 from discovery import DiscoveryCheckpointStore, default_filters
 from discovery_jobs import DiscoveryJobRegistry
 from notifications import DEFAULT_RECIPIENT
+from supplier_catalog import SupplierCatalogStore
 
 
 class DiscoveryJobRegistryTests(unittest.TestCase):
@@ -198,15 +199,24 @@ class DiscoveryJobUiTests(unittest.TestCase):
 
     def test_discovery_configuration_shows_notification_status(self):
         with tempfile.TemporaryDirectory() as temporary:
-            registry = DiscoveryJobRegistry(Path(temporary) / "runtime.sqlite3")
+            root = Path(temporary)
+            registry = DiscoveryJobRegistry(root / "runtime.sqlite3")
+            catalog_path = root / "catalog.sqlite3"
+            original_init = SupplierCatalogStore.__init__
+
+            def isolated_catalog_init(instance, path=None):
+                original_init(instance, path or catalog_path)
+
+            SupplierCatalogStore(catalog_path).initialize()
             with patch.dict(
                 os.environ,
                 {
                     "DISCOVERY_JOB_DATABASE": str(registry.path),
+                    "DISCOVERY_ROTATION_DATABASE": str(root / "rotation.sqlite3"),
                     "GLOWUP_SCOUT_EMAIL_ENABLED": "false",
                 },
                 clear=False,
-            ):
+            ), patch.object(SupplierCatalogStore, "__init__", isolated_catalog_init):
                 app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
                 app.session_state["ui_state"] = "discovery"
                 app = app.run()

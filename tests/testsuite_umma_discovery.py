@@ -532,8 +532,8 @@ class UmmaCrossSupplierTests(unittest.TestCase):
                 if scenarios[f"E{row}"].value == "UMMA"
             )
             self.assertIn("MOV USD 700", scenarios[f"H{umma_row_number}"].value)
-            self.assertIsNone(scenarios[f"V{umma_row_number}"].value)
-            self.assertIn("15 giorni", scenarios[f"W{umma_row_number}"].value)
+            self.assertIsNone(scenarios[f"W{umma_row_number}"].value)
+            self.assertIn("15 giorni", scenarios[f"X{umma_row_number}"].value)
 
     def test_discovery_excel_lists_europe_direct_as_distinct_scenario(self):
         product = normalize_umma_candidates(

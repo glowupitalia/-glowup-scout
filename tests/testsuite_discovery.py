@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import sqlite3
 import requests
+from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -2260,20 +2261,82 @@ class DiscoveryExcelTests(unittest.TestCase):
                 SCENARIO_COLUMNS,
             )
             self.assertEqual(scenarios.max_row, 6)
-            for column in ("V", "W", "X", "Y"):
+            for column in ("W", "X", "Y", "Z"):
                 self.assertTrue(opportunity.column_dimensions[column].hidden)
-            for column in ("Z", "AA", "AB", "AC"):
+            for column in ("AA", "AB", "AC", "AD"):
                 self.assertTrue(scenarios.column_dimensions[column].hidden)
-            self.assertTrue(scenarios["Z2"].protection.locked)
+            self.assertTrue(scenarios["AA2"].protection.locked)
             self.assertFalse(scenarios["I2"].protection.locked)
-            self.assertIn("MATCH($AB2,'Dati'!$A$2:$A$2,0)", scenarios["N2"].value)
-            self.assertIn("I2", scenarios["N2"].value)
-            for column in ("N", "O", "P", "Q", "R", "S"):
+            self.assertIn("MATCH($AC2,'Dati'!$A$2:$A$2,0)", scenarios["N2"].value)
+            self.assertIn("O2", scenarios["N2"].value)
+            self.assertIn("I2", scenarios["O2"].value)
+            for column in ("N", "O", "P", "Q", "R", "S", "T"):
                 self.assertTrue(str(scenarios[f"{column}2"].value).startswith("="))
             self.assertEqual(workbook["Dati"].sheet_state, "hidden")
-            self.assertEqual(opportunity["U2"].hyperlink.target, result["amazon_offers_url"])
+            self.assertEqual(opportunity["V2"].hyperlink.target, result["amazon_offers_url"])
             self.assertTrue(opportunity.protection.sheet)
             self.assertTrue(scenarios.protection.sheet)
+            self.assertFalse(opportunity.protection.autoFilter)
+            self.assertFalse(opportunity.protection.sort)
+            self.assertFalse(opportunity.protection.formatColumns)
+
+    def test_opportunities_are_sorted_and_currency_inputs_remain_numeric(self):
+        template = self._result()
+        specifications = [
+            ("8800000000001", 72, 30, 5),
+            ("8800000000002", 100, 20, 20),
+            ("8800000000003", 85, 50, 10),
+            ("8800000000004", 100, 30, 4),
+            ("8800000000005", 100, 30, 9),
+            ("8800000000006", 43, 99, 50),
+        ]
+        products = []
+        for index, (ean, score, margin, profit) in enumerate(specifications):
+            product = deepcopy(template)
+            product["canonical_ean"] = product["gtin"] = ean
+            product["product_key"] = f"product-{index}"
+            observation = product["amazon_observation"]
+            observation["observation_id"] = f"observation-{index}"
+            observation["reference_price"] = "30.1234"
+            scenario = product["scenarios"][-1]
+            scenario["cost_gross_unit_eur"] = "9.028125535928"
+            scenario.update({"score": score, "margin_percent": margin, "profit": profit})
+            products.append(product)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sorted.xlsx"
+            write_discovery_excel(products, path)
+            workbook = load_workbook(path, data_only=False)
+            sheet = workbook["Opportunità"]
+            self.assertEqual(
+                [sheet[f"A{row}"].value for row in range(2, 8)],
+                ["8800000000005", "8800000000004", "8800000000002",
+                 "8800000000003", "8800000000001", "8800000000006"],
+            )
+            self.assertEqual(sheet["G2"].data_type, "n")
+            self.assertAlmostEqual(sheet["G2"].value, 9.028125535928)
+            self.assertEqual(sheet["G2"].number_format, '€ #,##0.00')
+            self.assertFalse(sheet["G2"].protection.locked)
+            self.assertEqual(sheet["J2"].data_type, "n")
+            self.assertTrue(sheet["N2"].value.startswith("=IFERROR"))
+            self.assertIn("G2", sheet["N2"].value)
+            self.assertIn("N2", sheet["M2"].value)
+            self.assertTrue(sheet["N2"].protection.locked)
+            self.assertEqual(sheet["R2"].number_format, "0")
+            self.assertEqual(sheet.auto_filter.ref, "A1:V7")
+            self.assertFalse(sheet.protection.autoFilter)
+            self.assertFalse(sheet.protection.sort)
+            self.assertFalse(sheet.protection.formatColumns)
+            for row in range(2, sheet.max_row + 1):
+                for column in range(1, len(OPPORTUNITY_COLUMNS) + 1):
+                    self.assertEqual(
+                        sheet.cell(row, column).protection.locked,
+                        column != 7,
+                    )
+                    value = sheet.cell(row, column).value
+                    if isinstance(value, str) and value.startswith("="):
+                        self.assertNotIn("#REF!", value)
+            workbook.close()
 
     def test_complete_audit_export_preserves_every_filter_outcome(self):
         filters = {

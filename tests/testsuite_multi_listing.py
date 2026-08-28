@@ -527,7 +527,7 @@ class MultiListingPipelineTests(unittest.TestCase):
         self.assertEqual(data.max_row, 3)
         self.assertEqual(data.sheet_state, "hidden")
         self.assertFalse(combinations["I2"].protection.locked)
-        self.assertIn("MATCH($AB2,'Dati'!$A$2:$A$3,0)", combinations["N2"].value)
+        self.assertIn("MATCH($AC2,'Dati'!$A$2:$A$3,0)", combinations["N2"].value)
         headers = [cell.value for cell in data[1]]
         self.assertEqual(headers[-2:], ["Prezzo minimo FBA", "Prezzo minimo FBM"])
         self.assertEqual(data.cell(2, headers.index("Prezzo minimo FBA") + 1).value, 29)

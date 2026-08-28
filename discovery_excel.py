@@ -23,14 +23,14 @@ from purchase_scenarios import (
 OPPORTUNITY_COLUMNS = [
     "EAN", "Brand", "Titolo", "Fornitore", "Scenario", "Requisito", "Costo",
     "ASIN raccomandato", "BSR Beauty", "Prezzo riferimento", "Venditori FBA", "Venditori totali",
-    "Margine attuale %", "Prezzo 15%", "Prezzo 20%", "Prezzo 25%",
+    "Margine attuale %", "Utile €", "Prezzo 15%", "Prezzo 20%", "Prezzo 25%",
     "Score", "Opportunità", "Numero scenari acquisto", "Numero pagine Amazon",
     "Link Offerte Amazon",
 ]
 SCENARIO_COLUMNS = [
     "EAN", "Brand", "Titolo", "ASIN", "Fornitore", "Seller alias", "Scenario",
     "Requisito", "Costo", "Prezzo riferimento", "BSR Beauty", "Venditori FBA",
-    "Venditori totali", "Margine attuale %", "Prezzo 15%", "Prezzo 20%",
+    "Venditori totali", "Margine attuale %", "Utile €", "Prezzo 15%", "Prezzo 20%",
     "Prezzo 25%", "Score", "Opportunità", "Ruolo", "Stato", "Stock",
     "Lead time / Snapshot / freshness", "Warehouse", "Disponibilità",
 ]
@@ -76,6 +76,44 @@ def _as_decimal(value):
         return Decimal(str(value))
     except Exception:
         return None
+
+
+def _excel_number(value):
+    """Return an Excel numeric value without coercing identifiers or formulas."""
+    if value in (None, "") or isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.startswith("="):
+        return value
+    number = _as_decimal(value)
+    return float(number) if number is not None and number.is_finite() else value
+
+
+def _opportunity_sort_key(product):
+    """Use persisted economics to physically order the bounded final result set."""
+    combination = recommended_combination(product) or {}
+    scenario = _recommended(product) or {}
+
+    def descending(value):
+        number = _as_decimal(value)
+        return -number if number is not None and number.is_finite() else Decimal("Infinity")
+
+    def persisted(field):
+        value = combination.get(field)
+        return value if value is not None else scenario.get(field)
+
+    return (
+        descending(persisted("score")),
+        descending(persisted("margin_percent")),
+        descending(persisted("profit")),
+        str(_product_ean(product) or ""),
+    )
+
+
+def _sorted_final_products(final_products):
+    # Final opportunities are intentionally bounded (143 in the first full
+    # run). Sorting this view must never materialize the complete candidate or
+    # combination universe.
+    return sorted(final_products, key=_opportunity_sort_key)
 
 
 def _export_context(payload):
@@ -286,7 +324,7 @@ def _lookup(row, observation_id_column, data_column, last_row):
     )
 
 
-def _economic_formulas(row, *, cost_col, margin_col, target_cols, score_col,
+def _economic_formulas(row, *, cost_col, margin_col, profit_col, target_cols, score_col,
                        opportunity_col, observation_id_col, last_data_row):
     price = _lookup(row, observation_id_col, "E", last_data_row)
     bsr = _lookup(row, observation_id_col, "D", last_data_row)
@@ -294,11 +332,15 @@ def _economic_formulas(row, *, cost_col, margin_col, target_cols, score_col,
     total_sellers = _lookup(row, observation_id_col, "G", last_data_row)
     fba_gross = _lookup(row, observation_id_col, "I", last_data_row)
     referral_rate = _lookup(row, observation_id_col, "K", last_data_row)
-    margin = (
+    profit = (
         f'=IFERROR(IF(AND(ISNUMBER({price}),{price}>0,ISNUMBER({cost_col}{row}),'
         f'ISNUMBER({fba_gross}),ISNUMBER({referral_rate})),'
-        f'ROUND(({price}-{cost_col}{row}-({price}*{referral_rate})-'
-        f'{fba_gross})/{price},4),""),"")'
+        f'ROUND({price}-{cost_col}{row}-({price}*{referral_rate})-'
+        f'{fba_gross},2),""),"")'
+    )
+    margin = (
+        f'=IFERROR(IF(AND(ISNUMBER({price}),{price}>0,ISNUMBER({profit_col}{row})),'
+        f'ROUND({profit_col}{row}/{price},4),""),"")'
     )
     targets = {}
     for target, column in zip((0.15, 0.20, 0.25), target_cols):
@@ -333,7 +375,7 @@ def _economic_formulas(row, *, cost_col, margin_col, target_cols, score_col,
         f'"🟢 Ottima",IF({score_col}{row}>=55,"🟡 Interessante",'
         f'IF({score_col}{row}>=40,"🟠 Da valutare","🔴 Debole"))))'
     )
-    return margin, targets, score, opportunity
+    return margin, profit, targets, score, opportunity
 
 
 def _recommended(product):
@@ -391,7 +433,7 @@ def _style_sheet(ws, *, visible_columns, cost_column, hidden_columns, data_ws):
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
     ws[f"{cost_column}1"].comment = Comment(
-        "Modifica questi valori per simulare margine, prezzi target, Score e Opportunità.",
+        "Modifica questi valori per simulare utile, margine, prezzi target, Score e Opportunità.",
         "GlowUp Scout",
     )
     editable_fill = PatternFill("solid", fgColor="EAF2FE")
@@ -406,6 +448,8 @@ def _style_sheet(ws, *, visible_columns, cost_column, hidden_columns, data_ws):
     ws.protection.sheet = True
     ws.protection.autoFilter = False
     ws.protection.sort = False
+    ws.protection.formatColumns = False
+    ws.protection.selectLockedCells = False
     ws.protection.selectUnlockedCells = False
     data_ws.sheet_state = "hidden"
 
@@ -426,11 +470,17 @@ def _style_audit_sheet(ws, widths, *, currency_columns=(), percent_columns=(),
         for column in text_columns:
             ws.cell(row, column).number_format = "@"
         for column in currency_columns:
-            ws.cell(row, column).number_format = '€ #,##0.00'
+            cell = ws.cell(row, column)
+            cell.value = _excel_number(cell.value)
+            cell.number_format = '€ #,##0.00'
         for column in percent_columns:
-            ws.cell(row, column).number_format = '0.00%'
+            cell = ws.cell(row, column)
+            cell.value = _excel_number(cell.value)
+            cell.number_format = '0.00%'
         for column in integer_columns:
-            ws.cell(row, column).number_format = '#,##0'
+            cell = ws.cell(row, column)
+            cell.value = _excel_number(cell.value)
+            cell.number_format = '#,##0'
         if hyperlink_column:
             cell = ws.cell(row, hyperlink_column)
             if cell.value:
@@ -511,6 +561,7 @@ def write_discovery_excel(results, output_file, *, progress=None):
         return _write_incremental_discovery_excel(
             state, candidates, final_products, output_file, progress=progress,
         )
+    final_products = _sorted_final_products(final_products)
     output_path = os.path.abspath(output_file)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     descriptor, temporary_path = tempfile.mkstemp(
@@ -584,10 +635,10 @@ def write_discovery_excel(results, output_file, *, progress=None):
                 observation.get("amazon_title") or product.get("title"),
                 str(recommended.get("supplier") or "").upper(),
                 recommended.get("scenario_label"), scenario_requirement_label(recommended),
-                _value(recommended.get("cost_gross_unit_eur")), recommended_pair.get("asin"),
+                _excel_number(recommended.get("cost_gross_unit_eur")), recommended_pair.get("asin"),
                 observation.get("bsr_beauty"),
-                _value(observation.get("reference_price")), observation.get("fba_sellers"),
-                observation.get("total_sellers"), None, None, None, None, None, None,
+                _excel_number(observation.get("reference_price")), observation.get("fba_sellers"),
+                observation.get("total_sellers"), None, None, None, None, None, None, None,
                 len(product.get("scenarios") or []), len(product.get("amazon_listings") or [observation]),
                 product.get("amazon_offers_url"), product_id,
                 recommended.get("scenario_id"), recommended_pair.get("amazon_observation_id"),
@@ -625,12 +676,12 @@ def write_discovery_excel(results, output_file, *, progress=None):
                     combination.get("asin"),
                     str(scenario.get("supplier") or "").upper(),
                     scenario.get("supplier_alias"), scenario.get("scenario_label"),
-                    scenario_requirement_label(scenario), _value(scenario.get("cost_gross_unit_eur")),
-                    _value(combination_observation.get("reference_price")),
+                    scenario_requirement_label(scenario), _excel_number(scenario.get("cost_gross_unit_eur")),
+                    _excel_number(combination_observation.get("reference_price")),
                     combination_observation.get("bsr_beauty"),
                     combination_observation.get("fba_sellers"),
                     combination_observation.get("total_sellers"),
-                    None, None, None, None, None, None,
+                    None, None, None, None, None, None, None,
                     "Raccomandata" if combination.get("combination_id") == recommended_pair.get("combination_id") else "",
                     combination.get("evaluation_status"), scenario.get("stock"),
                     f"{scenario.get('lead_time') or '—'} · "
@@ -652,7 +703,7 @@ def write_discovery_excel(results, output_file, *, progress=None):
                     _product_ean(product), product.get("brand"), product.get("title"),
                     _supplier_names(product), len(product.get("scenarios") or []),
                     None, None, None, None, None, None, None, None, None, None,
-                    None, _value(_best_cost(product)), None, None, label, reason,
+                    None, _excel_number(_best_cost(product)), None, None, label, reason,
                     threshold, f"{technical} · {detail}".strip(" ·"),
                 ])
             for listing in listings:
@@ -667,10 +718,10 @@ def write_discovery_excel(results, output_file, *, progress=None):
                     listing.get("asin"), listing.get("title"),
                     listing.get("compatibility_status"),
                     "Sì" if listing.get("beauty_status") == "display_group_beauty" else "No",
-                    listing.get("bsr_beauty"), _value(listing.get("reference_price")),
-                    listing.get("price_source"), _value(listing.get("min_fba_price")),
-                    _value(listing.get("min_fbm_price")), listing.get("fba_sellers"),
-                    listing.get("total_sellers"), _value(_best_cost(product)),
+                    listing.get("bsr_beauty"), _excel_number(listing.get("reference_price")),
+                    listing.get("price_source"), _excel_number(listing.get("min_fba_price")),
+                    _excel_number(listing.get("min_fbm_price")), listing.get("fba_sellers"),
+                    listing.get("total_sellers"), _excel_number(_best_cost(product)),
                     (_value(_as_decimal((best or {}).get("margin_percent")) / Decimal("100"))
                      if (best or {}).get("margin_percent") is not None else None),
                     (best or {}).get("score"), label, reason, threshold,
@@ -690,8 +741,8 @@ def write_discovery_excel(results, output_file, *, progress=None):
                     _detail_text(listing.get("compatibility_reason")),
                     "Sì" if listing.get("beauty_status") == "display_group_beauty" else "No",
                     listing.get("display_group"), listing.get("bsr_beauty"),
-                    listing.get("catalog_status"), _value(buy_box),
-                    _value(listing.get("min_fba_price")), _value(listing.get("min_fbm_price")),
+                    listing.get("catalog_status"), _excel_number(buy_box),
+                    _excel_number(listing.get("min_fba_price")), _excel_number(listing.get("min_fbm_price")),
                     listing.get("price_source"), listing.get("fba_sellers"),
                     listing.get("total_sellers"), listing.get("pricing_status"),
                     listing.get("competition_status"), listing.get("fee_status"),
@@ -703,63 +754,69 @@ def write_discovery_excel(results, output_file, *, progress=None):
             fee = observation.get("fee_estimate") or {}
             data_ws.append([
                 observation_id, product_id, observation.get("asin"), observation.get("bsr_beauty"),
-                _value(observation.get("reference_price")), observation.get("fba_sellers"),
-                observation.get("total_sellers"), _value(fee.get("fba_fee_net")),
-                _value(fee.get("fba_fee_gross")), _value(fee.get("referral_fee")),
-                _value(observation.get("referral_rate") or fee.get("referral_rate")),
+                _excel_number(observation.get("reference_price")), observation.get("fba_sellers"),
+                observation.get("total_sellers"), _excel_number(fee.get("fba_fee_net")),
+                _excel_number(fee.get("fba_fee_gross")), _excel_number(fee.get("referral_fee")),
+                _excel_number(observation.get("referral_rate") or fee.get("referral_rate")),
                 observation.get("referral_source"),
                 observation.get("price_source"), observation.get("seller_count_source"),
                 observation.get("observed_at"),
-                _value(observation.get("min_fba_price")),
-                _value(observation.get("min_fbm_price")),
+                _excel_number(observation.get("min_fba_price")),
+                _excel_number(observation.get("min_fbm_price")),
             ])
         for label, value in _run_metadata(state, candidates, final_products):
             run_ws.append([label, _value(value)])
         last_data_row = max(2, data_ws.max_row)
 
         for row in range(2, opportunities.max_row + 1):
-            margin, targets, score, opportunity = _economic_formulas(
-                row, cost_col="G", margin_col="M", target_cols=("N", "O", "P"),
-                score_col="Q", opportunity_col="R", observation_id_col="X",
+            margin, profit, targets, score, opportunity = _economic_formulas(
+                row, cost_col="G", margin_col="M", profit_col="N",
+                target_cols=("O", "P", "Q"), score_col="R", opportunity_col="S",
+                observation_id_col="Y",
                 last_data_row=last_data_row,
             )
             opportunities[f"M{row}"] = margin
-            opportunities[f"N{row}"] = targets["N"]
+            opportunities[f"N{row}"] = profit
             opportunities[f"O{row}"] = targets["O"]
             opportunities[f"P{row}"] = targets["P"]
-            opportunities[f"Q{row}"] = score
-            opportunities[f"R{row}"] = opportunity
+            opportunities[f"Q{row}"] = targets["Q"]
+            opportunities[f"R{row}"] = score
+            opportunities[f"S{row}"] = opportunity
             opportunities[f"M{row}"].number_format = "0.00%"
-            for column in ("G", "J", "N", "O", "P"):
+            opportunities[f"R{row}"].number_format = "0"
+            for column in ("G", "J", "N", "O", "P", "Q"):
                 opportunities[f"{column}{row}"].number_format = '€ #,##0.00'
-            link = opportunities[f"U{row}"]
+            link = opportunities[f"V{row}"]
             if link.value:
                 link.hyperlink = link.value
                 link.style = "Hyperlink"
 
         for row in range(2, scenarios_ws.max_row + 1):
-            margin, targets, score, opportunity = _economic_formulas(
-                row, cost_col="I", margin_col="N", target_cols=("O", "P", "Q"),
-                score_col="R", opportunity_col="S", observation_id_col="AB",
+            margin, profit, targets, score, opportunity = _economic_formulas(
+                row, cost_col="I", margin_col="N", profit_col="O",
+                target_cols=("P", "Q", "R"), score_col="S", opportunity_col="T",
+                observation_id_col="AC",
                 last_data_row=last_data_row,
             )
             scenarios_ws[f"N{row}"] = margin
-            scenarios_ws[f"O{row}"] = targets["O"]
+            scenarios_ws[f"O{row}"] = profit
             scenarios_ws[f"P{row}"] = targets["P"]
             scenarios_ws[f"Q{row}"] = targets["Q"]
-            scenarios_ws[f"R{row}"] = score
-            scenarios_ws[f"S{row}"] = opportunity
+            scenarios_ws[f"R{row}"] = targets["R"]
+            scenarios_ws[f"S{row}"] = score
+            scenarios_ws[f"T{row}"] = opportunity
             scenarios_ws[f"N{row}"].number_format = "0.00%"
-            for column in ("I", "J", "O", "P", "Q"):
+            scenarios_ws[f"S{row}"].number_format = "0"
+            for column in ("I", "J", "O", "P", "Q", "R"):
                 scenarios_ws[f"{column}{row}"].number_format = '€ #,##0.00'
 
         _style_sheet(
             opportunities, visible_columns=len(OPPORTUNITY_COLUMNS), cost_column="G",
-            hidden_columns=("V", "W", "X", "Y"), data_ws=data_ws,
+            hidden_columns=("W", "X", "Y", "Z"), data_ws=data_ws,
         )
         _style_sheet(
             scenarios_ws, visible_columns=len(SCENARIO_COLUMNS), cost_column="I",
-            hidden_columns=("Z", "AA", "AB", "AC"), data_ws=data_ws,
+            hidden_columns=("AA", "AB", "AC", "AD"), data_ws=data_ws,
         )
         _style_audit_sheet(
             all_results_ws,
@@ -778,8 +835,8 @@ def write_discovery_excel(results, output_file, *, progress=None):
         _style_audit_sheet(run_ws, [28, 54])
         run_ws.auto_filter.ref = None
         run_ws.freeze_panes = "A2"
-        opportunity_widths = [16, 20, 45, 12, 22, 18, 12, 14, 12, 18, 14, 15, 17, 12, 12, 12, 9, 20, 16, 16, 42]
-        scenario_widths = [16, 20, 45, 14, 12, 16, 22, 18, 12, 18, 12, 14, 15, 17, 12, 12, 12, 9, 20, 16, 20, 10, 32, 14, 20]
+        opportunity_widths = [16, 20, 45, 12, 22, 18, 12, 14, 12, 18, 14, 15, 17, 12, 12, 12, 12, 9, 20, 16, 16, 42]
+        scenario_widths = [16, 20, 45, 14, 12, 16, 22, 18, 12, 18, 12, 14, 15, 17, 12, 12, 12, 12, 9, 20, 16, 20, 10, 32, 14, 20]
         for ws, widths in ((opportunities, opportunity_widths), (scenarios_ws, scenario_widths)):
             for index, width in enumerate(widths, start=1):
                 ws.column_dimensions[get_column_letter(index)].width = width
@@ -792,6 +849,10 @@ def write_discovery_excel(results, output_file, *, progress=None):
                     ws.cell(row, 4).number_format = "@"
         data_ws.freeze_panes = "A2"
         data_ws.auto_filter.ref = f"A1:{get_column_letter(data_ws.max_column)}{max(1, data_ws.max_row)}"
+        for row in range(2, data_ws.max_row + 1):
+            for column in (5, 8, 9, 10, 16, 17):
+                data_ws.cell(row, column).number_format = '€ #,##0.00'
+            data_ws.cell(row, 11).number_format = "0.00%"
 
         workbook.calculation.calcMode = "auto"
         workbook.calculation.fullCalcOnLoad = True
@@ -832,17 +893,22 @@ def _stream_append(ws, values, *, header=False, currency_columns=(),
     cells = []
     for index, value in enumerate(values, start=1):
         fmt = None
+        numeric = False
         if index in currency_columns:
             fmt = '€ #,##0.00'
+            numeric = True
         elif index in percent_columns:
             fmt = '0.00%'
+            numeric = True
         elif index in integer_columns:
             fmt = '#,##0'
+            numeric = True
         elif index in text_columns:
             fmt = '@'
         hyperlink = value if index in hyperlink_columns and value else None
         cells.append(_stream_cell(
-            ws, value, header=header, number_format=fmt,
+            ws, _excel_number(value) if numeric and not header else value,
+            header=header, number_format=fmt,
             unlocked=index in unlocked_columns, hyperlink=hyperlink,
         ))
     ws.append(cells)
@@ -860,6 +926,8 @@ def _configure_stream_sheet(ws, widths, *, visible_columns=None,
         ws.protection.sheet = True
         ws.protection.autoFilter = False
         ws.protection.sort = False
+        ws.protection.formatColumns = False
+        ws.protection.selectLockedCells = False
         ws.protection.selectUnlockedCells = False
 
 
@@ -872,6 +940,7 @@ def _write_incremental_discovery_excel(
     write-only worksheets keep only the current row in memory while retaining
     formulas, filters, hyperlinks, hidden technical columns and run metadata.
     """
+    final_products = _sorted_final_products(final_products)
     output_path = os.path.abspath(output_file)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     descriptor, temporary_path = tempfile.mkstemp(
@@ -888,15 +957,15 @@ def _write_incremental_discovery_excel(
         data_ws = workbook.create_sheet("Dati")
         run_ws = workbook.create_sheet("Parametri run")
 
-        opportunity_widths = [16, 20, 45, 12, 22, 18, 12, 14, 12, 18, 14, 15, 17, 12, 12, 12, 9, 20, 16, 16, 42]
-        scenario_widths = [16, 20, 45, 14, 12, 16, 22, 18, 12, 18, 12, 14, 15, 17, 12, 12, 12, 9, 20, 16, 20, 10, 32, 14, 20]
+        opportunity_widths = [16, 20, 45, 12, 22, 18, 12, 14, 12, 18, 14, 15, 17, 12, 12, 12, 12, 9, 20, 16, 16, 42]
+        scenario_widths = [16, 20, 45, 14, 12, 16, 22, 18, 12, 18, 12, 14, 15, 17, 12, 12, 12, 12, 9, 20, 16, 20, 10, 32, 14, 20]
         _configure_stream_sheet(
             opportunities, opportunity_widths, visible_columns=len(OPPORTUNITY_COLUMNS),
-            hidden_columns=("V", "W", "X", "Y"), protected=True,
+            hidden_columns=("W", "X", "Y", "Z"), protected=True,
         )
         _configure_stream_sheet(
             scenarios_ws, scenario_widths, visible_columns=len(SCENARIO_COLUMNS),
-            hidden_columns=("Z", "AA", "AB", "AC"), protected=True,
+            hidden_columns=("AA", "AB", "AC", "AD"), protected=True,
         )
         _configure_stream_sheet(
             all_results_ws,
@@ -961,9 +1030,10 @@ def _write_incremental_discovery_excel(
                     "amazon_observation_id": observation.get("observation_id") or product_id,
                 }
             opportunity_row += 1
-            margin, targets, score, opportunity = _economic_formulas(
-                opportunity_row, cost_col="G", margin_col="M", target_cols=("N", "O", "P"),
-                score_col="Q", opportunity_col="R", observation_id_col="X",
+            margin, profit, targets, score, opportunity = _economic_formulas(
+                opportunity_row, cost_col="G", margin_col="M", profit_col="N",
+                target_cols=("O", "P", "Q"), score_col="R", opportunity_col="S",
+                observation_id_col="Y",
                 last_data_row=last_data_row,
             )
             link = product.get("amazon_offers_url")
@@ -975,16 +1045,16 @@ def _write_incremental_discovery_excel(
                 recommended.get("cost_gross_unit_eur"), recommended_pair.get("asin"),
                 observation.get("bsr_beauty"), observation.get("reference_price"),
                 observation.get("fba_sellers"), observation.get("total_sellers"),
-                margin, targets["N"], targets["O"], targets["P"], score, opportunity,
+                margin, profit, targets["O"], targets["P"], targets["Q"], score, opportunity,
                 len(product.get("scenarios") or []),
                 len(product.get("amazon_listings") or [observation]), link, product_id,
                 recommended.get("scenario_id"), recommended_pair.get("amazon_observation_id"),
                 recommended_pair.get("combination_id"),
             ]
             _stream_append(
-                opportunities, values, currency_columns=(7, 10, 14, 15, 16),
-                percent_columns=(13,), text_columns=(1, 8), unlocked_columns=(7,),
-                hyperlink_columns=(21,),
+                opportunities, values, currency_columns=(7, 10, 14, 15, 16, 17),
+                percent_columns=(13,), integer_columns=(18,), text_columns=(1, 8),
+                unlocked_columns=(7,), hyperlink_columns=(22,),
             )
 
         scenario_row = all_results_row = listing_row = 1
@@ -1009,9 +1079,10 @@ def _write_incremental_discovery_excel(
                     combination.get("amazon_observation_id"), {}
                 ) or observations.get(combination.get("amazon_observation_id"), (None, {}))[1]
                 scenario_row += 1
-                margin, targets, score, opportunity = _economic_formulas(
-                    scenario_row, cost_col="I", margin_col="N", target_cols=("O", "P", "Q"),
-                    score_col="R", opportunity_col="S", observation_id_col="AB",
+                margin, profit, targets, score, opportunity = _economic_formulas(
+                    scenario_row, cost_col="I", margin_col="N", profit_col="O",
+                    target_cols=("P", "Q", "R"), score_col="S", opportunity_col="T",
+                    observation_id_col="AC",
                     last_data_row=last_data_row,
                 )
                 _stream_append(scenarios_ws, [
@@ -1022,15 +1093,15 @@ def _write_incremental_discovery_excel(
                     scenario_requirement_label(scenario), scenario.get("cost_gross_unit_eur"),
                     combination_observation.get("reference_price"), combination_observation.get("bsr_beauty"),
                     combination_observation.get("fba_sellers"), combination_observation.get("total_sellers"),
-                    margin, targets["O"], targets["P"], targets["Q"], score, opportunity,
+                    margin, profit, targets["P"], targets["Q"], targets["R"], score, opportunity,
                     "Raccomandata" if combination.get("combination_id") == recommended_pair.get("combination_id") else "",
                     combination.get("evaluation_status"), scenario.get("stock"),
                     f"{scenario.get('lead_time') or '—'} · {scenario.get('snapshot_at') or ''} · {scenario.get('freshness_status') or ''}",
                     scenario.get("warehouse"), scenario.get("availability_text") or scenario.get("availability_status"),
                     product_id, scenario.get("scenario_id"), combination.get("amazon_observation_id"),
                     combination.get("combination_id"),
-                ], currency_columns=(9, 10, 15, 16, 17), percent_columns=(14,),
-                    text_columns=(1, 4), unlocked_columns=(9,))
+                ], currency_columns=(9, 10, 15, 16, 17, 18), percent_columns=(14,),
+                    integer_columns=(19,), text_columns=(1, 4), unlocked_columns=(9,))
 
             listings = product.get("amazon_listings") or []
             if not listings:
@@ -1095,7 +1166,8 @@ def _write_incremental_discovery_excel(
                 observation.get("referral_source"), observation.get("price_source"),
                 observation.get("seller_count_source"), observation.get("observed_at"),
                 observation.get("min_fba_price"), observation.get("min_fbm_price"),
-            ], text_columns=(1, 2, 3), currency_columns=(5, 8, 9, 10, 16, 17))
+            ], text_columns=(1, 2, 3), currency_columns=(5, 8, 9, 10, 16, 17),
+                percent_columns=(11,), integer_columns=(4, 6, 7))
         for label, value in _run_metadata(state, candidates, final_products):
             _stream_append(run_ws, [label, value])
 

@@ -153,6 +153,26 @@ class FinalizationTests(unittest.TestCase):
         self.assertEqual(workbook["Opportunità"].max_row, 2)
         self.assertEqual(workbook["Scenari"].max_row, 2)
         self.assertTrue(str(workbook["Opportunità"]["M2"].value).startswith("="))
+        self.assertTrue(str(workbook["Opportunità"]["N2"].value).startswith("="))
+        self.assertEqual(workbook["Opportunità"]["G2"].data_type, "n")
+        self.assertEqual(workbook["Opportunità"]["J2"].data_type, "n")
+        self.assertEqual(workbook["Opportunità"]["G2"].number_format, '€ #,##0.00')
+        self.assertFalse(workbook["Opportunità"]["G2"].protection.locked)
+        self.assertTrue(workbook["Opportunità"]["N2"].protection.locked)
+        self.assertFalse(workbook["Opportunità"].protection.autoFilter)
+        self.assertFalse(workbook["Opportunità"].protection.sort)
+        self.assertFalse(workbook["Opportunità"].protection.formatColumns)
+        for sheet_name, coordinates in {
+            "Scenari": ("I2", "J2"),
+            "Tutti i risultati": ("K2", "M2", "N2", "Q2"),
+            "Listing Amazon": ("K2", "L2", "M2"),
+            "Dati": ("E2", "H2", "I2", "J2", "K2"),
+        }.items():
+            for coordinate in coordinates:
+                self.assertEqual(
+                    workbook[sheet_name][coordinate].data_type, "n",
+                    f"{sheet_name}!{coordinate} must remain numeric",
+                )
         self.assertEqual(workbook["Dati"].sheet_state, "hidden")
         self.assertEqual(workbook["Opportunità"].freeze_panes, "A2")
         workbook.close()
@@ -209,7 +229,7 @@ class FinalizationTests(unittest.TestCase):
         large_checkpoints = LightweightCheckpointStore(self.root / "large-checkpoints")
         state, template, observation = completed_fixture("large")
         state.update({"selected_count": 200, "sampled_identifier_count": 200,
-                      "catalog_completed_count": 200, "final_products": 0})
+                      "catalog_completed_count": 200, "final_products": 143})
 
         def products():
             for index in range(200):
@@ -229,6 +249,8 @@ class FinalizationTests(unittest.TestCase):
                 **template["opportunity_combinations"][0],
                 "combination_id": f"combination-{index}-{item}",
             } for item in range(100)]
+            row["is_final_result"] = index < 143
+            row["recommended_combination"] = row["opportunity_combinations"][0]
             large_store.update_candidates("large", [row], replace_scenarios=True)
         large_store.set_phase("large", "completed", status="completed")
         large_checkpoints.save(state)
@@ -239,6 +261,7 @@ class FinalizationTests(unittest.TestCase):
         tracemalloc.stop()
         self.assertLess(peak, 250 * 1024 * 1024)
         workbook = load_workbook(target, read_only=True, data_only=False)
+        self.assertEqual(sum(1 for _ in workbook["Opportunità"].iter_rows()), 144)
         self.assertEqual(sum(1 for _ in workbook["Scenari"].iter_rows()), 20_001)
         workbook.close()
 

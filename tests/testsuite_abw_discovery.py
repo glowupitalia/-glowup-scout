@@ -258,8 +258,8 @@ class AbwIntegrationTests(unittest.TestCase):
         self.assertEqual([scenarios.cell(1, c).value for c in range(1, len(SCENARIO_COLUMNS) + 1)], SCENARIO_COLUMNS)
         self.assertEqual({scenarios.cell(r, 5).value for r in range(2, 8)}, {"ABW"})
         self.assertFalse(scenarios["I2"].protection.locked)
-        self.assertIn("MATCH($AB2", scenarios["N2"].value)
-        self.assertEqual(scenarios["X2"].value, "core")
+        self.assertIn("MATCH($AC2", scenarios["N2"].value)
+        self.assertEqual(scenarios["Y2"].value, "core")
         self.assertEqual(workbook["Dati"].sheet_state, "hidden")
 
     def test_abw_scenarios_do_not_multiply_amazon_calls(self):
