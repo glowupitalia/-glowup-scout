@@ -60,7 +60,10 @@ def finalization_state(
 ) -> dict:
     persisted = store.summary(job_id)
     compact = checkpoints.load(job_id)
-    state = {**persisted, **compact, "job_id": job_id}
+    state = {
+        **persisted, **compact, **store.notification_summary(job_id),
+        "job_id": job_id,
+    }
     if int(state.get("selected_count") or 0) <= 0:
         raise ValueError("Discovery finalization has no persisted selection")
     if int(state.get("catalog_pending_count") or 0) != 0:

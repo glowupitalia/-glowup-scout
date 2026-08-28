@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from openpyxl import load_workbook
 
-from discovery_finalize_worker import export_offline, finalize
+from discovery_finalize_worker import export_offline, finalization_state, finalize
 from discovery_incremental import (
     DiscoveryIncrementalStore,
     IncrementalCandidateCollection,
@@ -38,6 +38,7 @@ def completed_fixture(job_id="job"):
         "is_final_result": True,
         "scenario_roles": {"scenario_raccomandato": "scenario-1"},
         "combination_roles": {"recommended_combination": "combination-1"},
+        "recommended_combination": combination,
         "scenarios": [scenario],
         "amazon_listings": [{
             "asin": "B012345678", "amazon_observation_id": observation_id,
@@ -102,6 +103,24 @@ class FinalizationTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT 1").fetchone()[0], 1)
         with self.assertRaises(sqlite3.ProgrammingError):
             connection.execute("SELECT 1")
+
+    def test_notification_summary_is_bounded_and_authoritative(self):
+        summary = self.store.notification_summary("job")
+        self.assertEqual(summary["selected_count"], 1)
+        self.assertEqual(summary["final_opportunity_count"], 1)
+        self.assertEqual(summary["combination_count"], 1)
+        self.assertEqual(summary["fee_target_count"], 1)
+        self.assertEqual(summary["fee_valid_count"], 1)
+        self.assertEqual(summary["fee_unavailable_count"], 0)
+        self.assertEqual(summary["bsr_passed_count"], 1)
+        self.assertEqual(summary["best_opportunity"]["supplier"], "umma")
+        self.assertEqual(summary["best_opportunity"]["score"], 81)
+
+    def test_finalization_state_includes_persisted_notification_projection(self):
+        state = finalization_state("job", self.store, self.checkpoints)
+        self.assertNotIn("results", state)
+        self.assertEqual(state["final_opportunity_count"], 1)
+        self.assertEqual(state["best_opportunity"]["asin"], "B012345678")
 
     def test_export_iterator_hydrates_combinations_and_closes_every_batch(self):
         opened = []

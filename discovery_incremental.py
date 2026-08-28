@@ -847,6 +847,119 @@ class DiscoveryIncrementalStore:
                 ).fetchone()[0],
             }
 
+    def notification_summary(self, job_id: str) -> dict[str, Any]:
+        """Return a bounded, authoritative terminal-notification projection.
+
+        Terminal email rendering must not depend on an in-memory ``results``
+        collection.  All counts come directly from the incremental job tables,
+        and only the single best final product (plus its recommended scenario)
+        is decoded.
+        """
+        self.initialize()
+        with self._connect() as connection:
+            job = connection.execute(
+                """SELECT selected_count FROM discovery_incremental_jobs
+                   WHERE job_id=?""", (job_id,),
+            ).fetchone()
+            if not job:
+                raise KeyError(job_id)
+            listing = connection.execute(
+                """SELECT COUNT(*) listing_count,
+                          COUNT(DISTINCT canonical_identifier) product_count
+                   FROM discovery_listings WHERE job_id=?""", (job_id,),
+            ).fetchone()
+            observation = connection.execute(
+                """SELECT COUNT(*) target_count,
+                          SUM(CASE WHEN json_extract(observation_json,'$.fee_status')='valid'
+                                   THEN 1 ELSE 0 END) valid_count,
+                          SUM(CASE WHEN json_extract(observation_json,'$.fee_status')='unavailable'
+                                   THEN 1 ELSE 0 END) unavailable_count,
+                          SUM(CASE WHEN json_extract(observation_json,'$.reference_price') IS NOT NULL
+                                   THEN 1 ELSE 0 END) pricing_valid_count,
+                          SUM(CASE WHEN json_extract(observation_json,'$.bsr_beauty') IS NOT NULL
+                                   THEN 1 ELSE 0 END) beauty_count
+                   FROM discovery_observations WHERE job_id=?""", (job_id,),
+            ).fetchone()
+            combination_count = connection.execute(
+                "SELECT COUNT(*) FROM discovery_combinations WHERE job_id=?", (job_id,),
+            ).fetchone()[0]
+            final_count = connection.execute(
+                """SELECT COUNT(*) FROM discovery_job_items
+                   WHERE job_id=? AND json_extract(product_json,'$.is_final_result')=1""",
+                (job_id,),
+            ).fetchone()[0]
+            best = connection.execute(
+                """SELECT canonical_identifier,product_json
+                   FROM discovery_job_items
+                   WHERE job_id=? AND json_extract(product_json,'$.is_final_result')=1
+                   ORDER BY
+                     CAST(json_extract(product_json,'$.recommended_combination.score') AS REAL) DESC,
+                     CAST(json_extract(product_json,'$.recommended_combination.margin_percent') AS REAL) DESC,
+                     CAST(json_extract(product_json,'$.recommended_combination.profit') AS REAL) DESC,
+                     CAST(json_extract(product_json,'$.recommended_combination.cost_gross_unit_eur') AS REAL) ASC,
+                     sequence_no ASC
+                   LIMIT 1""", (job_id,),
+            ).fetchone()
+            best_opportunity = None
+            if best:
+                product = json.loads(best["product_json"])
+                combination = dict(product.get("recommended_combination") or {})
+                scenario = None
+                scenario_id = combination.get("scenario_id") or product.get(
+                    "best_purchase_scenario"
+                )
+                if scenario_id:
+                    scenario_row = connection.execute(
+                        """SELECT scenario_json FROM discovery_purchase_scenarios
+                           WHERE job_id=? AND canonical_identifier=? AND scenario_id=?""",
+                        (job_id, best["canonical_identifier"], str(scenario_id)),
+                    ).fetchone()
+                    if scenario_row:
+                        scenario = json.loads(scenario_row[0])
+                scenario = scenario or {}
+                best_opportunity = {
+                    "product": product.get("amazon_title") or product.get("title"),
+                    "canonical_ean": product.get("canonical_ean")
+                    or best["canonical_identifier"],
+                    "asin": combination.get("asin") or product.get("asin"),
+                    "supplier": combination.get("supplier") or scenario.get("supplier"),
+                    "scenario": combination.get("scenario_label")
+                    or scenario.get("scenario_label"),
+                    "cost_gross_unit_eur": combination.get("cost_gross_unit_eur")
+                    or scenario.get("cost_gross_unit_eur"),
+                    "price_reference": combination.get("price_reference")
+                    or product.get("reference_price"),
+                    "margin_percent": combination.get("margin_percent")
+                    or product.get("margin_percent"),
+                    "profit": combination.get("profit"),
+                    "score": combination.get("score")
+                    if combination.get("score") is not None else product.get("score"),
+                    "combination_id": combination.get("combination_id"),
+                }
+        target = int(observation["target_count"] or 0)
+        valid = int(observation["valid_count"] or 0)
+        unavailable = int(observation["unavailable_count"] or 0)
+        return {
+            "selected_count": int(job["selected_count"]),
+            "sampled_identifier_count": int(job["selected_count"]),
+            "amazon_found_count": int(listing["product_count"] or 0),
+            "listing_count": int(listing["listing_count"] or 0),
+            "observation_count": target,
+            "pricing_valid_count": int(observation["pricing_valid_count"] or 0),
+            "beauty_count": int(observation["beauty_count"] or 0),
+            "bsr_passed_count": int(observation["beauty_count"] or 0),
+            "competition_passed_count": target,
+            "fee_target_count": target,
+            "fee_valid_count": valid,
+            "fee_unavailable_count": unavailable,
+            "fee_pending_count": max(0, target - valid - unavailable),
+            "fee_coverage_partial": unavailable > 0,
+            "combination_count": int(combination_count),
+            "final_opportunity_count": int(final_count),
+            "final_products": int(final_count),
+            "best_opportunity": best_opportunity,
+        }
+
     def definitive_catalog_statuses(self, job_id: str) -> dict[str, str]:
         with self._connect() as connection:
             return {

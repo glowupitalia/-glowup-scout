@@ -424,7 +424,9 @@ def prepare_discovery_attachment(
     export_state = dict(state.get("export_state") or {})
     if not job_id or str(runtime.get("job_id") or "") != job_id:
         return AttachmentDecision("invalid", error="Export non correlato al job")
-    if str(runtime.get("status") or "") != "completed":
+    if str(runtime.get("status") or "") not in {
+        "completed", "export_complete", "notification_pending",
+    }:
         return AttachmentDecision("invalid", error="Job runtime non completato")
     if export_state.get("job_id") and str(export_state["job_id"]) != job_id:
         return AttachmentDecision("invalid", error="Export state non coerente con job_id")
@@ -480,7 +482,10 @@ def _content_with_attachment_note(
 ) -> NotificationContent:
     notes = {
         "attached": "Il file Excel completo della Discovery è allegato a questa email.",
-        "skipped_too_large": "File Excel non allegato perché supera il limite email configurato.",
+        "skipped_too_large": (
+            "Il file Excel è disponibile dalla UI Scout ma non è stato allegato "
+            "perché supera il limite email configurato."
+        ),
         "unavailable": "File Excel non allegato perché non disponibile.",
         "invalid": "File Excel non allegato perché non ha superato la validazione.",
     }
@@ -572,15 +577,52 @@ def _summary_rows(state: dict[str, Any]) -> list[tuple[str, object]]:
         ("Durata", _duration(state)),
         ("Supplier", " · ".join(str(x).upper() for x in state.get("selected_suppliers") or []) or "—"),
         ("EAN analizzati", int(analyzed or 0)),
-        ("Prodotti trovati Amazon", int(funnel.get("amazon_found") or 0)),
-        ("Listing Amazon", int(funnel.get("amazon_listings_found") or 0)),
-        ("Beauty", int(funnel.get("beauty_listings") or funnel.get("beauty_valid") or 0)),
-        ("BSR nel range", int(funnel.get("bsr_passed_listings") or funnel.get("bsr_passed") or 0)),
-        ("Pricing validi", int(funnel.get("pricing_valid") or _pricing_valid(state))),
-        ("Concorrenza valida", int(funnel.get("competition_passed_listings") or funnel.get("competition_passed") or 0)),
-        ("Fee valide", int(funnel.get("fee_valid_listings") or funnel.get("fee_valid") or 0)),
-        ("Combinazioni valutate", int(funnel.get("combinations_evaluated") or 0)),
-        ("Opportunità finali", len(state.get("results") or [])),
+        ("Prodotti trovati Amazon", int(
+            state.get("amazon_found_count")
+            if state.get("amazon_found_count") is not None
+            else funnel.get("amazon_found") or 0
+        )),
+        ("Listing Amazon", int(
+            state.get("listing_count")
+            if state.get("listing_count") is not None
+            else funnel.get("amazon_listings_found") or 0
+        )),
+        ("Beauty", int(
+            state.get("beauty_count")
+            if state.get("beauty_count") is not None
+            else funnel.get("beauty_listings") or funnel.get("beauty_valid") or 0
+        )),
+        ("BSR nel range", int(
+            state.get("bsr_passed_count")
+            if state.get("bsr_passed_count") is not None
+            else funnel.get("bsr_passed_listings") or funnel.get("bsr_passed") or 0
+        )),
+        ("Pricing validi", int(
+            state.get("pricing_valid_count")
+            if state.get("pricing_valid_count") is not None
+            else funnel.get("pricing_valid") or _pricing_valid(state)
+        )),
+        ("Concorrenza valida", int(
+            state.get("competition_passed_count")
+            if state.get("competition_passed_count") is not None
+            else funnel.get("competition_passed_listings")
+            or funnel.get("competition_passed") or 0
+        )),
+        ("Fee valide", int(
+            state.get("fee_valid_count")
+            if state.get("fee_valid_count") is not None
+            else funnel.get("fee_valid_listings") or funnel.get("fee_valid") or 0
+        )),
+        ("Combinazioni valutate", int(
+            state.get("combination_count")
+            if state.get("combination_count") is not None
+            else funnel.get("combinations_evaluated") or 0
+        )),
+        ("Opportunità finali", int(
+            state.get("final_opportunity_count")
+            if state.get("final_opportunity_count") is not None
+            else len(state.get("results") or [])
+        )),
     ]
     target = int(state.get("fee_target_count") or funnel.get("fee_target_count") or 0)
     unavailable = int(
@@ -596,6 +638,21 @@ def _summary_rows(state: dict[str, Any]) -> list[tuple[str, object]]:
 
 
 def _best_opportunity(state: dict[str, Any]):
+    persisted = state.get("best_opportunity")
+    if isinstance(persisted, dict) and persisted:
+        return [
+            ("Prodotto", persisted.get("product") or "—"),
+            ("EAN", persisted.get("canonical_ean") or "—"),
+            ("ASIN", persisted.get("asin") or "—"),
+            ("Supplier", str(persisted.get("supplier") or "—").upper()),
+            ("Scenario", persisted.get("scenario") or "—"),
+            ("Costo", _money(persisted.get("cost_gross_unit_eur"))),
+            ("Prezzo Amazon", _money(persisted.get("price_reference"))),
+            ("Margine", _percent(persisted.get("margin_percent"))),
+            ("Utile", _money(persisted.get("profit"))),
+            ("Score", persisted.get("score")
+             if persisted.get("score") is not None else "—"),
+        ]
     product = next(iter(state.get("results") or []), None)
     if not product:
         return None
@@ -644,6 +701,18 @@ def discovery_terminal_event(state: dict[str, Any], *, runtime: dict[str, Any] |
     status = str(state.get("status") or "").lower()
     runtime = runtime or {}
     if status == "completed":
+        if state.get("final_opportunity_count") is not None:
+            return (
+                DISCOVERY_COMPLETED
+                if int(state.get("final_opportunity_count") or 0) > 0
+                else DISCOVERY_COMPLETED_ZERO_RESULTS
+            )
+        if state.get("final_products") is not None:
+            return (
+                DISCOVERY_COMPLETED
+                if int(state.get("final_products") or 0) > 0
+                else DISCOVERY_COMPLETED_ZERO_RESULTS
+            )
         return (
             DISCOVERY_COMPLETED if state.get("results")
             else DISCOVERY_COMPLETED_ZERO_RESULTS
@@ -784,6 +853,20 @@ def send_discovery_terminal_notification(
     event_type = discovery_terminal_event(state, runtime=runtime)
     if event_type is None:
         return None
+    if event_type in {DISCOVERY_COMPLETED, DISCOVERY_COMPLETED_ZERO_RESULTS}:
+        # Completion and zero-result completion are two renderings of the same
+        # terminal business event.  A corrected classification must never
+        # create a second email for the same job after either variant exists.
+        outbox = NotificationOutbox(database_path)
+        for existing_type in (
+            event_type,
+            DISCOVERY_COMPLETED
+            if event_type == DISCOVERY_COMPLETED_ZERO_RESULTS
+            else DISCOVERY_COMPLETED_ZERO_RESULTS,
+        ):
+            existing = outbox.get(str(state.get("job_id") or ""), existing_type)
+            if existing is not None:
+                return existing
     render_state = dict(state)
     if runtime and "resumable" in runtime:
         render_state["resumable"] = bool(runtime["resumable"])
@@ -801,6 +884,38 @@ def send_discovery_terminal_notification(
         max_attempts=max_attempts, sleep_func=sleep_func,
         attachment=decision.attachment, attachment_metadata=decision.metadata(),
     )
+
+
+def preview_discovery_terminal_notification(
+    state: dict[str, Any], *, runtime: dict[str, Any] | None = None,
+    config: EmailConfig | None = None,
+    allowed_attachment_roots: Sequence[str | Path] | None = None,
+) -> dict[str, Any] | None:
+    """Render and validate a terminal notification without outbox or SMTP I/O."""
+    event_type = discovery_terminal_event(state, runtime=runtime)
+    if event_type is None:
+        return None
+    render_state = dict(state)
+    if runtime and "resumable" in runtime:
+        render_state["resumable"] = bool(runtime["resumable"])
+    config = config or EmailConfig.from_runtime()
+    decision = prepare_discovery_attachment(
+        render_state, runtime, max_attachment_mb=config.max_attachment_mb,
+        allowed_roots=allowed_attachment_roots,
+    )
+    content = _content_with_attachment_note(
+        render_discovery_notification(render_state, event_type), decision,
+    )
+    return {
+        "event_type": event_type,
+        "subject": content.subject,
+        "text": content.text,
+        "html": content.html,
+        "attachment_status": decision.status,
+        "attachment_name": decision.name,
+        "attachment_size": decision.size,
+        "attachment_error": decision.error,
+    }
 
 
 def send_notification(

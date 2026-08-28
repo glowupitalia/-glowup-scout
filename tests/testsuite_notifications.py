@@ -21,6 +21,7 @@ from notifications import (
     SMTPEmailTransport,
     discovery_terminal_event,
     prepare_discovery_attachment,
+    preview_discovery_terminal_notification,
     render_discovery_notification,
     send_discovery_terminal_notification,
 )
@@ -268,6 +269,93 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(content.event_type, DISCOVERY_COMPLETED_ZERO_RESULTS)
         self.assertIn("senza opportunità", content.subject)
         self.assertIn("Opportunità finali: 0", content.text)
+
+    def test_persisted_final_count_is_authoritative_without_results_collection(self):
+        state = completed_state()
+        state.pop("results")
+        state.update({
+            "final_opportunity_count": 143,
+            "combination_count": 19_928,
+            "fee_target_count": 843,
+            "fee_valid_count": 833,
+            "fee_unavailable_count": 10,
+            "bsr_passed_count": 843,
+            "best_opportunity": {
+                "product": "Best product", "canonical_ean": "8809562191179",
+                "asin": "B012345678", "supplier": "umma",
+                "scenario": "U-Quick", "cost_gross_unit_eur": "8.06",
+                "price_reference": "22.90", "margin_percent": "24.50",
+                "profit": "5.61", "score": 81,
+            },
+        })
+        content = render_discovery_notification(state)
+        self.assertEqual(content.event_type, DISCOVERY_COMPLETED)
+        self.assertIn("Opportunità finali: 143", content.text)
+        self.assertIn("Combinazioni valutate: 19928", content.text)
+        self.assertIn("Copertura Fee Amazon: 833/843", content.text)
+        self.assertIn("BSR nel range: 843", content.text)
+        self.assertIn("MIGLIORE OPPORTUNITÀ", content.text)
+        self.assertIn("Best product", content.text)
+
+    def test_explicit_zero_persisted_count_preserves_genuine_zero_result_event(self):
+        state = completed_state()
+        state["final_opportunity_count"] = 0
+        self.assertEqual(
+            discovery_terminal_event(state), DISCOVERY_COMPLETED_ZERO_RESULTS,
+        )
+
+    def test_notification_pending_runtime_accepts_valid_export_and_size_policy(self):
+        state = completed_state()
+        path, runtime, root = self.export_for(state)
+        runtime["status"] = "notification_pending"
+        attached = prepare_discovery_attachment(
+            state, runtime, max_attachment_mb=15, allowed_roots=[root],
+        )
+        skipped = prepare_discovery_attachment(
+            state, runtime, max_attachment_mb=0.000001, allowed_roots=[root],
+        )
+        self.assertEqual(attached.status, "attached")
+        self.assertEqual(skipped.status, "skipped_too_large")
+        self.assertEqual(skipped.size, path.stat().st_size)
+
+    def test_preview_is_pure_and_reports_too_large_without_outbox(self):
+        state = completed_state()
+        state["final_opportunity_count"] = 1
+        path, runtime, root = self.export_for(state)
+        runtime["status"] = "notification_pending"
+        preview = preview_discovery_terminal_notification(
+            state, runtime=runtime,
+            config=replace(configured_email(), max_attachment_mb=0.000001),
+            allowed_attachment_roots=[root],
+        )
+        self.assertEqual(preview["event_type"], DISCOVERY_COMPLETED)
+        self.assertEqual(preview["attachment_status"], "skipped_too_large")
+        self.assertEqual(preview["attachment_size"], path.stat().st_size)
+        self.assertIn("disponibile dalla UI Scout", preview["text"])
+        self.assertIsNone(NotificationOutbox(self.database).get("job-1"))
+
+    def test_completion_variants_share_one_terminal_notification_identity(self):
+        transport = FakeTransport()
+        zero = completed_state(False)
+        first = send_discovery_terminal_notification(
+            zero, database_path=self.database,
+            config=configured_email(), transport=transport,
+        )
+        corrected = completed_state()
+        corrected["final_opportunity_count"] = 1
+        second = send_discovery_terminal_notification(
+            corrected, database_path=self.database,
+            config=configured_email(), transport=transport,
+        )
+        self.assertEqual(first["event_type"], DISCOVERY_COMPLETED_ZERO_RESULTS)
+        self.assertEqual(second["event_type"], DISCOVERY_COMPLETED_ZERO_RESULTS)
+        self.assertEqual(len(transport.messages), 1)
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM notification_outbox WHERE entity_id='job-1'"
+                ).fetchone()[0], 1,
+            )
 
     def test_completed_partial_fee_coverage_warns_without_becoming_failure(self):
         state = completed_state()
