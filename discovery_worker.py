@@ -90,27 +90,82 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
         raise RuntimeError(f"Discovery job {job_id} is already owned by another worker")
     incremental_store = DiscoveryIncrementalStore()
     amazon_cache = DiscoveryAmazonCache(incremental_store)
-    incremental = incremental_store.has_job(job_id)
-    state = (
-        LightweightCheckpointStore().load(job_id)
-        if incremental else checkpoint_store.load(job_id)
-    )
-    if (
-        not incremental and state.get("phase") == "initialized"
-        and state.get("selected_suppliers")
-        and Path(checkpoint_store.root) == Path("data/discovery_jobs")
-    ):
-        prepared = prepare_incremental_job(
-            state, supplier_store=SupplierCatalogStore(),
-            rotation_store=DiscoveryRotationStore(),
-            amazon_cache=amazon_cache,
+    resource_governor = DiscoveryResourceGovernor(database_path=incremental_store.path)
+
+    def preparation_progress(phase, current, total):
+        registry.heartbeat(
+            job_id, pid=pid, phase=phase, current=current, total=total,
         )
-        incremental_store.create_job(
-            prepared["metadata"], prepared["candidates"],
+
+    try:
+        incremental = incremental_store.has_job(job_id)
+        incremental_state = incremental_store.summary(job_id) if incremental else None
+        preparing = bool(
+            incremental_state
+            and (
+                incremental_state.get("phase") == "preparing"
+                or (
+                    incremental_state.get("prepared_total")
+                    and not incremental_state.get("preparation_complete")
+                )
+            )
         )
-        state = incremental_store.summary(job_id)
-        LightweightCheckpointStore().save(state)
-        incremental = True
+        state = (
+            checkpoint_store.load(job_id)
+            if not incremental or preparing
+            else LightweightCheckpointStore().load(job_id)
+        )
+        if (
+            (not incremental or preparing) and state.get("phase") == "initialized"
+            and state.get("selected_suppliers")
+            and Path(checkpoint_store.root) == Path("data/discovery_jobs")
+        ):
+            prepared_current = int(
+                (incremental_state or {}).get("prepared_current")
+                or (incremental_state or {}).get("selected_count") or 0
+            )
+            preparation_progress("preparing", prepared_current, int(
+                state.get("progress_total") or state.get("sampled_identifier_count") or 0
+            ))
+            prepared = prepare_incremental_job(
+                state, supplier_store=SupplierCatalogStore(),
+                rotation_store=DiscoveryRotationStore(),
+                amazon_cache=amazon_cache, start_sequence=prepared_current,
+                progress=preparation_progress, resource_governor=resource_governor,
+            )
+            incremental_store.create_job(
+                prepared["metadata"], prepared["candidates"],
+                progress=preparation_progress, resource_governor=resource_governor,
+            )
+            state = incremental_store.summary(job_id)
+            LightweightCheckpointStore().save(state)
+            incremental = True
+    except ResourcePause as exc:
+        metrics = exc.snapshot.as_dict()
+        if incremental_store.has_job(job_id):
+            incremental_store.record_resource_event(
+                job_id, "hard", exc.reason, {**metrics, "threshold": exc.threshold},
+            )
+            incremental_store.set_phase(job_id, "resource_paused", status="resource_paused")
+        registry.resource_pause(
+            job_id, reason=exc.reason, metrics=metrics, phase="preparing",
+        )
+        logger.warning(
+            "DISCOVERY PREPARATION RESOURCE PAUSED | job_id=%s reason=%s",
+            job_id, exc.reason,
+        )
+        return {
+            "job_id": job_id, "status": "resource_paused", "phase": "preparing",
+            "resource_pause": {
+                "reason": exc.reason, "observed": metrics,
+                "threshold": exc.threshold, "resumable": True,
+            },
+        }
+    except Exception as exc:
+        logger.exception("DISCOVERY PREPARATION FAILED | job_id=%s", job_id)
+        registry.fail(job_id, str(exc))
+        raise
+
     token_provider = RefreshingTokenProvider(get_access_token)
 
     def catalog_batch(gtins, current_job_id, products=None):
@@ -145,9 +200,7 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
                 rotation_store=DiscoveryRotationStore(),
                 amazon_cache=amazon_cache,
                 progress=progress,
-                resource_governor=DiscoveryResourceGovernor(
-                    database_path=incremental_store.path,
-                ),
+                resource_governor=resource_governor,
             )
         else:
             result = run_discovery(

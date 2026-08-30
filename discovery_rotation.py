@@ -525,6 +525,62 @@ class DiscoveryRotationStore:
         }
         return selected_rows, metadata
 
+    def frozen_selection(
+        self, job_id: str, selected_suppliers: Iterable[str],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+        """Load an existing job selection without resyncing the live universe."""
+        self.initialize()
+        selected = normalize_rotation_suppliers(selected_suppliers)
+        scope = rotation_scope_key(selected)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT selection.canonical_identifier,selection.cycle_id,
+                          item.supplier_membership_json
+                     FROM discovery_rotation_selections selection
+                     JOIN discovery_rotation_items item
+                       ON item.scope_key=selection.scope_key
+                      AND item.canonical_identifier=selection.canonical_identifier
+                    WHERE selection.job_id=? AND selection.scope_key=?
+                    ORDER BY selection.canonical_identifier""",
+                (job_id, scope),
+            ).fetchall()
+            if not rows:
+                return None
+            cycle = int(rows[0]["cycle_id"])
+            universe = connection.execute(
+                "SELECT COUNT(*) FROM discovery_rotation_items WHERE scope_key=? AND active=1",
+                (scope,),
+            ).fetchone()[0]
+            analyzed_before = connection.execute(
+                """SELECT COUNT(*) FROM discovery_rotation_items
+                   WHERE scope_key=? AND active=1 AND last_analyzed_cycle=?""",
+                (scope, cycle),
+            ).fetchone()[0]
+        candidates = []
+        for row in rows:
+            identifier = str(row["canonical_identifier"])
+            membership = tuple(json.loads(row["supplier_membership_json"] or "[]"))
+            candidates.append({
+                "canonical_ean": identifier, "gtin": identifier,
+                "scenarios": [{"supplier": supplier} for supplier in membership],
+                "suppliers": list(membership),
+            })
+        metadata = {
+            "rotation_scope": scope, "rotation_cycle_id": cycle,
+            "rotation_universe_count": int(universe),
+            "rotation_analyzed_before_run": int(analyzed_before),
+            "rotation_selected_identifiers": [
+                row["canonical_identifier"] for row in rows
+            ],
+            "rotation_analyzed_this_run": 0,
+            "rotation_remaining_after_run": max(0, int(universe) - int(analyzed_before)),
+            "run_budget": "all", "sampled_identifier_count": len(candidates),
+            "sampling_strategy": "automatic_amazon_freshness_v1",
+            "rotation_selection_mode": "current_universe",
+            "rotation_selection_frozen": True,
+        }
+        return candidates, metadata
+
     def commit_catalog_results(
         self, job_id: str, statuses: dict[str, Any], *, now: str | None = None,
     ) -> dict[str, Any]:

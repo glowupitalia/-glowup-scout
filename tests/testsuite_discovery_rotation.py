@@ -87,6 +87,19 @@ class DiscoveryRotationTests(unittest.TestCase):
         self.assertEqual(self.ids(first), self.ids(resumed))
         self.assertEqual(metadata["rotation_cycle_id"], resumed_metadata["rotation_cycle_id"])
 
+    def test_frozen_selection_does_not_resync_changed_live_universe(self):
+        first, metadata = self.store.select_current_universe(
+            "job-1", self.rows, ["abw"], None,
+        )
+        frozen = self.store.frozen_selection("job-1", ["abw"])
+        self.assertIsNotNone(frozen)
+        resumed, resumed_metadata = frozen
+        self.assertEqual(self.ids(resumed), self.ids(first))
+        self.assertEqual(
+            resumed_metadata["rotation_cycle_id"], metadata["rotation_cycle_id"],
+        )
+        self.assertTrue(resumed_metadata["rotation_selection_frozen"])
+
     def test_new_product_has_priority_over_never_analyzed(self):
         initial = self.rows[:6]
         first, _ = self.store.select("job-1", initial, ["abw"], 2)

@@ -305,6 +305,10 @@ CREATE INDEX IF NOT EXISTS idx_supplier_catalog_products_ean
 ON supplier_catalog_products (supplier, canonical_ean);
 CREATE INDEX IF NOT EXISTS idx_supplier_catalog_products_gtin
 ON supplier_catalog_products (supplier, canonical_gtin);
+CREATE INDEX IF NOT EXISTS idx_supplier_catalog_products_run_ean
+ON supplier_catalog_products (run_id, canonical_ean);
+CREATE INDEX IF NOT EXISTS idx_supplier_catalog_products_run_gtin
+ON supplier_catalog_products (run_id, canonical_gtin);
 CREATE INDEX IF NOT EXISTS idx_supplier_catalog_products_fingerprint
 ON supplier_catalog_products (run_id, catalog_fingerprint);
 
@@ -341,6 +345,8 @@ CREATE INDEX IF NOT EXISTS idx_supplier_catalog_scenarios_ean
 ON supplier_catalog_scenarios (supplier, canonical_ean);
 CREATE INDEX IF NOT EXISTS idx_supplier_catalog_scenarios_product
 ON supplier_catalog_scenarios (run_id, canonical_product_key);
+CREATE INDEX IF NOT EXISTS idx_supplier_catalog_scenarios_product_order
+ON supplier_catalog_scenarios (run_id, canonical_product_key, scenario_id);
 
 CREATE TABLE IF NOT EXISTS supplier_catalog_active_generations (
     supplier TEXT PRIMARY KEY,
@@ -1197,6 +1203,137 @@ class SupplierCatalogStore:
                     "coverage_complete": bool(active["coverage_complete"]),
                 })
             return candidates
+
+    def active_candidate_generation_metadata(
+        self, supplier: str,
+    ) -> dict[str, Any] | None:
+        """Load immutable candidate-source metadata once for a preparation run."""
+        supplier = _validate_supplier(supplier)
+        if supplier == "qogita":
+            return self.serving_generation_metadata("qogita")
+        self.initialize()
+        with _connect(self.path) as connection:
+            row = connection.execute(
+                """SELECT run.run_id,run.completed_at,run.coverage_type,
+                          run.coverage_complete
+                     FROM supplier_catalog_active_generations active
+                     JOIN supplier_catalog_runs run ON run.run_id=active.run_id
+                    WHERE active.supplier=? AND run.status='success'""",
+                (supplier,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def iter_active_candidates_for_identifiers(
+        self, supplier: str, identifiers: Iterable[str], *, batch_size: int = 500,
+        generation_metadata: dict[str, Any] | None = None,
+    ):
+        """Yield active candidates using bounded, indexed supplier batches.
+
+        The direct-EAN method above intentionally remains point-oriented.  Full
+        Discovery preparation uses this set-oriented path so generation and
+        serving metadata are not reloaded for every identifier.
+        """
+        supplier = _validate_supplier(supplier)
+        metadata = generation_metadata or self.active_candidate_generation_metadata(supplier)
+        if not metadata:
+            return
+        values = iter(identifiers)
+        with _connect(self.path) as connection:
+            while True:
+                requested = []
+                try:
+                    for _ in range(max(1, int(batch_size))):
+                        requested.append(str(next(values)))
+                except StopIteration:
+                    pass
+                if not requested:
+                    return
+                requested_by_gtin = {
+                    canonical_gtin14(value): value for value in requested
+                    if canonical_gtin14(value) is not None
+                }
+                comparisons = sorted(requested_by_gtin)
+                if not comparisons:
+                    continue
+                placeholders = ",".join("?" for _ in comparisons)
+                if supplier == "qogita":
+                    run_id = str(metadata["source_generation_id"])
+                    serving_id = str(metadata["serving_generation_id"])
+                    product_rows = connection.execute(
+                        f"""SELECT product.*
+                              FROM supplier_catalog_products AS product
+                                   INDEXED BY idx_supplier_catalog_products_run_gtin
+                              JOIN qogita_serving_memberships membership
+                                ON membership.serving_generation_id=?
+                               AND membership.canonical_product_key=product.canonical_product_key
+                             WHERE product.run_id=?
+                               AND product.canonical_gtin IN ({placeholders})
+                             ORDER BY product.canonical_product_key""",
+                        (serving_id, run_id, *comparisons),
+                    ).fetchall()
+                else:
+                    run_id = str(metadata["run_id"])
+                    product_rows = connection.execute(
+                        f"""SELECT * FROM supplier_catalog_products
+                             WHERE run_id=? AND canonical_gtin IN ({placeholders})
+                             ORDER BY canonical_product_key""",
+                        (run_id, *comparisons),
+                    ).fetchall()
+                if not product_rows:
+                    continue
+                product_keys = [str(row["canonical_product_key"]) for row in product_rows]
+                key_placeholders = ",".join("?" for _ in product_keys)
+                scenario_rows = connection.execute(
+                    f"""SELECT canonical_product_key,payload_json
+                           FROM supplier_catalog_scenarios
+                          WHERE run_id=?
+                            AND canonical_product_key IN ({key_placeholders})
+                          ORDER BY canonical_product_key,scenario_id""",
+                    (run_id, *product_keys),
+                ).fetchall()
+                scenarios_by_key: dict[str, list[dict[str, Any]]] = {}
+                for row in scenario_rows:
+                    scenarios_by_key.setdefault(
+                        str(row["canonical_product_key"]), [],
+                    ).append(normalize_purchase_scenario(json.loads(row["payload_json"])))
+                for product_row in product_rows:
+                    comparison = canonical_gtin14(product_row["canonical_gtin"])
+                    identifier = requested_by_gtin.get(comparison)
+                    scenarios = scenarios_by_key.get(
+                        str(product_row["canonical_product_key"]), [],
+                    )
+                    if not identifier or not scenarios:
+                        continue
+                    scenarios.sort(key=lambda row: (
+                        int(row.get("scenario_order") or 0),
+                        str(row.get("scenario_id") or ""),
+                    ))
+                    candidate = {
+                        "product_key": scenarios[0].get("product_key"),
+                        "canonical_ean": identifier,
+                        "identifier_type": product_row["identifier_type"],
+                        "brand": product_row["brand"],
+                        "title": product_row["title"],
+                        "volume_value": product_row["size_value"],
+                        "volume_unit": product_row["size_unit"],
+                        "pack_count": product_row["pack_count"],
+                        "scenarios": scenarios,
+                        "supplier_catalog_run_id": run_id,
+                        "supplier_catalog_completed_at": (
+                            metadata.get("created_at") if supplier == "qogita"
+                            else metadata.get("completed_at")
+                        ),
+                        "coverage_type": (
+                            metadata.get("product_catalog_coverage_type")
+                            if supplier == "qogita" else metadata.get("coverage_type")
+                        ),
+                        "coverage_complete": True if supplier == "qogita" else bool(
+                            metadata.get("coverage_complete")
+                        ),
+                    }
+                    if supplier == "qogita":
+                        candidate["supplier_serving_generation_id"] = serving_id
+                    yield candidate
 
     def _serving_candidates_for_identifier(
         self, identifier: str, comparison: str,

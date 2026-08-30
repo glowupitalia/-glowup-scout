@@ -832,9 +832,14 @@ def _render_discovery_runtime(job_id):
         total = int(runtime.get("progress_total") or 0)
         progress_value = min(1.0, current / total) if total else 0.02
         st.progress(progress_value)
+        phase = str(runtime.get("phase") or "preparazione")
+        progress_label = (
+            "Preparazione Discovery"
+            if phase.startswith("preparing") else "Prodotti valutati"
+        )
         st.caption(
-            f"Prodotti valutati: {current:,} / {total:,} · "
-            f"fase {str(runtime.get('phase') or 'preparazione').replace('_', ' ')} · "
+            f"{progress_label}: {current:,} / {total:,} · "
+            f"fase {phase.replace('_', ' ')} · "
             f"ultimo aggiornamento {runtime.get('updated_at') or '—'}"
             .replace(",", ".")
         )

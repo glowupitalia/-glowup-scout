@@ -22,6 +22,7 @@ from qogita_serving import QogitaServingStore
 from supplier_catalog import (
     SupplierCatalogGeneration,
     SupplierCatalogStore,
+    canonical_gtin14,
     candidates_to_cache_records,
 )
 
@@ -209,6 +210,42 @@ class DirectLookupTests(unittest.TestCase):
             snapshot["serving_generation_id"],
         )
         self.assertEqual(context["supplier_snapshot_set"]["qogita"]["scenario_count"], 1)
+
+    def test_qogita_batch_lookup_is_bound_to_immutable_serving_snapshot(self):
+        snapshot = publish_qogita_serving(self.store)
+        metadata = self.store.active_candidate_generation_metadata("qogita")
+        rows = list(self.store.iter_active_candidates_for_identifiers(
+            "qogita", [EAN], generation_metadata=metadata,
+        ))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["canonical_ean"], EAN)
+        self.assertEqual(
+            rows[0]["supplier_serving_generation_id"],
+            snapshot["serving_generation_id"],
+        )
+        self.assertEqual(
+            rows[0]["supplier_catalog_run_id"], snapshot["source_generation_id"],
+        )
+        self.assertIsNone(self.store.active_generation_metadata("qogita"))
+        with sqlite3.connect(self.store.path) as connection:
+            plan = " ".join(
+                str(value)
+                for row in connection.execute(
+                    "EXPLAIN QUERY PLAN SELECT product.* "
+                    "FROM supplier_catalog_products AS product "
+                    "INDEXED BY idx_supplier_catalog_products_run_gtin "
+                    "JOIN qogita_serving_memberships membership "
+                    "ON membership.serving_generation_id=? "
+                    "AND membership.canonical_product_key=product.canonical_product_key "
+                    "WHERE product.run_id=? AND product.canonical_gtin IN (?)",
+                    (
+                        snapshot["serving_generation_id"], snapshot["source_generation_id"],
+                        canonical_gtin14(EAN),
+                    ),
+                )
+                for value in row
+            )
+        self.assertIn("idx_supplier_catalog_products_run_gtin", plan)
 
     def test_active_identifier_lookup_handles_zero_padded_gtin(self):
         publish(self.store, "qudo")

@@ -176,6 +176,58 @@ class SupplierCatalogStoreTests(unittest.TestCase):
             self.store.active_identifier_universe(["qudo"]),
             {"total": 2, "eligible": 1},
         )
+
+    def test_batch_candidate_lookup_matches_point_lookup(self):
+        second_ean = "8809562191179"
+        value = generation("qudo")
+        second = candidate("qudo", second_ean)
+        products, scenarios = candidates_to_cache_records([second])
+        value = replace(
+            value,
+            products=(*value.products, *products),
+            scenarios=(*value.scenarios, *scenarios),
+            source_count=2, enumerated_count=2, unique_count=2,
+        )
+        self.publish("qudo", value)
+        metadata = self.store.active_candidate_generation_metadata("qudo")
+        batched = list(self.store.iter_active_candidates_for_identifiers(
+            "qudo", [EAN, second_ean], batch_size=2,
+            generation_metadata=metadata,
+        ))
+        self.assertEqual(
+            {row["canonical_ean"] for row in batched}, {EAN, second_ean},
+        )
+        self.assertEqual(
+            sum(len(row["scenarios"]) for row in batched),
+            sum(len(self.store.active_candidates_for_identifier("qudo", value))
+                for value in (EAN, second_ean)),
+        )
+
+    def test_preparation_lookup_indexes_are_selected_by_sqlite(self):
+        run_id = self.publish("qudo")
+        with sqlite3.connect(self.database) as connection:
+            product_plan = " ".join(
+                str(value)
+                for row in connection.execute(
+                    "EXPLAIN QUERY PLAN SELECT * FROM supplier_catalog_products "
+                    "WHERE run_id=? AND canonical_gtin IN (?)",
+                    (run_id, canonical_gtin14(EAN)),
+                )
+                for value in row
+            )
+            scenario_plan = " ".join(
+                str(value)
+                for row in connection.execute(
+                    "EXPLAIN QUERY PLAN SELECT canonical_product_key,payload_json "
+                    "FROM supplier_catalog_scenarios WHERE run_id=? "
+                    "AND canonical_product_key IN (?) "
+                    "ORDER BY canonical_product_key,scenario_id",
+                    (run_id, product_key(EAN)),
+                )
+                for value in row
+            )
+        self.assertIn("idx_supplier_catalog_products_run_gtin", product_plan)
+        self.assertIn("idx_supplier_catalog_scenarios_product_order", scenario_plan)
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.database = Path(self.temporary.name) / "supplier.sqlite3"

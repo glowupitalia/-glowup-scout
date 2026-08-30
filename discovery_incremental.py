@@ -15,6 +15,7 @@ import sqlite3
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -271,9 +272,19 @@ class DiscoveryIncrementalStore:
         self, metadata: dict[str, Any], candidates: Iterable[dict[str, Any]], *,
         legacy_checkpoint_path: str | Path | None = None,
         legacy_checkpoint_sha256: str | None = None,
+        batch_size: int = 500, progress=None, resource_governor=None,
     ) -> dict[str, Any]:
         self.initialize()
         job_id = str(metadata["job_id"])
+        target_phase = str(metadata.get("phase") or "suppliers_loaded")
+        target_status = str(metadata.get("status") or "running")
+        total = int(metadata.get("prepared_total") or metadata.get("sampled_identifier_count") or 0)
+        compact_metadata = dict(metadata)
+        compact_metadata.pop("rotation_selected_identifiers", None)
+        compact_metadata.update({
+            "phase": "preparing", "status": "running",
+            "prepared_total": total, "preparation_complete": False,
+        })
         observed = _now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -284,20 +295,56 @@ class DiscoveryIncrementalStore:
                    VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(job_id) DO NOTHING""",
                 (
-                    job_id, SCHEMA_VERSION, metadata.get("status", "running"),
-                    metadata.get("phase", "initialized"), _dump(metadata),
+                    job_id, SCHEMA_VERSION, "running", "preparing", _dump(compact_metadata),
                     str(legacy_checkpoint_path) if legacy_checkpoint_path else None,
                     legacy_checkpoint_sha256, metadata.get("created_at") or observed, observed,
                 ),
             )
-            existing = connection.execute(
-                "SELECT COUNT(*) FROM discovery_job_items WHERE job_id=?", (job_id,)
-            ).fetchone()[0]
-            if existing:
+            job = connection.execute(
+                "SELECT * FROM discovery_incremental_jobs WHERE job_id=?", (job_id,),
+            ).fetchone()
+            existing_metadata = json.loads(job["metadata_json"] or "{}")
+            existing = int(job["selected_count"] or 0)
+            completed = int(job["catalog_completed_count"] or 0)
+            preparation_incomplete = (
+                str(job["phase"]) == "preparing"
+                or (
+                    existing_metadata.get("prepared_total")
+                    and not existing_metadata.get("preparation_complete")
+                )
+            )
+            if existing and not preparation_incomplete:
                 connection.commit()
                 return self.summary(job_id, connection=connection)
-            selected = completed = 0
-            for sequence_no, candidate in enumerate(candidates):
+            compact_metadata["prepared_current"] = existing
+            connection.execute(
+                """UPDATE discovery_incremental_jobs
+                      SET status='running',phase='preparing',metadata_json=?,updated_at=?
+                    WHERE job_id=?""",
+                (_dump(compact_metadata), observed, job_id),
+            )
+            connection.commit()
+
+        iterator = iter(candidates)
+        supplied_start = int(metadata.get("preparation_start_sequence") or 0)
+        if existing and supplied_start < existing:
+            for _ in islice(iterator, existing - supplied_start):
+                pass
+        selected = existing
+        while True:
+            if resource_governor is not None:
+                resource_governor.before_next_batch()
+            rows = list(islice(iterator, max(1, int(batch_size))))
+            if not rows:
+                break
+            observed = _now()
+            item_rows = []
+            scenario_rows = []
+            catalog_rows = []
+            listing_rows = []
+            batch_completed = 0
+            for offset, candidate in enumerate(rows):
+                sequence_no = selected + offset
                 identifier = str(
                     candidate.get("canonical_ean") or candidate.get("gtin") or ""
                 ).strip()
@@ -310,53 +357,101 @@ class DiscoveryIncrementalStore:
                 product.pop("amazon_listings", None)
                 product.pop("opportunity_combinations", None)
                 catalog_status = candidate.get("catalog_status")
-                connection.execute(
-                    """INSERT INTO discovery_job_items
-                       (job_id,sequence_no,canonical_identifier,identifier_type,
-                        product_json,catalog_status,pricing_status,fees_status,
-                        terminal_status,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        job_id, sequence_no, identifier, candidate.get("identifier_type"),
-                        _dump(product), catalog_status, candidate.get("pricing_status"),
-                        candidate.get("fee_status"), candidate.get("evaluation_status"), observed,
-                    ),
+                item_rows.append((
+                    job_id, sequence_no, identifier, candidate.get("identifier_type"),
+                    _dump(product), catalog_status, candidate.get("pricing_status"),
+                    candidate.get("fee_status"), candidate.get("evaluation_status"), observed,
+                ))
+                batch_completed += int(
+                    str(catalog_status or "") in TERMINAL_CATALOG_STATUSES
                 )
                 for index, scenario in enumerate(scenarios):
                     scenario_id = _scenario_identity(identifier, scenario, index)
                     payload = dict(scenario)
                     payload.setdefault("scenario_id", scenario_id)
-                    connection.execute(
-                        """INSERT INTO discovery_purchase_scenarios
-                           (job_id,canonical_identifier,scenario_id,scenario_json)
-                           VALUES (?,?,?,?)""",
-                        (job_id, identifier, scenario_id, _dump(payload)),
-                    )
+                    scenario_rows.append((job_id, identifier, scenario_id, _dump(payload)))
                 if catalog_status:
-                    connection.execute(
-                        """INSERT INTO discovery_catalog_results
-                           (job_id,canonical_identifier,catalog_status,diagnostics_json,updated_at)
-                           VALUES (?,?,?,?,?)""",
-                        (
-                            job_id, identifier, catalog_status,
-                            _dump(candidate.get("catalog_diagnostics") or {}), observed,
-                        ),
-                    )
+                    catalog_rows.append((
+                        job_id, identifier, catalog_status,
+                        _dump(candidate.get("catalog_diagnostics") or {}), observed,
+                    ))
                 for listing in listings:
                     asin = str(listing.get("asin") or "").strip()
                     if not asin:
                         continue
-                    connection.execute(
-                        """INSERT INTO discovery_listings
-                           (job_id,canonical_identifier,asin,listing_json,updated_at)
-                           VALUES (?,?,?,?,?)""",
-                        (job_id, identifier, asin, _dump(listing), observed),
-                    )
-                selected += 1
-                completed += int(str(catalog_status or "") in TERMINAL_CATALOG_STATUSES)
+                    listing_rows.append((job_id, identifier, asin, _dump(listing), observed))
+            next_selected = selected + len(rows)
+            next_completed = completed + batch_completed
+            compact_metadata["prepared_current"] = next_selected
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.executemany(
+                    """INSERT INTO discovery_job_items
+                       (job_id,sequence_no,canonical_identifier,identifier_type,
+                        product_json,catalog_status,pricing_status,fees_status,
+                        terminal_status,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(job_id,canonical_identifier) DO UPDATE SET
+                         sequence_no=excluded.sequence_no,identifier_type=excluded.identifier_type,
+                         product_json=excluded.product_json,catalog_status=excluded.catalog_status,
+                         pricing_status=excluded.pricing_status,fees_status=excluded.fees_status,
+                         terminal_status=excluded.terminal_status,updated_at=excluded.updated_at""",
+                    item_rows,
+                )
+                connection.executemany(
+                    """INSERT INTO discovery_purchase_scenarios
+                       (job_id,canonical_identifier,scenario_id,scenario_json)
+                       VALUES (?,?,?,?)
+                       ON CONFLICT(job_id,canonical_identifier,scenario_id) DO UPDATE SET
+                         scenario_json=excluded.scenario_json""",
+                    scenario_rows,
+                )
+                connection.executemany(
+                    """INSERT INTO discovery_catalog_results
+                       (job_id,canonical_identifier,catalog_status,diagnostics_json,updated_at)
+                       VALUES (?,?,?,?,?)
+                       ON CONFLICT(job_id,canonical_identifier) DO UPDATE SET
+                         catalog_status=excluded.catalog_status,
+                         diagnostics_json=excluded.diagnostics_json,updated_at=excluded.updated_at""",
+                    catalog_rows,
+                )
+                connection.executemany(
+                    """INSERT INTO discovery_listings
+                       (job_id,canonical_identifier,asin,listing_json,updated_at)
+                       VALUES (?,?,?,?,?)
+                       ON CONFLICT(job_id,canonical_identifier,asin) DO UPDATE SET
+                         listing_json=excluded.listing_json,updated_at=excluded.updated_at""",
+                    listing_rows,
+                )
+                connection.execute(
+                    """UPDATE discovery_incremental_jobs
+                         SET selected_count=?,catalog_completed_count=?,metadata_json=?,updated_at=?
+                       WHERE job_id=?""",
+                    (next_selected, next_completed, _dump(compact_metadata), observed, job_id),
+                )
+                connection.commit()
+            selected, completed = next_selected, next_completed
+            if progress is not None:
+                progress("preparing", selected, total or selected)
+
+        if total and selected != total:
+            raise ValueError(
+                f"Preparation produced {selected} of {total} frozen candidates"
+            )
+        compact_metadata.update({
+            "phase": target_phase, "status": target_status,
+            "prepared_current": selected, "prepared_total": total or selected,
+            "preparation_complete": True, "preparation_completed_at": _now(),
+        })
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """UPDATE discovery_incremental_jobs
-                   SET selected_count=?,catalog_completed_count=?,updated_at=? WHERE job_id=?""",
-                (selected, completed, observed, job_id),
+                     SET status=?,phase=?,selected_count=?,catalog_completed_count=?,
+                         metadata_json=?,updated_at=? WHERE job_id=?""",
+                (
+                    target_status, target_phase, selected, completed,
+                    _dump(compact_metadata), _now(), job_id,
+                ),
             )
             connection.commit()
         return self.summary(job_id)
@@ -1123,7 +1218,8 @@ class LightweightCheckpointStore:
 
 def prepare_incremental_job(
     state: dict[str, Any], *, supplier_store, rotation_store, amazon_cache=None,
-    freshness_policy=None,
+    freshness_policy=None, batch_size: int = 500, start_sequence: int = 0,
+    progress=None, resource_governor=None,
 ) -> dict[str, Any]:
     """Freeze a supplier-first selection without loading the full union payload.
 
@@ -1136,11 +1232,13 @@ def prepare_incremental_job(
 
     selected = normalize_selected_suppliers(state.get("selected_suppliers") or [])
     snapshots: dict[str, Any] = {}
+    source_metadata: dict[str, dict[str, Any]] = {}
     usable: list[str] = []
     for supplier in selected:
         metadata = supplier_store.serving_generation_metadata(supplier)
         if metadata:
             usable.append(supplier)
+            source_metadata[supplier] = dict(metadata)
             snapshots[supplier] = {
                 "supplier": supplier,
                 "snapshot_id": metadata.get("run_id"),
@@ -1165,8 +1263,24 @@ def prepare_incremental_job(
             }
     if not usable:
         raise RuntimeError("No supplier-first baseline is available")
-    memberships = supplier_store.active_identifier_memberships(usable)
-    stubs = [
+    frozen_selection = (
+        rotation_store.frozen_selection(state["job_id"], usable)
+        if hasattr(rotation_store, "frozen_selection") else None
+    )
+    if frozen_selection:
+        frozen_stubs, frozen_rotation = frozen_selection
+        memberships = {
+            str(row["canonical_ean"]): tuple(row.get("suppliers") or ())
+            for row in frozen_stubs
+        }
+    else:
+        frozen_stubs = frozen_rotation = None
+        memberships = supplier_store.active_identifier_memberships(usable)
+    if progress is not None:
+        progress("preparing_memberships", max(0, int(start_sequence)), len(memberships))
+    if resource_governor is not None:
+        resource_governor.before_next_batch()
+    stubs = frozen_stubs or [
         {
             "canonical_ean": identifier, "gtin": identifier,
             "scenarios": [{"supplier": supplier} for supplier in suppliers],
@@ -1196,69 +1310,103 @@ def prepare_incremental_job(
             PlanAction.REFRESH_FEES.value: 3,
             PlanAction.CACHE_REUSE.value: 4,
         }
+        planned_count = 0
         for identifier, cached in amazon_cache.get_many(sorted(memberships)):
             planned[identifier] = plan_cached_product(cached, policy=policy)
-        selected_stubs, rotation = rotation_store.select_current_universe(
-            state["job_id"], stubs, usable, budget,
-            supplier_snapshot_set=snapshots,
-            action_priority={
-                identifier: action_order[value["primary_action"]]
-                for identifier, value in planned.items()
-            },
-        )
+            planned_count += 1
+            if planned_count % max(1, int(batch_size)) == 0:
+                if progress is not None:
+                    progress("preparing_plan", max(int(start_sequence), planned_count), len(memberships))
+                if resource_governor is not None:
+                    resource_governor.before_next_batch()
+        if frozen_stubs is not None:
+            selected_stubs, rotation = frozen_stubs, frozen_rotation
+        else:
+            selected_stubs, rotation = rotation_store.select_current_universe(
+                state["job_id"], stubs, usable, budget,
+                supplier_snapshot_set=snapshots,
+                action_priority={
+                    identifier: action_order[value["primary_action"]]
+                    for identifier, value in planned.items()
+                },
+            )
     else:
         policy = None
-        selected_stubs, rotation = rotation_store.select(
-            state["job_id"], stubs, usable, budget,
-            supplier_snapshot_set=snapshots,
-        )
-    selected_identifiers = [row["canonical_ean"] for row in selected_stubs]
-
-    def build_candidate(identifier, cached=None):
-        collections = []
-        for supplier in memberships.get(identifier, ()):
-            collections.append(
-                supplier_store.active_candidates_for_identifier(supplier, identifier)
-            )
-        merged = merge_product_candidates(*collections)
-        if len(merged) != 1:
-            raise ValueError(
-                f"Frozen identifier {identifier} produced {len(merged)} candidates"
-            )
-        candidate = merged[0]
-        if planner_version:
-            plan = planned[identifier]
-            cached = cached or {}
-            actions = set(plan["actions"])
-            candidate["amazon_plan"] = plan
-            if not ({"REFRESH_CATALOG", "REFRESH_BSR", "NEW_LOOKUP"} & actions):
-                candidate["catalog_status"] = cached.get("catalog_status")
-                candidate["catalog_diagnostics"] = {
-                    "cache_source_job_id": cached.get("source_job_id"),
-                    "cache_reused": True,
-                }
-                listings = [dict(row) for row in cached.get("amazon_listings") or []]
-                if "REFRESH_PRICING" in actions:
-                    for listing in listings:
-                        for key in (
-                            "pricing_status", "fba_sellers", "total_sellers",
-                            "seller_count_source", "reference_price", "price_source",
-                            "min_fba_price", "min_fbm_price", "competition_status",
-                            "pricing_observed_at", "competition_observed_at",
-                        ):
-                            listing.pop(key, None)
-                candidate["amazon_listings"] = listings
-            return candidate
+        if frozen_stubs is not None:
+            selected_stubs, rotation = frozen_stubs, frozen_rotation
         else:
-            return candidate
+            selected_stubs, rotation = rotation_store.select(
+                state["job_id"], stubs, usable, budget,
+                supplier_snapshot_set=snapshots,
+            )
+    selected_identifiers = [row["canonical_ean"] for row in selected_stubs]
+    if progress is not None:
+        progress("preparing", max(0, int(start_sequence)), len(selected_identifiers))
 
     def candidates():
-        if planner_version:
-            for identifier, cached in amazon_cache.get_many(selected_identifiers):
-                yield build_candidate(identifier, cached)
-        else:
-            for identifier in selected_identifiers:
-                yield build_candidate(identifier)
+        pending_identifiers = selected_identifiers[max(0, int(start_sequence)):]
+        for offset in range(0, len(pending_identifiers), max(1, int(batch_size))):
+            batch = pending_identifiers[offset:offset + max(1, int(batch_size))]
+            cached_by_identifier = (
+                dict(amazon_cache.get_many(batch))
+                if planner_version else {}
+            )
+            supplier_candidates: dict[str, dict[str, list[dict[str, Any]]]] = {}
+            for supplier in usable:
+                relevant = [
+                    identifier for identifier in batch
+                    if supplier in memberships.get(identifier, ())
+                ]
+                if not relevant:
+                    continue
+                grouped: dict[str, list[dict[str, Any]]] = {}
+                if hasattr(supplier_store, "iter_active_candidates_for_identifiers"):
+                    rows = supplier_store.iter_active_candidates_for_identifiers(
+                        supplier, relevant, batch_size=len(relevant),
+                        generation_metadata=source_metadata.get(supplier),
+                    )
+                    for row in rows:
+                        grouped.setdefault(str(row.get("canonical_ean")), []).append(row)
+                else:
+                    for identifier in relevant:
+                        grouped[identifier] = supplier_store.active_candidates_for_identifier(
+                            supplier, identifier,
+                        )
+                supplier_candidates[supplier] = grouped
+            for identifier in batch:
+                collections = [
+                    supplier_candidates.get(supplier, {}).get(identifier, [])
+                    for supplier in memberships.get(identifier, ())
+                ]
+                merged = merge_product_candidates(*collections)
+                if len(merged) != 1:
+                    raise ValueError(
+                        f"Frozen identifier {identifier} produced {len(merged)} candidates"
+                    )
+                candidate = merged[0]
+                if planner_version:
+                    plan = planned[identifier]
+                    cached = cached_by_identifier.get(identifier) or {}
+                    actions = set(plan["actions"])
+                    candidate["amazon_plan"] = plan
+                    if not ({"REFRESH_CATALOG", "REFRESH_BSR", "NEW_LOOKUP"} & actions):
+                        candidate["catalog_status"] = cached.get("catalog_status")
+                        candidate["catalog_diagnostics"] = {
+                            "cache_source_job_id": cached.get("source_job_id"),
+                            "cache_reused": True,
+                        }
+                        listings = [dict(row) for row in cached.get("amazon_listings") or []]
+                        if "REFRESH_PRICING" in actions:
+                            for listing in listings:
+                                for key in (
+                                    "pricing_status", "fba_sellers", "total_sellers",
+                                    "seller_count_source", "reference_price", "price_source",
+                                    "min_fba_price", "min_fbm_price", "competition_status",
+                                    "pricing_observed_at", "competition_observed_at",
+                                ):
+                                    listing.pop(key, None)
+                        candidate["amazon_listings"] = listings
+                yield candidate
 
     metadata = {
         **state, **rotation,
@@ -1272,6 +1420,8 @@ def prepare_incremental_job(
         "phase": "suppliers_loaded", "status": "running",
         "sampled_identifier_count": len(selected_identifiers),
         "total_supplier_ean_universe": len(memberships),
+        "prepared_total": len(selected_identifiers),
+        "preparation_start_sequence": max(0, int(start_sequence)),
     }
     if planner_version:
         selected_plans = [planned[identifier] for identifier in selected_identifiers]

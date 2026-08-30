@@ -16,6 +16,7 @@ from discovery_incremental import (
 )
 from discovery_resources import (
     DiscoveryResourceGovernor,
+    ResourcePause,
     ResourcePolicy,
     ResourceSnapshot,
 )
@@ -126,6 +127,68 @@ class IncrementalStoreTests(unittest.TestCase):
         first[0]["catalog_status"] = "resolved"  # simulated process death here
         again = self.store.pending_catalog_batch("job", 1)
         self.assertEqual(again[0]["canonical_ean"], first[0]["canonical_ean"])
+
+    def test_preparation_commits_batches_and_resumes_without_duplicates(self):
+        progress = []
+
+        def interrupted():
+            yield candidate(1)
+            yield candidate(2)
+            raise RuntimeError("simulated preparation crash")
+
+        metadata = {
+            "job_id": "prepare", "filters": {}, "phase": "suppliers_loaded",
+            "prepared_total": 5,
+        }
+        with self.assertRaisesRegex(RuntimeError, "simulated preparation crash"):
+            self.store.create_job(
+                metadata, interrupted(), batch_size=2,
+                progress=lambda phase, current, total: progress.append(
+                    (phase, current, total)
+                ),
+            )
+        partial = self.store.summary("prepare")
+        self.assertEqual(partial["phase"], "preparing")
+        self.assertEqual(partial["prepared_current"], 2)
+        self.assertEqual(progress, [("preparing", 2, 5)])
+
+        completed = self.store.create_job(
+            metadata, (candidate(value) for value in range(1, 6)), batch_size=2,
+        )
+        self.assertEqual(completed["selected_count"], 5)
+        self.assertTrue(completed["preparation_complete"])
+        self.assertEqual(self.store.counts("prepare")["scenarios"], 5)
+
+    def test_resource_governor_is_checked_during_preparation(self):
+        class PausingGovernor:
+            def __init__(self):
+                self.calls = 0
+
+            def before_next_batch(self):
+                self.calls += 1
+                if self.calls == 2:
+                    snapshot = ResourceSnapshot(
+                        rss_bytes=2_000, available_memory_bytes=100,
+                        swap_used_bytes=0, disk_free_bytes=10_000,
+                        database_bytes=100, wal_bytes=100, write_bytes=100,
+                        write_rate_bytes_per_second=10, db_latency_ms=1,
+                        observed_monotonic=1.0,
+                    )
+                    raise ResourcePause("rss_hard", snapshot, 1_250)
+
+        governor = PausingGovernor()
+        with self.assertRaises(ResourcePause):
+            self.store.create_job(
+                {
+                    "job_id": "guarded", "filters": {},
+                    "phase": "suppliers_loaded", "prepared_total": 4,
+                },
+                (candidate(value) for value in range(1, 5)),
+                batch_size=2, resource_governor=governor,
+            )
+        partial = self.store.summary("guarded")
+        self.assertEqual(partial["prepared_current"], 2)
+        self.assertEqual(partial["phase"], "preparing")
 
     def test_multi_listing_and_scenario_identity_have_no_duplicates(self):
         row = candidate(1, "ambiguous", listings=2)
@@ -529,6 +592,66 @@ class IncrementalStoreTests(unittest.TestCase):
         self.assertEqual(len(rotation.received), 2)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["scenarios"][0]["supplier"], "abw")
+
+    def test_supplier_preparation_uses_bounded_batch_api_not_point_lookups(self):
+        class SupplierStore:
+            def __init__(self):
+                self.batch_calls = 0
+                self.point_calls = 0
+
+            def serving_generation_metadata(self, supplier):
+                return {
+                    "run_id": f"run-{supplier}", "completed_at": "2026-08-27T00:00:00Z",
+                    "product_count": 1200, "scenario_count": 1200,
+                    "product_catalog_coverage_complete": True,
+                    "product_catalog_coverage_type": "full_relevant_catalog",
+                }
+
+            def active_identifier_memberships(self, suppliers):
+                return {
+                    f"{value:013d}": ("abw",)
+                    for value in range(1, 1201)
+                }
+
+            def iter_active_candidates_for_identifiers(
+                self, supplier, identifiers, **kwargs,
+            ):
+                self.batch_calls += 1
+                for identifier in identifiers:
+                    yield {
+                        "canonical_ean": identifier, "gtin": identifier,
+                        "product_key": f"product-{identifier}",
+                        "scenarios": [{
+                            "scenario_id": f"scenario-{identifier}",
+                            "supplier": supplier,
+                        }],
+                    }
+
+            def active_candidates_for_identifier(self, *_):
+                self.point_calls += 1
+                raise AssertionError("point lookup must not be used")
+
+        class Rotation:
+            def select(self, job_id, candidates, suppliers, budget, **kwargs):
+                return candidates, {
+                    "rotation_scope": "scope", "rotation_cycle_id": 1,
+                    "rotation_selected_identifiers": [
+                        row["canonical_ean"] for row in candidates
+                    ],
+                }
+
+        supplier_store = SupplierStore()
+        prepared = prepare_incremental_job(
+            {
+                "job_id": "batch", "selected_suppliers": ["abw"],
+                "run_budget": "all", "filters": {},
+            },
+            supplier_store=supplier_store, rotation_store=Rotation(), batch_size=500,
+        )
+        rows = list(prepared["candidates"])
+        self.assertEqual(len(rows), 1200)
+        self.assertEqual(supplier_store.batch_calls, 3)
+        self.assertEqual(supplier_store.point_calls, 0)
 
 
 class ResourceGovernorTests(unittest.TestCase):
