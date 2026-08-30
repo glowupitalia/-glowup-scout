@@ -300,7 +300,11 @@ class PlannerIntegrationTests(unittest.TestCase):
             columns = {row["name"] for row in connection.execute(
                 "PRAGMA table_info(discovery_amazon_cache)"
             )}
+            fee_placeholder = connection.execute(
+                "SELECT observation_json FROM discovery_amazon_fee_cache"
+            ).fetchone()[0]
         self.assertNotIn("payload_json", columns)
+        self.assertEqual(fee_placeholder, "{}")
 
     def test_fresh_cached_job_completes_without_amazon_calls(self):
         root = Path(self.temporary.name)

@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS discovery_amazon_fee_cache (
     observation_id TEXT NOT NULL,
     fee_status TEXT NOT NULL,
     fee_observed_at TEXT NOT NULL,
-    observation_json TEXT NOT NULL,
+    observation_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_amazon_cache_source
@@ -329,17 +329,17 @@ class DiscoveryAmazonCache:
                     connection.execute(
                         """INSERT INTO discovery_amazon_fee_cache
                            (fee_cache_key,source_job_id,observation_id,fee_status,fee_observed_at,
-                            observation_json,updated_at) VALUES (?,?,?,?,?,?,?)
+                            observation_json,updated_at) VALUES (?,?,?,?,?,'{}',?)
                            ON CONFLICT(fee_cache_key) DO UPDATE SET
                              source_job_id=excluded.source_job_id,
                              observation_id=excluded.observation_id,
                              fee_status=excluded.fee_status,
                              fee_observed_at=excluded.fee_observed_at,
-                             observation_json=excluded.observation_json,
+                             observation_json='{}',
                              updated_at=excluded.updated_at
                            WHERE excluded.fee_observed_at >= discovery_amazon_fee_cache.fee_observed_at""",
                         (key, job_id, row["observation_id"], value["fee_status"], fee_at,
-                         row["observation_json"], observed),
+                         observed),
                     )
                 connection.execute(
                     """INSERT INTO discovery_amazon_cache_indexed_jobs
@@ -555,7 +555,12 @@ class DiscoveryAmazonCache:
         self.initialize()
         with self.store._connect() as connection:
             row = connection.execute(
-                "SELECT observation_json,fee_observed_at FROM discovery_amazon_fee_cache WHERE fee_cache_key=?",
+                """SELECT observation.observation_json,cache.fee_observed_at
+                   FROM discovery_amazon_fee_cache cache
+                   JOIN discovery_observations observation
+                     ON observation.job_id=cache.source_job_id
+                    AND observation.observation_id=cache.observation_id
+                   WHERE cache.fee_cache_key=?""",
                 (key,),
             ).fetchone()
         if not row:
