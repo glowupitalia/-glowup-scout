@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -411,18 +412,30 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             row.label == "Prodotti da analizzare in questa ricerca"
             for row in app.selectbox
         ))
-        self.assertTrue(any(row.label == "Nuovo ciclo Discovery" for row in app.button))
+        self.assertFalse(any(row.label == "Nuovo ciclo Discovery" for row in app.button))
         metrics = {row.label: row.value for row in app.metric}
         self.assertEqual(metrics["Prodotti da valutare"], "3")
-        self.assertEqual(metrics["Nuovi"], "3")
+        self.assertNotIn("Dalla cache", metrics)
+        self.assertNotIn("Da aggiornare", metrics)
+        self.assertNotIn("Nuovi", metrics)
         rendered = " ".join(
             [row.value for row in app.markdown]
             + [row.value for row in app.caption]
         )
         self.assertNotIn("Ampiezza ricerca", rendered)
-        self.assertTrue(any(row.label == "Dettagli tecnici" for row in app.expander))
+        self.assertNotIn("Anteprima", rendered)
+        self.assertNotIn("Calcolo della disponibilità cache", rendered)
+        self.assertNotIn("Nuovo insieme fornitori", rendered)
+        self.assertNotIn("keyboard_arrow_right", rendered)
+        self.assertFalse(any(
+            row.label == "Riprendi ultima Discovery incompleta" for row in app.button
+        ))
+        details = next(row for row in app.toggle if row.label == "Dettagli tecnici")
+        self.assertFalse(details.value)
 
     def test_full_catalog_start_requires_simple_second_confirmation(self):
+        registry = DiscoveryJobRegistry()
+        self.assertIsNone(registry.latest())
         app = self.discovery_app()
         requested_filters = {
             "BSR minimo": 0,
@@ -452,35 +465,39 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             row.label == "Prodotti da analizzare in questa ricerca"
             for row in app.selectbox
         ))
+        self.assertIsNone(registry.latest())
 
-    def test_production_preview_failure_keeps_full_catalog_cta_visible(self):
+    def test_production_render_never_invokes_cache_planner(self):
         registry = DiscoveryJobRegistry()
         self.assertIsNone(registry.latest())
         with patch.object(
+            SupplierCatalogStore, "active_identifier_universe",
+            return_value={"total": 120_001, "eligible": 120_000},
+        ) as universe_count, patch.object(
+            SupplierCatalogStore, "active_identifiers",
+        ) as cache_scan, patch.object(
             DiscoveryAmazonCache, "preview_counts",
-            side_effect=TimeoutError("production-size preview timeout"),
-        ):
+        ) as preview:
+            started = time.monotonic()
             app = self.discovery_app()
+            elapsed = time.monotonic() - started
             self.assertEqual(len(app.exception), 0)
             metrics = {row.label: row.value for row in app.metric}
-            self.assertEqual(metrics["Prodotti da valutare"], "3")
-            self.assertEqual(metrics["Dalla cache"], "—")
-            self.assertEqual(metrics["Da aggiornare"], "—")
-            self.assertEqual(metrics["Nuovi"], "—")
+            self.assertEqual(metrics, {"Prodotti da valutare": "120.000"})
             start = next(
                 row for row in app.button if row.label == "Trova opportunità"
             )
             self.assertFalse(start.disabled)
-            self.assertTrue(any(
-                "Anteprima cache temporaneamente non disponibile" in row.value
-                for row in app.warning
-            ))
-            app = start.click().run()
-            self.assertTrue(any(row.label == "Annulla" for row in app.button))
-            self.assertTrue(any(row.label == "Avvia Discovery" for row in app.button))
-            self.assertTrue(any(
-                "Stai per valutare 3 prodotti" in row.value for row in app.warning
-            ))
+            rendered = " ".join(
+                [row.value for row in app.markdown]
+                + [row.value for row in app.caption]
+            )
+            self.assertNotIn("Anteprima", rendered)
+            self.assertNotIn("Calcolo", rendered)
+            self.assertLess(elapsed, 10)
+            universe_count.assert_called()
+            cache_scan.assert_not_called()
+            preview.assert_not_called()
         self.assertIsNone(registry.latest())
 
     def test_tutti_tracks_individual_selection(self):
@@ -508,6 +525,8 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         )
         st.cache_data.clear()
         app = self.discovery_app()
+        details = next(row for row in app.toggle if row.label == "Dettagli tecnici")
+        app = details.set_value(True).run()
         new_cycle = next(
             row for row in app.button if row.label == "Nuovo ciclo Discovery"
         )

@@ -1033,7 +1033,47 @@ class SupplierCatalogStore:
 
     def active_identifier_universe(self, suppliers) -> dict[str, int]:
         """Count the union eligible for Discovery without loading scenario payloads."""
-        identifiers = self.active_identifiers(suppliers)
+        selected = [_validate_supplier(value) for value in suppliers]
+        if not selected:
+            return {"total": 0, "eligible": 0}
+        self.initialize()
+        promoted = [supplier for supplier in selected if supplier != "qogita"]
+        queries = []
+        parameters: list[str] = []
+        if promoted:
+            placeholders = ",".join("?" for _ in promoted)
+            queries.append(
+                f"""SELECT scenario.canonical_ean AS identifier
+                       FROM supplier_catalog_active_generations active
+                       JOIN supplier_catalog_scenarios scenario
+                         ON scenario.run_id=active.run_id
+                      WHERE active.supplier IN ({placeholders})
+                        AND scenario.canonical_ean IS NOT NULL
+                      GROUP BY scenario.canonical_ean"""
+            )
+            parameters.extend(promoted)
+        if "qogita" in selected:
+            from qogita_serving import QogitaServingStore
+            QogitaServingStore(self.path).initialize()
+            queries.append(
+                """SELECT selected.gtin AS identifier
+                     FROM qogita_serving_active active
+                     JOIN qogita_serving_snapshots snapshot
+                       ON snapshot.serving_generation_id=active.serving_generation_id
+                     JOIN qogita_serving_memberships membership
+                       ON membership.serving_generation_id=snapshot.serving_generation_id
+                     JOIN qogita_bootstrap_products selected
+                       ON selected.bootstrap_run_id=snapshot.bootstrap_run_id
+                      AND selected.canonical_product_key=membership.canonical_product_key
+                    WHERE active.supplier='qogita' AND snapshot.status='valid'
+                      AND membership.scenario_count>0
+                    GROUP BY selected.gtin"""
+            )
+        with _connect(self.path) as connection:
+            identifiers = [
+                row["identifier"]
+                for row in connection.execute(" UNION ".join(queries), parameters)
+            ]
         return {
             "total": len(identifiers),
             "eligible": sum(canonical_gtin14(value) is not None for value in identifiers),

@@ -730,6 +730,14 @@ def discovery_supplier_catalog_status():
 def discovery_supplier_universe(selected_suppliers):
     if not selected_suppliers:
         return {"total": 0, "eligible": 0}
+    return SupplierCatalogStore().active_identifier_universe(selected_suppliers)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def discovery_rotation_diagnostics(selected_suppliers):
+    """Load rotation diagnostics only after the user opens advanced controls."""
+    if not selected_suppliers:
+        return {"total": 0, "eligible": 0}
     identifiers = SupplierCatalogStore().active_identifiers(selected_suppliers)
     eligible_identifiers = {
         value for value in identifiers if canonical_gtin14(value) is not None
@@ -1403,7 +1411,6 @@ elif ui_state == "discovery":
                     f"catalogo {str(status.get('product_catalog_coverage_type') or status.get('coverage_type') or 'parziale').replace('_', ' ')} · "
                     f"scenari {str(status.get('scenario_enrichment_status') or 'none')}"
                 )
-        st.caption("  \n".join(coverage_lines).replace(",", "."))
         st.markdown("**Filtri**")
         defaults = default_filters()
         first = st.columns(3)
@@ -1436,74 +1443,12 @@ elif ui_state == "discovery":
             universe = discovery_supplier_universe(tuple(selected_suppliers))
         except Exception:
             universe = {"total": 0, "eligible": 0}
-        remaining = int(universe.get("rotation_remaining_count") or 0)
         eligible = int(universe.get("eligible") or 0)
+        st.metric("Prodotti da valutare", f"{eligible:,}".replace(",", "."))
         st.caption(
             "Scout riutilizzerà automaticamente i dati Amazon recenti e "
             "aggiornerà solo quelli necessari."
         )
-        global_analyzed = int(universe.get("rotation_global_analyzed_count") or 0)
-        new_identifiers = int(universe.get("rotation_new_identifier_count") or 0)
-        st.markdown("**Anteprima**")
-        preview_columns = st.columns(4)
-        preview_columns[0].metric("Prodotti da valutare", f"{eligible:,}".replace(",", "."))
-        cache_preview_slot = preview_columns[1].empty()
-        refresh_preview_slot = preview_columns[2].empty()
-        new_preview_slot = preview_columns[3].empty()
-        cache_preview_slot.metric("Dalla cache", "Calcolo…")
-        refresh_preview_slot.metric("Da aggiornare", "Calcolo…")
-        new_preview_slot.metric("Nuovi", "Calcolo…")
-        preview_message_slot = st.empty()
-        added_suppliers = universe.get("rotation_added_suppliers") or []
-        if universe.get("rotation_previous_scope") and added_suppliers:
-            added_labels = " · ".join(
-                supplier_labels.get(value, value.upper()) for value in added_suppliers
-            )
-            ui_alert(
-                (
-                    f"Nuovo insieme fornitori: {added_labels} è stato aggiunto. "
-                    f"Lo scope precedente conserva "
-                    f"{int(universe.get('rotation_previous_analyzed_count') or 0):,} "
-                    "EAN analizzati; la storia Amazon globale non è stata cancellata. "
-                    "Il nuovo scope parte dal ciclo 1 perché include nuovi scenari di acquisto."
-                ).replace(",", "."),
-                "info",
-            )
-        with st.expander("Dettagli tecnici", expanded=False):
-            st.caption(
-                f"Scope {universe.get('rotation_scope') or '—'} · "
-                f"ciclo {int(universe.get('rotation_cycle_id') or 1)} · "
-                f"universo {universe['total']:,} · analizzati "
-                f"{int(universe.get('rotation_analyzed_count') or 0):,} · "
-                f"rimanenti {remaining:,} · storico globale {global_analyzed:,} · "
-                f"nuovi {new_identifiers:,} · policy {POLICY_VERSION}"
-                .replace(",", ".")
-            )
-            planner_details_slot = st.empty()
-            planner_details_slot.caption("Planner · calcolo anteprima in corso…")
-            can_start_new_cycle = bool(universe.get("rotation_scope_initialized"))
-            if st.button(
-                "Nuovo ciclo Discovery", key="discovery_new_cycle",
-                disabled=bool(active_discovery) or not can_start_new_cycle,
-            ):
-                st.session_state["discovery_new_cycle_confirmation_scope"] = universe.get(
-                    "rotation_scope"
-                )
-                st.rerun()
-            confirmation_scope = st.session_state.get("discovery_new_cycle_confirmation_scope")
-            if confirmation_scope == universe.get("rotation_scope"):
-                st.warning("Conferma il nuovo ciclo tecnico. Lo storico globale sarà preservato.")
-                confirm_columns = st.columns(2)
-                if confirm_columns[0].button(
-                    "Conferma nuovo ciclo", key="discovery_confirm_new_cycle", type="primary",
-                ):
-                    DiscoveryRotationStore().start_new_cycle(selected_suppliers, confirmed=True)
-                    discovery_supplier_universe.clear()
-                    st.session_state.pop("discovery_new_cycle_confirmation_scope", None)
-                    st.rerun()
-                if confirm_columns[1].button("Annulla", key="discovery_cancel_new_cycle"):
-                    st.session_state.pop("discovery_new_cycle_confirmation_scope", None)
-                    st.rerun()
         validation_error = discovery_filter_error(filters, selected_suppliers)
         if not validation_error and eligible == 0:
             validation_error = "Nessun prodotto idoneo nelle baseline selezionate."
@@ -1557,71 +1502,108 @@ elif ui_state == "discovery":
                 _start_discovery_worker(state)
                 st.rerun()
 
-        if selected_suppliers and eligible:
+        technical_details = st.toggle(
+            "Dettagli tecnici", value=False, key="discovery_technical_details",
+        )
+        if technical_details:
+            st.caption("  \n".join(coverage_lines).replace(",", "."))
             try:
-                with st.spinner("Calcolo della disponibilità cache in corso…"):
-                    cache_preview = discovery_amazon_plan_preview(
-                        tuple(selected_suppliers)
-                    )
+                rotation_details = discovery_rotation_diagnostics(
+                    tuple(selected_suppliers)
+                )
             except Exception:
-                logger.exception("DISCOVERY CACHE PREVIEW FAILED")
-                cache_preview_slot.metric("Dalla cache", "—")
-                refresh_preview_slot.metric("Da aggiornare", "—")
-                new_preview_slot.metric("Nuovi", "—")
-                preview_message_slot.warning(
-                    "Anteprima cache temporaneamente non disponibile. "
-                    "Puoi comunque avviare la Discovery: il planner ricalcolerà "
-                    "il lavoro necessario nel job persistente."
+                logger.exception("DISCOVERY ROTATION DIAGNOSTICS FAILED")
+                st.warning("Diagnostica tecnica temporaneamente non disponibile.")
+                rotation_details = {}
+            if rotation_details:
+                remaining = int(
+                    rotation_details.get("rotation_remaining_count") or 0
                 )
-                planner_details_slot.caption("Planner · anteprima non disponibile")
-            else:
-                cache_estimate = int(cache_preview.get("cache_reuse_count") or 0)
-                refresh_estimate = int(cache_preview.get("refresh_count") or 0)
-                new_estimate = max(
-                    0,
-                    eligible - cache_estimate - refresh_estimate,
+                global_analyzed = int(
+                    rotation_details.get("rotation_global_analyzed_count") or 0
                 )
-                cache_preview_slot.metric(
-                    "Dalla cache", f"{cache_estimate:,}".replace(",", ".")
+                new_identifiers = int(
+                    rotation_details.get("rotation_new_identifier_count") or 0
                 )
-                refresh_preview_slot.metric(
-                    "Da aggiornare", f"{refresh_estimate:,}".replace(",", ".")
+                st.caption(
+                    f"Scope {rotation_details.get('rotation_scope') or '—'} · "
+                    f"ciclo {int(rotation_details.get('rotation_cycle_id') or 1)} · "
+                    f"universo {int(rotation_details.get('total') or 0):,} · analizzati "
+                    f"{int(rotation_details.get('rotation_analyzed_count') or 0):,} · "
+                    f"rimanenti {remaining:,} · storico globale {global_analyzed:,} · "
+                    f"nuovi {new_identifiers:,} · policy {POLICY_VERSION}"
+                    .replace(",", ".")
                 )
-                new_preview_slot.metric(
-                    "Nuovi", f"{new_estimate:,}".replace(",", ".")
-                )
-                planner_actions = cache_preview.get("planner_action_counts") or {}
-                if planner_actions:
-                    planner_details_slot.caption(
-                        "Planner · " + " · ".join(
-                            f"{action.lower().replace('_', ' ')} {int(count):,}"
-                            for action, count in planner_actions.items()
-                            if int(count)
-                        ).replace(",", ".")
+                added_suppliers = rotation_details.get("rotation_added_suppliers") or []
+                if rotation_details.get("rotation_previous_scope") and added_suppliers:
+                    added_labels = " · ".join(
+                        supplier_labels.get(value, value.upper())
+                        for value in added_suppliers
                     )
-                else:
-                    planner_details_slot.caption("Planner · nessun lavoro pianificato")
-        else:
-            cache_preview_slot.metric("Dalla cache", "0")
-            refresh_preview_slot.metric("Da aggiornare", "0")
-            new_preview_slot.metric("Nuovi", "0")
-            planner_details_slot.caption("Planner · nessun prodotto idoneo")
-
-        incomplete = DiscoveryCheckpointStore().latest_incomplete()
-        if incomplete and not active_discovery and st.button(
-            "Riprendi ultima Discovery incompleta",
-            key="resume_discovery",
-            type="secondary",
-            use_container_width=True,
-        ):
-            st.session_state["discovery_filters"] = incomplete["filters"]
-            st.session_state["discovery_selected_suppliers"] = incomplete.get(
-                "selected_suppliers"
-            ) or ["qogita"]
-            st.session_state["discovery_run_budget"] = incomplete.get("run_budget", "all")
-            st.session_state["discovery_job_id"] = incomplete["job_id"]
-            _start_discovery_worker(incomplete)
-            st.rerun()
+                    ui_alert(
+                        (
+                            f"Nuovo insieme fornitori: {added_labels} è stato aggiunto. "
+                            f"Lo scope precedente conserva "
+                            f"{int(rotation_details.get('rotation_previous_analyzed_count') or 0):,} "
+                            "EAN analizzati; la storia Amazon globale non è stata cancellata."
+                        ).replace(",", "."),
+                        "info",
+                    )
+                can_start_new_cycle = bool(
+                    rotation_details.get("rotation_scope_initialized")
+                )
+                if st.button(
+                    "Nuovo ciclo Discovery", key="discovery_new_cycle",
+                    disabled=bool(active_discovery) or not can_start_new_cycle,
+                ):
+                    st.session_state[
+                        "discovery_new_cycle_confirmation_scope"
+                    ] = rotation_details.get("rotation_scope")
+                    st.rerun()
+                confirmation_scope = st.session_state.get(
+                    "discovery_new_cycle_confirmation_scope"
+                )
+                if confirmation_scope == rotation_details.get("rotation_scope"):
+                    st.warning(
+                        "Conferma il nuovo ciclo tecnico. Lo storico globale sarà preservato."
+                    )
+                    confirm_columns = st.columns(2)
+                    if confirm_columns[0].button(
+                        "Conferma nuovo ciclo", key="discovery_confirm_new_cycle",
+                        type="primary",
+                    ):
+                        DiscoveryRotationStore().start_new_cycle(
+                            selected_suppliers, confirmed=True
+                        )
+                        discovery_rotation_diagnostics.clear()
+                        st.session_state.pop(
+                            "discovery_new_cycle_confirmation_scope", None
+                        )
+                        st.rerun()
+                    if confirm_columns[1].button(
+                        "Annulla", key="discovery_cancel_new_cycle"
+                    ):
+                        st.session_state.pop(
+                            "discovery_new_cycle_confirmation_scope", None
+                        )
+                        st.rerun()
+            incomplete = DiscoveryCheckpointStore().latest_incomplete()
+            if incomplete and not active_discovery and st.button(
+                "Riprendi ultima Discovery incompleta",
+                key="resume_discovery",
+                type="secondary",
+                use_container_width=True,
+            ):
+                st.session_state["discovery_filters"] = incomplete["filters"]
+                st.session_state["discovery_selected_suppliers"] = incomplete.get(
+                    "selected_suppliers"
+                ) or ["qogita"]
+                st.session_state["discovery_run_budget"] = incomplete.get(
+                    "run_budget", "all"
+                )
+                st.session_state["discovery_job_id"] = incomplete["job_id"]
+                _start_discovery_worker(incomplete)
+                st.rerun()
 
 elif ui_state == "discovery_running":
     st.button(
