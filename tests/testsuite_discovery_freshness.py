@@ -246,6 +246,25 @@ class PlannerIntegrationTests(unittest.TestCase):
         self.assertEqual(before["sentinel"], after["sentinel"])
         self.assertEqual(before["catalog_status_counts"], after["catalog_status_counts"])
 
+    def test_preview_is_read_only_and_does_not_misclassify_unindexed_history(self):
+        root = Path(self.temporary.name)
+        store = DiscoveryIncrementalStore(root / "preview.sqlite3")
+        known, new = self.identifiers[:2]
+        store.create_job(
+            {"job_id": "historical", "status": "completed", "phase": "completed", "filters": {}},
+            [{"canonical_ean": known, "gtin": known, "catalog_status": "not_found",
+              "scenarios": []}],
+        )
+        cache = DiscoveryAmazonCache(store)
+        counts = cache.preview_counts([known, new], AmazonFreshnessPolicy())
+        self.assertEqual(counts["refresh_count"], 1)
+        self.assertEqual(counts["new_lookup_count"], 1)
+        with store._connect() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM discovery_amazon_cache").fetchone()[0],
+                0,
+            )
+
     def test_completed_job_cache_reuses_exact_fee_without_copying_listing_payload(self):
         root = Path(self.temporary.name)
         store = DiscoveryIncrementalStore(root / "cache.sqlite3")

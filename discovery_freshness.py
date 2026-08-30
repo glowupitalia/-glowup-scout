@@ -515,10 +515,38 @@ class DiscoveryAmazonCache:
     def preview_counts(
         self, identifiers: Iterable[str], policy: AmazonFreshnessPolicy,
     ) -> dict[str, int]:
-        return planning_counts(
-            plan_cached_product(cached, policy=policy)
-            for _, cached in self.get_many(sorted(set(identifiers)))
-        )
+        requested = sorted(set(identifiers))
+        self.initialize()
+        # Preview must not backfill or consume rotation.  Until the rebuildable
+        # reference index has seen every historical job, classify a known
+        # identifier conservatively as refresh (never as a false new lookup).
+        with self.store._connect() as connection:
+            known = {
+                str(row[0]) for row in connection.execute(
+                    """SELECT DISTINCT item.canonical_identifier
+                       FROM discovery_job_items item
+                       JOIN discovery_incremental_jobs job ON job.job_id=item.job_id
+                       WHERE job.status IN ('completed','computed')
+                         AND item.catalog_status IS NOT NULL"""
+                )
+            }
+
+        def plans():
+            for identifier, cached in self.get_many(requested):
+                if cached is not None:
+                    yield plan_cached_product(cached, policy=policy)
+                elif identifier in known:
+                    yield {
+                        "primary_action": PlanAction.REFRESH_CATALOG.value,
+                        "actions": [PlanAction.REFRESH_CATALOG.value],
+                    }
+                else:
+                    yield {
+                        "primary_action": PlanAction.NEW_LOOKUP.value,
+                        "actions": [PlanAction.NEW_LOOKUP.value],
+                    }
+
+        return planning_counts(plans())
 
     def fee(self, asin: str, price: Any, currency: str = "EUR") -> dict[str, Any] | None:
         key = fee_cache_key(asin, price, currency)
