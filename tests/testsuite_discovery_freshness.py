@@ -25,6 +25,15 @@ FRESH = (NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
 STALE = (NOW - timedelta(days=40)).isoformat().replace("+00:00", "Z")
 
 
+def valid_gtin(value):
+    body = f"88000{value:08d}"
+    check = (10 - sum(
+        int(digit) * (3 if index % 2 == 0 else 1)
+        for index, digit in enumerate(reversed(body))
+    ) % 10) % 10
+    return body + str(check)
+
+
 def resolved_cache(**changes):
     value = {
         "catalog_status": "resolved",
@@ -118,21 +127,21 @@ class FreshnessPolicyTests(unittest.TestCase):
             for _ in range(500)
         ] + [
             plan_cached_product(None, policy=self.policy, now=NOW)
-            for _ in range(100)
+            for _ in range(5_000)
         ]
         counts = planning_counts(rows)
         self.assertEqual(counts["cache_reuse_count"], 500)
-        self.assertEqual(counts["new_lookup_count"], 100)
+        self.assertEqual(counts["new_lookup_count"], 5_000)
 
-    def test_sixty_thousand_item_counting_is_streaming_and_bounded(self):
+    def test_one_hundred_twenty_thousand_item_counting_is_streaming_and_bounded(self):
         tracemalloc.start()
         counts = planning_counts(
             {"primary_action": PlanAction.NEW_LOOKUP.value}
-            for _ in range(60_000)
+            for _ in range(120_000)
         )
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
-        self.assertEqual(counts["requested_universe_count"], 60_000)
+        self.assertEqual(counts["requested_universe_count"], 120_000)
         self.assertLess(peak, 5 * 1024 * 1024)
 
 
@@ -141,14 +150,7 @@ class PlannerIntegrationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.rotation = DiscoveryRotationStore(root / "rotation.sqlite3")
-        def gtin(value):
-            body = f"880000000{value:03d}"
-            check = (10 - sum(
-                int(digit) * (3 if index % 2 == 0 else 1)
-                for index, digit in enumerate(reversed(body))
-            ) % 10) % 10
-            return body + str(check)
-        self.identifiers = [gtin(value) for value in range(6)]
+        self.identifiers = [valid_gtin(value) for value in range(6)]
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -209,6 +211,51 @@ class PlannerIntegrationTests(unittest.TestCase):
         candidates = list(prepared["candidates"])
         self.assertEqual(prepared["metadata"]["new_lookup_count"], 2)
         self.assertTrue(all(row["amazon_plan"]["primary_action"] == "NEW_LOOKUP" for row in candidates))
+
+    def test_full_universe_mixed_plan_evaluates_all_products(self):
+        identifiers = [valid_gtin(value) for value in range(1_000)]
+        values = {
+            identifier: resolved_cache()
+            for identifier in identifiers[:400]
+        }
+        values.update({
+            identifier: resolved_cache(
+                pricing_observed_at=STALE, competition_observed_at=STALE,
+            )
+            for identifier in identifiers[400:700]
+        })
+        prepared = prepare_incremental_job(
+            self.state("mixed-full"),
+            supplier_store=FakeSupplierStore(identifiers),
+            rotation_store=self.rotation,
+            amazon_cache=FakeCache(values),
+            freshness_policy=AmazonFreshnessPolicy(),
+        )
+        metadata = prepared["metadata"]
+        self.assertEqual(metadata["requested_universe_count"], 1_000)
+        self.assertEqual(metadata["sampled_identifier_count"], 1_000)
+        self.assertEqual(metadata["cache_reuse_count"], 400)
+        self.assertEqual(metadata["refresh_count"], 300)
+        self.assertEqual(metadata["new_lookup_count"], 300)
+
+    def test_qogita_growth_enters_same_cycle_without_reset(self):
+        known = [valid_gtin(value) for value in range(100)]
+        cache = FakeCache({identifier: resolved_cache() for identifier in known})
+        first = prepare_incremental_job(
+            self.state("growth-before"), supplier_store=FakeSupplierStore(known),
+            rotation_store=self.rotation, amazon_cache=cache,
+            freshness_policy=AmazonFreshnessPolicy(),
+        )
+        self.assertEqual(first["metadata"]["rotation_cycle_id"], 1)
+        grown = known + [valid_gtin(value) for value in range(100, 5_100)]
+        second = prepare_incremental_job(
+            self.state("growth-after"), supplier_store=FakeSupplierStore(grown),
+            rotation_store=self.rotation, amazon_cache=cache,
+            freshness_policy=AmazonFreshnessPolicy(),
+        )
+        self.assertEqual(second["metadata"]["rotation_cycle_id"], 1)
+        self.assertEqual(second["metadata"]["requested_universe_count"], 5_100)
+        self.assertEqual(second["metadata"]["new_lookup_count"], 5_000)
 
     def test_stale_pricing_seeds_catalog_but_removes_pricing(self):
         identifier = self.identifiers[0]
@@ -306,39 +353,44 @@ class PlannerIntegrationTests(unittest.TestCase):
         self.assertNotIn("payload_json", columns)
         self.assertEqual(fee_placeholder, "{}")
 
-    def test_fresh_cached_job_completes_without_amazon_calls(self):
+    def test_one_thousand_fresh_cached_products_complete_without_amazon_calls(self):
         root = Path(self.temporary.name)
         store = DiscoveryIncrementalStore(root / "reuse.sqlite3")
-        identifier = self.identifiers[0]
-        listing = {
-            "asin": "B000REUSE", "compatibility_status": "compatible",
-            "beauty_status": "display_group_beauty", "bsr_beauty": 100,
-            "pricing_status": "success", "competition_status": "passed",
-            "fba_sellers": 1, "total_sellers": 2,
-            "reference_price": 25, "currency": "EUR",
-            "catalog_observed_at": FRESH, "pricing_observed_at": FRESH,
-            "competition_observed_at": FRESH,
-        }
+        identifiers = [valid_gtin(value) for value in range(1_000)]
         store.create_job(
             {"job_id": "source", "status": "completed", "phase": "completed", "filters": {}},
-            [{"canonical_ean": identifier, "gtin": identifier,
-              "catalog_status": "resolved", "scenarios": [],
-              "amazon_listings": [listing]}],
+            ({
+                "canonical_ean": identifier, "gtin": identifier,
+                "catalog_status": "resolved", "scenarios": [],
+                "amazon_listings": [{
+                    "asin": f"B{index:09d}", "compatibility_status": "compatible",
+                    "beauty_status": "display_group_beauty", "bsr_beauty": 100,
+                    "pricing_status": "success", "competition_status": "passed",
+                    "fba_sellers": 1, "total_sellers": 2,
+                    "reference_price": 25, "currency": "EUR",
+                    "catalog_observed_at": FRESH, "pricing_observed_at": FRESH,
+                    "competition_observed_at": FRESH,
+                }],
+            } for index, identifier in enumerate(identifiers)),
         )
-        store.upsert_observations("source", [{
-            "observation_id": "fee", "canonical_ean": identifier,
-            "asin": "B000REUSE", "reference_price": 25, "currency": "EUR",
+        store.upsert_observations("source", ({
+            "observation_id": f"fee-{index}", "canonical_ean": identifier,
+            "asin": f"B{index:09d}", "reference_price": 25, "currency": "EUR",
             "fee_status": "valid", "fee_estimate": {
                 "fba_fee": 5, "referral_fee": 3, "total_fees": 8,
             }, "observed_at": FRESH, "fee_last_attempt_at": FRESH,
-        }])
+        } for index, identifier in enumerate(identifiers)))
         cache = DiscoveryAmazonCache(store)
         cache.index_completed_jobs()
         prepared = prepare_incremental_job(
-            self.state("reused", budget=1), supplier_store=FakeSupplierStore([identifier]),
+            self.state("reused"), supplier_store=FakeSupplierStore(identifiers),
             rotation_store=self.rotation, amazon_cache=cache,
             freshness_policy=AmazonFreshnessPolicy(),
         )
+        self.assertEqual(prepared["metadata"]["requested_universe_count"], 1_000)
+        self.assertEqual(prepared["metadata"]["cache_reuse_count"], 1_000)
+        self.assertEqual(prepared["metadata"]["refresh_count"], 0)
+        self.assertEqual(prepared["metadata"]["new_lookup_count"], 0)
         store.create_job(prepared["metadata"], prepared["candidates"])
 
         def forbidden(*args, **kwargs):

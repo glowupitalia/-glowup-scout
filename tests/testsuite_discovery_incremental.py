@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import tracemalloc
 import unittest
 import requests
 from pathlib import Path
@@ -148,16 +149,20 @@ class IncrementalStoreTests(unittest.TestCase):
         self.assertLess(self.checkpoints.path("job").stat().st_size, 4096)
         self.assertLess(total_written, 500_000)
 
-    def test_large_50k_metadata_is_linear_and_checkpoint_is_small(self):
+    def test_large_120k_metadata_is_linear_and_checkpoint_is_small(self):
+        tracemalloc.start()
         self.store.create_job(
             {"job_id": "large", "filters": {}, "phase": "suppliers_loaded"},
-            (candidate(value) for value in range(50_000)),
+            (candidate(value) for value in range(120_000)),
         )
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
         summary = self.store.summary("large")
         size = self.checkpoints.save(summary)
-        self.assertEqual(summary["selected_count"], 50_000)
+        self.assertEqual(summary["selected_count"], 120_000)
         self.assertLess(size, 16_384)
-        self.assertLess(self.store.file_sizes()["database_bytes"], 128 * 1024 * 1024)
+        self.assertLess(peak, 32 * 1024 * 1024)
+        self.assertLess(self.store.file_sizes()["database_bytes"], 320 * 1024 * 1024)
 
     def test_streaming_legacy_migration_preserves_counts_and_file(self):
         legacy = Path(self.temp.name) / "legacy.json"

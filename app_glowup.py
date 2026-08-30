@@ -42,11 +42,7 @@ from purchase_scenarios import (
     scenario_requirement_label,
     target_price,
 )
-from supplier_preparation import (
-    DEFAULT_DISCOVERY_RUN_BUDGET,
-    DISCOVERY_BUDGET_OPTIONS,
-    SUPPORTED_SUPPLIERS,
-)
+from supplier_preparation import SUPPORTED_SUPPLIERS
 from supplier_catalog import SupplierCatalogStore, canonical_gtin14
 from discovery_rotation import DiscoveryRotationStore
 from discovery_jobs import DiscoveryJobRegistry
@@ -829,8 +825,9 @@ def _render_discovery_runtime(job_id):
         progress_value = min(1.0, current / total) if total else 0.02
         st.progress(progress_value)
         st.caption(
-            f"Fase: {str(runtime.get('phase') or 'preparazione').replace('_', ' ')} · "
-            f"{current:,} / {total:,} · ultimo aggiornamento {runtime.get('updated_at') or '—'}"
+            f"Prodotti valutati: {current:,} / {total:,} · "
+            f"fase {str(runtime.get('phase') or 'preparazione').replace('_', ' ')} · "
+            f"ultimo aggiornamento {runtime.get('updated_at') or '—'}"
             .replace(",", ".")
         )
         if runtime["status"] in {"computed", "export_pending", "export_running"}:
@@ -891,7 +888,7 @@ if ui_state == "home":
             total = int(active_discovery.get("progress_total") or 0)
             phase = str(active_discovery.get("phase") or "preparazione").replace("_", " ")
             st.caption(
-                f"Fase: {phase} · {current:,} / {total:,} · "
+                f"Prodotti valutati: {current:,} / {total:,} · fase {phase} · "
                 f"avviata {active_discovery.get('started_at') or '—'}".replace(",", ".")
             )
             if st.button("Apri Discovery", key="open_active_discovery", type="primary"):
@@ -1435,33 +1432,12 @@ elif ui_state == "discovery":
             "minimum_margin": minimum_margin,
             "minimum_qogita_stock": defaults["minimum_qogita_stock"],
         }
-        st.markdown("**Ampiezza ricerca**")
-        previous_budget = st.session_state.get(
-            "discovery_run_budget", DEFAULT_DISCOVERY_RUN_BUDGET,
-        )
-        previous_label = (
-            "Tutto il catalogo" if previous_budget in (None, "all") else str(previous_budget)
-        )
         try:
             universe = discovery_supplier_universe(tuple(selected_suppliers))
         except Exception:
             universe = {"total": 0, "eligible": 0}
         remaining = int(universe.get("rotation_remaining_count") or 0)
         eligible = int(universe.get("eligible") or 0)
-        all_catalog_label = f"Tutto il catalogo — {eligible:,} prodotti".replace(",", ".")
-        budget_labels = [str(value) for value in DISCOVERY_BUDGET_OPTIONS] + [all_catalog_label]
-        budget_label = st.selectbox(
-            "Prodotti da analizzare in questa ricerca",
-            budget_labels,
-            index=(
-                len(budget_labels) - 1
-                if previous_label == "Tutto il catalogo"
-                else budget_labels.index(previous_label)
-                if previous_label in budget_labels else 1
-            ),
-        )
-        run_budget = "all" if budget_label == all_catalog_label else int(budget_label)
-        effective_count = eligible if run_budget == "all" else min(int(run_budget), eligible)
         st.caption(
             "Scout riutilizzerà automaticamente i dati Amazon recenti e "
             "aggiornerà solo quelli necessari."
@@ -1476,16 +1452,15 @@ elif ui_state == "discovery":
                 "refresh_count": min(eligible, global_analyzed),
                 "new_lookup_count": max(0, eligible - global_analyzed),
             }
-        ratio = (effective_count / eligible) if eligible else 0
-        cache_estimate = round(int(cache_preview.get("cache_reuse_count") or 0) * ratio)
-        refresh_estimate = round(int(cache_preview.get("refresh_count") or 0) * ratio)
+        cache_estimate = int(cache_preview.get("cache_reuse_count") or 0)
+        refresh_estimate = int(cache_preview.get("refresh_count") or 0)
         new_estimate = max(
             0,
-            effective_count - cache_estimate - refresh_estimate,
+            eligible - cache_estimate - refresh_estimate,
         )
         st.markdown("**Anteprima**")
         preview_columns = st.columns(4)
-        preview_columns[0].metric("Prodotti da valutare", f"{effective_count:,}".replace(",", "."))
+        preview_columns[0].metric("Prodotti da valutare", f"{eligible:,}".replace(",", "."))
         preview_columns[1].metric("Dalla cache", f"{cache_estimate:,}".replace(",", "."))
         preview_columns[2].metric("Da aggiornare", f"{refresh_estimate:,}".replace(",", "."))
         preview_columns[3].metric("Nuovi", f"{new_estimate:,}".replace(",", "."))
@@ -1504,14 +1479,8 @@ elif ui_state == "discovery":
                 ).replace(",", "."),
                 "info",
             )
-        all_confirmed = True
-        if run_budget == "all" and eligible > 5000:
-            all_confirmed = st.checkbox(
-                "Confermo di voler analizzare tutto il catalogo",
-                key="discovery_confirm_all_catalog",
-                help="La ricerca completa può generare molte chiamate Amazon e richiedere molto tempo.",
-            )
         with st.expander("Dettagli tecnici", expanded=False):
+            planner_actions = cache_preview.get("planner_action_counts") or {}
             st.caption(
                 f"Scope {universe.get('rotation_scope') or '—'} · "
                 f"ciclo {int(universe.get('rotation_cycle_id') or 1)} · "
@@ -1521,6 +1490,14 @@ elif ui_state == "discovery":
                 f"nuovi {new_identifiers:,} · policy {POLICY_VERSION}"
                 .replace(",", ".")
             )
+            if planner_actions:
+                st.caption(
+                    "Planner · " + " · ".join(
+                        f"{action.lower().replace('_', ' ')} {int(count):,}"
+                        for action, count in planner_actions.items()
+                        if int(count)
+                    ).replace(",", ".")
+                )
             can_start_new_cycle = bool(universe.get("rotation_scope_initialized"))
             if st.button(
                 "Nuovo ciclo Discovery", key="discovery_new_cycle",
@@ -1545,30 +1522,57 @@ elif ui_state == "discovery":
                     st.session_state.pop("discovery_new_cycle_confirmation_scope", None)
                     st.rerun()
         validation_error = discovery_filter_error(filters, selected_suppliers)
-        if not validation_error and not all_confirmed:
-            validation_error = "Conferma esplicitamente l'analisi di tutto il catalogo."
+        if not validation_error and eligible == 0:
+            validation_error = "Nessun prodotto idoneo nelle baseline selezionate."
         if validation_error:
             ui_alert(validation_error, "warning")
+        confirmation_signature = (
+            tuple(selected_suppliers), tuple(sorted(filters.items())), eligible,
+        )
+        pending_confirmation = st.session_state.get("discovery_full_confirmation")
+        if pending_confirmation != confirmation_signature:
+            st.session_state.pop("discovery_full_confirmation", None)
+            pending_confirmation = None
         if st.button(
             "Trova opportunità", key="start_discovery", type="primary",
             use_container_width=True,
             disabled=bool(validation_error) or bool(active_discovery),
         ):
-            st.session_state["discovery_filters"] = filters
-            st.session_state["discovery_selected_suppliers"] = selected_suppliers
-            st.session_state["discovery_run_budget"] = run_budget
-            store = DiscoveryCheckpointStore()
-            state = store.create(filters)
-            state["selected_suppliers"] = selected_suppliers
-            state["run_budget"] = run_budget
-            state["discovery_planner_version"] = "automatic_amazon_freshness_v1"
-            state["freshness_policy_version"] = AmazonFreshnessPolicy.from_environment().version
-            state["progress_phase"] = "initialized"
-            state["progress_current"] = 0
-            state["progress_total"] = int(run_budget) if run_budget != "all" else 0
-            store.save(state)
-            _start_discovery_worker(state)
+            st.session_state["discovery_full_confirmation"] = confirmation_signature
             st.rerun()
+        if pending_confirmation == confirmation_signature:
+            st.warning(
+                (
+                    f"Stai per valutare {eligible:,} prodotti. Scout riutilizzerà "
+                    "automaticamente la cache disponibile e aggiornerà solo i dati necessari."
+                ).replace(",", ".")
+            )
+            confirmation_columns = st.columns(2)
+            if confirmation_columns[0].button(
+                "Annulla", key="discovery_cancel_full_catalog",
+            ):
+                st.session_state.pop("discovery_full_confirmation", None)
+                st.rerun()
+            if confirmation_columns[1].button(
+                "Avvia Discovery", key="discovery_start_full_catalog", type="primary",
+            ):
+                st.session_state["discovery_filters"] = filters
+                st.session_state["discovery_selected_suppliers"] = selected_suppliers
+                store = DiscoveryCheckpointStore()
+                state = store.create(filters)
+                state["selected_suppliers"] = selected_suppliers
+                state["run_budget"] = "all"
+                state["discovery_planner_version"] = "automatic_amazon_freshness_v1"
+                state["freshness_policy_version"] = (
+                    AmazonFreshnessPolicy.from_environment().version
+                )
+                state["progress_phase"] = "initialized"
+                state["progress_current"] = 0
+                state["progress_total"] = eligible
+                store.save(state)
+                st.session_state.pop("discovery_full_confirmation", None)
+                _start_discovery_worker(state)
+                st.rerun()
 
         incomplete = DiscoveryCheckpointStore().latest_incomplete()
         if incomplete and not active_discovery and st.button(
@@ -1665,8 +1669,7 @@ elif ui_state == "discovery_result":
             funnel = discovery_funnel_view(state)
             st.caption(
                 f"Universo supplier: {int(state.get('total_supplier_ean_universe') or 0):,} EAN · "
-                f"budget: {state.get('run_budget', 'all')} · "
-                f"campione analizzato: {int(state.get('sampled_identifier_count') or len(state.get('candidates') or [])):,}"
+                f"prodotti valutati: {int(state.get('sampled_identifier_count') or len(state.get('candidates') or [])):,}"
                 .replace(",", ".")
             )
             if state.get("rotation_scope"):

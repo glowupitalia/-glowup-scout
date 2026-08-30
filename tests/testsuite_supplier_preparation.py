@@ -404,24 +404,36 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         self.assertEqual(values["BSR minimo"], 0)
         self.assertEqual(values["BSR massimo"], 20000)
         self.assertEqual(values["Margine minimo %"], 15)
-        self.assertEqual(
-            next(row for row in app.selectbox if row.label == "Prodotti da analizzare in questa ricerca").value,
-            "500",
-        )
+        self.assertFalse(any(
+            row.label == "Prodotti da analizzare in questa ricerca"
+            for row in app.selectbox
+        ))
         self.assertTrue(any(row.label == "Nuovo ciclo Discovery" for row in app.button))
-        budget_select = next(
-            row for row in app.selectbox
-            if row.label == "Prodotti da analizzare in questa ricerca"
+        metrics = {row.label: row.value for row in app.metric}
+        self.assertEqual(metrics["Prodotti da valutare"], "3")
+        self.assertEqual(metrics["Nuovi"], "3")
+        rendered = " ".join(
+            [row.value for row in app.markdown]
+            + [row.value for row in app.caption]
         )
-        self.assertTrue(any(
-            str(option).startswith("Tutto il catalogo —")
-            for option in budget_select.options
-        ))
-        self.assertTrue(any(
-            str(option).endswith("prodotti") and "rimanenti" not in str(option)
-            for option in budget_select.options
-        ))
+        self.assertNotIn("Ampiezza ricerca", rendered)
         self.assertTrue(any(row.label == "Dettagli tecnici" for row in app.expander))
+
+    def test_full_catalog_start_requires_simple_second_confirmation(self):
+        app = self.discovery_app()
+        app = next(
+            row for row in app.button if row.label == "Trova opportunità"
+        ).click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any(row.label == "Annulla" for row in app.button))
+        self.assertTrue(any(row.label == "Avvia Discovery" for row in app.button))
+        self.assertTrue(any(
+            "Stai per valutare 3 prodotti" in row.value for row in app.warning
+        ))
+        self.assertFalse(any(
+            row.label == "Prodotti da analizzare in questa ricerca"
+            for row in app.selectbox
+        ))
 
     def test_tutti_tracks_individual_selection(self):
         app = self.discovery_app()
