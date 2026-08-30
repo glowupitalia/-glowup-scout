@@ -20,6 +20,8 @@ from supplier_preparation import (
 )
 from supplier_catalog import SupplierCatalogGeneration, SupplierCatalogStore, candidates_to_cache_records
 from discovery_rotation import DiscoveryRotationStore
+from discovery_freshness import DiscoveryAmazonCache
+from discovery_jobs import DiscoveryJobRegistry
 
 
 NOW = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
@@ -326,6 +328,7 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             {
                 "DISCOVERY_ROTATION_DATABASE": str(self.rotation_path),
                 "DISCOVERY_INCREMENTAL_DATABASE": str(root / "incremental.sqlite3"),
+                "DISCOVERY_JOB_DATABASE": str(root / "jobs.sqlite3"),
             },
         )
         self.environment.start()
@@ -421,6 +424,17 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
 
     def test_full_catalog_start_requires_simple_second_confirmation(self):
         app = self.discovery_app()
+        requested_filters = {
+            "BSR minimo": 0,
+            "BSR massimo": 20000,
+            "Venditori FBA massimi": 10,
+            "Venditori totali massimi": 10,
+            "Margine minimo %": 25,
+        }
+        for row in app.number_input:
+            if row.label in requested_filters:
+                row.set_value(requested_filters[row.label])
+        app = app.run()
         app = next(
             row for row in app.button if row.label == "Trova opportunità"
         ).click().run()
@@ -430,10 +444,44 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         self.assertTrue(any(
             "Stai per valutare 3 prodotti" in row.value for row in app.warning
         ))
+        self.assertEqual(
+            {row.label: row.value for row in app.number_input},
+            requested_filters,
+        )
         self.assertFalse(any(
             row.label == "Prodotti da analizzare in questa ricerca"
             for row in app.selectbox
         ))
+
+    def test_production_preview_failure_keeps_full_catalog_cta_visible(self):
+        registry = DiscoveryJobRegistry()
+        self.assertIsNone(registry.latest())
+        with patch.object(
+            DiscoveryAmazonCache, "preview_counts",
+            side_effect=TimeoutError("production-size preview timeout"),
+        ):
+            app = self.discovery_app()
+            self.assertEqual(len(app.exception), 0)
+            metrics = {row.label: row.value for row in app.metric}
+            self.assertEqual(metrics["Prodotti da valutare"], "3")
+            self.assertEqual(metrics["Dalla cache"], "—")
+            self.assertEqual(metrics["Da aggiornare"], "—")
+            self.assertEqual(metrics["Nuovi"], "—")
+            start = next(
+                row for row in app.button if row.label == "Trova opportunità"
+            )
+            self.assertFalse(start.disabled)
+            self.assertTrue(any(
+                "Anteprima cache temporaneamente non disponibile" in row.value
+                for row in app.warning
+            ))
+            app = start.click().run()
+            self.assertTrue(any(row.label == "Annulla" for row in app.button))
+            self.assertTrue(any(row.label == "Avvia Discovery" for row in app.button))
+            self.assertTrue(any(
+                "Stai per valutare 3 prodotti" in row.value for row in app.warning
+            ))
+        self.assertIsNone(registry.latest())
 
     def test_tutti_tracks_individual_selection(self):
         app = self.discovery_app()

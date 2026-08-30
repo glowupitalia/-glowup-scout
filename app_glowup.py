@@ -1444,26 +1444,16 @@ elif ui_state == "discovery":
         )
         global_analyzed = int(universe.get("rotation_global_analyzed_count") or 0)
         new_identifiers = int(universe.get("rotation_new_identifier_count") or 0)
-        try:
-            cache_preview = discovery_amazon_plan_preview(tuple(selected_suppliers))
-        except Exception:
-            cache_preview = {
-                "cache_reuse_count": 0,
-                "refresh_count": min(eligible, global_analyzed),
-                "new_lookup_count": max(0, eligible - global_analyzed),
-            }
-        cache_estimate = int(cache_preview.get("cache_reuse_count") or 0)
-        refresh_estimate = int(cache_preview.get("refresh_count") or 0)
-        new_estimate = max(
-            0,
-            eligible - cache_estimate - refresh_estimate,
-        )
         st.markdown("**Anteprima**")
         preview_columns = st.columns(4)
         preview_columns[0].metric("Prodotti da valutare", f"{eligible:,}".replace(",", "."))
-        preview_columns[1].metric("Dalla cache", f"{cache_estimate:,}".replace(",", "."))
-        preview_columns[2].metric("Da aggiornare", f"{refresh_estimate:,}".replace(",", "."))
-        preview_columns[3].metric("Nuovi", f"{new_estimate:,}".replace(",", "."))
+        cache_preview_slot = preview_columns[1].empty()
+        refresh_preview_slot = preview_columns[2].empty()
+        new_preview_slot = preview_columns[3].empty()
+        cache_preview_slot.metric("Dalla cache", "Calcolo…")
+        refresh_preview_slot.metric("Da aggiornare", "Calcolo…")
+        new_preview_slot.metric("Nuovi", "Calcolo…")
+        preview_message_slot = st.empty()
         added_suppliers = universe.get("rotation_added_suppliers") or []
         if universe.get("rotation_previous_scope") and added_suppliers:
             added_labels = " · ".join(
@@ -1480,7 +1470,6 @@ elif ui_state == "discovery":
                 "info",
             )
         with st.expander("Dettagli tecnici", expanded=False):
-            planner_actions = cache_preview.get("planner_action_counts") or {}
             st.caption(
                 f"Scope {universe.get('rotation_scope') or '—'} · "
                 f"ciclo {int(universe.get('rotation_cycle_id') or 1)} · "
@@ -1490,14 +1479,8 @@ elif ui_state == "discovery":
                 f"nuovi {new_identifiers:,} · policy {POLICY_VERSION}"
                 .replace(",", ".")
             )
-            if planner_actions:
-                st.caption(
-                    "Planner · " + " · ".join(
-                        f"{action.lower().replace('_', ' ')} {int(count):,}"
-                        for action, count in planner_actions.items()
-                        if int(count)
-                    ).replace(",", ".")
-                )
+            planner_details_slot = st.empty()
+            planner_details_slot.caption("Planner · calcolo anteprima in corso…")
             can_start_new_cycle = bool(universe.get("rotation_scope_initialized"))
             if st.button(
                 "Nuovo ciclo Discovery", key="discovery_new_cycle",
@@ -1573,6 +1556,56 @@ elif ui_state == "discovery":
                 st.session_state.pop("discovery_full_confirmation", None)
                 _start_discovery_worker(state)
                 st.rerun()
+
+        if selected_suppliers and eligible:
+            try:
+                with st.spinner("Calcolo della disponibilità cache in corso…"):
+                    cache_preview = discovery_amazon_plan_preview(
+                        tuple(selected_suppliers)
+                    )
+            except Exception:
+                logger.exception("DISCOVERY CACHE PREVIEW FAILED")
+                cache_preview_slot.metric("Dalla cache", "—")
+                refresh_preview_slot.metric("Da aggiornare", "—")
+                new_preview_slot.metric("Nuovi", "—")
+                preview_message_slot.warning(
+                    "Anteprima cache temporaneamente non disponibile. "
+                    "Puoi comunque avviare la Discovery: il planner ricalcolerà "
+                    "il lavoro necessario nel job persistente."
+                )
+                planner_details_slot.caption("Planner · anteprima non disponibile")
+            else:
+                cache_estimate = int(cache_preview.get("cache_reuse_count") or 0)
+                refresh_estimate = int(cache_preview.get("refresh_count") or 0)
+                new_estimate = max(
+                    0,
+                    eligible - cache_estimate - refresh_estimate,
+                )
+                cache_preview_slot.metric(
+                    "Dalla cache", f"{cache_estimate:,}".replace(",", ".")
+                )
+                refresh_preview_slot.metric(
+                    "Da aggiornare", f"{refresh_estimate:,}".replace(",", ".")
+                )
+                new_preview_slot.metric(
+                    "Nuovi", f"{new_estimate:,}".replace(",", ".")
+                )
+                planner_actions = cache_preview.get("planner_action_counts") or {}
+                if planner_actions:
+                    planner_details_slot.caption(
+                        "Planner · " + " · ".join(
+                            f"{action.lower().replace('_', ' ')} {int(count):,}"
+                            for action, count in planner_actions.items()
+                            if int(count)
+                        ).replace(",", ".")
+                    )
+                else:
+                    planner_details_slot.caption("Planner · nessun lavoro pianificato")
+        else:
+            cache_preview_slot.metric("Dalla cache", "0")
+            refresh_preview_slot.metric("Da aggiornare", "0")
+            new_preview_slot.metric("Nuovi", "0")
+            planner_details_slot.caption("Planner · nessun prodotto idoneo")
 
         incomplete = DiscoveryCheckpointStore().latest_incomplete()
         if incomplete and not active_discovery and st.button(
