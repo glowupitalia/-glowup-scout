@@ -53,6 +53,7 @@ def run_incremental_discovery(
     metadata_store: LightweightCheckpointStore,
     catalog_batch, pricing_batch, fees_batch, token_provider,
     rotation_store=None, resource_governor: DiscoveryResourceGovernor | None = None,
+    amazon_cache=None, freshness_policy=None,
     progress=None, sleep_func=time.sleep, catalog_batch_interval: float = 0.5,
     pricing_batch_interval: float = 10.0, fee_batch_interval: float = 2.0,
 ) -> dict[str, Any]:
@@ -237,7 +238,22 @@ def run_incremental_discovery(
                 else:
                     listing.pop("exclusion_reason", None)
                     listing.pop("exclusion_reasons", None)
-            observations_batch.extend(_build_amazon_observations([candidate]))
+            new_observations = _build_amazon_observations([candidate])
+            if amazon_cache is not None:
+                from discovery_freshness import AmazonFreshnessPolicy, reusable_fee
+
+                policy = freshness_policy or AmazonFreshnessPolicy.from_environment()
+                for observation in new_observations:
+                    cached_fee = amazon_cache.fee(
+                        observation.get("asin"), observation.get("reference_price"),
+                        observation.get("currency") or "EUR",
+                    )
+                    if reusable_fee(cached_fee, policy):
+                        for key, value in cached_fee.items():
+                            if key.startswith("fee_") or key == "fee_status":
+                                observation[key] = value
+                        observation["fee_cache_reused"] = True
+            observations_batch.extend(new_observations)
             transformed.append(candidate)
             if len(transformed) == 250:
                 store.upsert_observations(job_id, observations_batch)

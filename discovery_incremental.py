@@ -1122,7 +1122,8 @@ class LightweightCheckpointStore:
 
 
 def prepare_incremental_job(
-    state: dict[str, Any], *, supplier_store, rotation_store,
+    state: dict[str, Any], *, supplier_store, rotation_store, amazon_cache=None,
+    freshness_policy=None,
 ) -> dict[str, Any]:
     """Freeze a supplier-first selection without loading the full union payload.
 
@@ -1175,25 +1176,89 @@ def prepare_incremental_job(
     ]
     budget = state.get("run_budget")
     budget = None if budget in {None, "all"} else int(budget)
-    selected_stubs, rotation = rotation_store.select(
-        state["job_id"], stubs, usable, budget,
-        supplier_snapshot_set=snapshots,
-    )
+    planner_version = state.get("discovery_planner_version")
+    planned: dict[str, dict[str, Any]] = {}
+    if planner_version:
+        from discovery_freshness import (
+            AmazonFreshnessPolicy, DiscoveryAmazonCache, PlanAction,
+            plan_cached_product, planning_counts,
+        )
+
+        policy = freshness_policy or AmazonFreshnessPolicy.from_environment()
+        if amazon_cache is None:
+            amazon_cache = DiscoveryAmazonCache(DiscoveryIncrementalStore())
+        amazon_cache.index_completed_jobs()
+        action_order = {
+            PlanAction.NEW_LOOKUP.value: 0,
+            PlanAction.REFRESH_CATALOG.value: 1,
+            PlanAction.REFRESH_BSR.value: 1,
+            PlanAction.REFRESH_PRICING.value: 2,
+            PlanAction.REFRESH_FEES.value: 3,
+            PlanAction.CACHE_REUSE.value: 4,
+        }
+        for identifier, cached in amazon_cache.get_many(sorted(memberships)):
+            planned[identifier] = plan_cached_product(cached, policy=policy)
+        selected_stubs, rotation = rotation_store.select_current_universe(
+            state["job_id"], stubs, usable, budget,
+            supplier_snapshot_set=snapshots,
+            action_priority={
+                identifier: action_order[value["primary_action"]]
+                for identifier, value in planned.items()
+            },
+        )
+    else:
+        policy = None
+        selected_stubs, rotation = rotation_store.select(
+            state["job_id"], stubs, usable, budget,
+            supplier_snapshot_set=snapshots,
+        )
     selected_identifiers = [row["canonical_ean"] for row in selected_stubs]
 
+    def build_candidate(identifier, cached=None):
+        collections = []
+        for supplier in memberships.get(identifier, ()):
+            collections.append(
+                supplier_store.active_candidates_for_identifier(supplier, identifier)
+            )
+        merged = merge_product_candidates(*collections)
+        if len(merged) != 1:
+            raise ValueError(
+                f"Frozen identifier {identifier} produced {len(merged)} candidates"
+            )
+        candidate = merged[0]
+        if planner_version:
+            plan = planned[identifier]
+            cached = cached or {}
+            actions = set(plan["actions"])
+            candidate["amazon_plan"] = plan
+            if not ({"REFRESH_CATALOG", "REFRESH_BSR", "NEW_LOOKUP"} & actions):
+                candidate["catalog_status"] = cached.get("catalog_status")
+                candidate["catalog_diagnostics"] = {
+                    "cache_source_job_id": cached.get("source_job_id"),
+                    "cache_reused": True,
+                }
+                listings = [dict(row) for row in cached.get("amazon_listings") or []]
+                if "REFRESH_PRICING" in actions:
+                    for listing in listings:
+                        for key in (
+                            "pricing_status", "fba_sellers", "total_sellers",
+                            "seller_count_source", "reference_price", "price_source",
+                            "min_fba_price", "min_fbm_price", "competition_status",
+                            "pricing_observed_at", "competition_observed_at",
+                        ):
+                            listing.pop(key, None)
+                candidate["amazon_listings"] = listings
+            return candidate
+        else:
+            return candidate
+
     def candidates():
-        for identifier in selected_identifiers:
-            collections = []
-            for supplier in memberships.get(identifier, ()):
-                collections.append(
-                    supplier_store.active_candidates_for_identifier(supplier, identifier)
-                )
-            merged = merge_product_candidates(*collections)
-            if len(merged) != 1:
-                raise ValueError(
-                    f"Frozen identifier {identifier} produced {len(merged)} candidates"
-                )
-            yield merged[0]
+        if planner_version:
+            for identifier, cached in amazon_cache.get_many(selected_identifiers):
+                yield build_candidate(identifier, cached)
+        else:
+            for identifier in selected_identifiers:
+                yield build_candidate(identifier)
 
     metadata = {
         **state, **rotation,
@@ -1208,4 +1273,15 @@ def prepare_incremental_job(
         "sampled_identifier_count": len(selected_identifiers),
         "total_supplier_ean_universe": len(memberships),
     }
+    if planner_version:
+        selected_plans = [planned[identifier] for identifier in selected_identifiers]
+        metadata.update(planning_counts(selected_plans))
+        metadata.update({
+            "requested_universe_count": (
+                len(memberships) if budget is None else len(selected_identifiers)
+            ),
+            "freshness_policy_version": policy.version,
+            "freshness_policy": policy.as_metadata(),
+            "discovery_planner_version": planner_version,
+        })
     return {"metadata": metadata, "candidates": candidates()}

@@ -31,6 +31,7 @@ from notifications import send_discovery_terminal_notification
 from product_fees import search_product_fees_batch
 from supplier_catalog import SupplierCatalogStore
 from discovery_rotation import DiscoveryRotationStore
+from discovery_freshness import DiscoveryAmazonCache
 
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
     if not registry.claim(job_id, pid=pid):
         raise RuntimeError(f"Discovery job {job_id} is already owned by another worker")
     incremental_store = DiscoveryIncrementalStore()
+    amazon_cache = DiscoveryAmazonCache(incremental_store)
     incremental = incremental_store.has_job(job_id)
     state = (
         LightweightCheckpointStore().load(job_id)
@@ -101,6 +103,7 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
         prepared = prepare_incremental_job(
             state, supplier_store=SupplierCatalogStore(),
             rotation_store=DiscoveryRotationStore(),
+            amazon_cache=amazon_cache,
         )
         incremental_store.create_job(
             prepared["metadata"], prepared["candidates"],
@@ -140,6 +143,7 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
                 catalog_batch=catalog_batch, pricing_batch=pricing_batch,
                 fees_batch=search_product_fees_batch, token_provider=token_provider,
                 rotation_store=DiscoveryRotationStore(),
+                amazon_cache=amazon_cache,
                 progress=progress,
                 resource_governor=DiscoveryResourceGovernor(
                     database_path=incremental_store.path,
@@ -154,6 +158,7 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
                 run_budget=state.get("run_budget"), progress=progress,
             )
         if incremental and result.get("status") == "completed":
+            amazon_cache.index_completed_jobs()
             # Persist a small hand-off and let a clean interpreter perform the
             # export.  The computation process can then exit and the OS releases
             # every Catalog/economics object before workbook generation starts.

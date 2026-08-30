@@ -434,6 +434,97 @@ class DiscoveryRotationStore:
         }
         return selected_rows, metadata
 
+    def select_current_universe(
+        self, job_id: str, candidates: list[dict[str, Any]],
+        selected_suppliers: Iterable[str], budget: int | None, *,
+        supplier_snapshot_set: dict[str, Any] | None = None,
+        action_priority: dict[str, int] | None = None,
+        now: str | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Select from the whole active universe without resetting a cycle.
+
+        This V2 entry point leaves ``select`` unchanged for legacy jobs.  The
+        current cycle remains audit/fairness state, while filters and full-
+        universe evaluation no longer require an artificial cycle reset.
+        """
+        if not job_id:
+            raise ValueError("Rotation selection requires a job_id")
+        observed = now or _now()
+        selected = normalize_rotation_suppliers(selected_suppliers)
+        scope = rotation_scope_key(selected)
+        self.sync_universe(
+            candidates, selected, supplier_snapshot_set=supplier_snapshot_set, now=observed,
+        )
+        by_identifier = {
+            str(row.get("canonical_ean")): row for row in candidates
+            if canonical_gtin14(row.get("canonical_ean")) is not None
+        }
+        priorities = action_priority or {}
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """SELECT canonical_identifier,cycle_id FROM discovery_rotation_selections
+                   WHERE job_id=? AND scope_key=? ORDER BY canonical_identifier""",
+                (job_id, scope),
+            ).fetchall()
+            scope_row = self._scope_row(connection, scope)
+            cycle = int(scope_row["current_cycle_id"])
+            if existing:
+                identifiers = [row["canonical_identifier"] for row in existing]
+                cycle = int(existing[0]["cycle_id"])
+            else:
+                active = connection.execute(
+                    "SELECT * FROM discovery_rotation_items WHERE scope_key=? AND active=1",
+                    (scope,),
+                ).fetchall()
+                ordered = sorted(
+                    active,
+                    key=lambda row: (
+                        int(priorities.get(str(row["canonical_identifier"]), 99)),
+                        -int(row["priority_new"]),
+                        row["last_discovery_at"] is not None,
+                        row["last_discovery_at"] or "",
+                        hashlib.sha256(
+                            f"{scope}:{row['canonical_identifier']}".encode("utf-8")
+                        ).hexdigest(),
+                    ),
+                )
+                count = len(ordered) if budget is None else min(int(budget), len(ordered))
+                identifiers = [row["canonical_identifier"] for row in ordered[:count]]
+                connection.executemany(
+                    """INSERT INTO discovery_rotation_selections
+                       (job_id,scope_key,cycle_id,canonical_identifier,selected_at,status)
+                       VALUES (?,?,?,?,?,'selected')""",
+                    [(job_id, scope, cycle, identifier, observed) for identifier in identifiers],
+                )
+            universe = connection.execute(
+                "SELECT COUNT(*) FROM discovery_rotation_items WHERE scope_key=? AND active=1",
+                (scope,),
+            ).fetchone()[0]
+            analyzed_before = connection.execute(
+                """SELECT COUNT(*) FROM discovery_rotation_items
+                   WHERE scope_key=? AND active=1 AND last_analyzed_cycle=?""",
+                (scope, cycle),
+            ).fetchone()[0]
+            connection.commit()
+        selected_rows = [by_identifier[value] for value in identifiers if value in by_identifier]
+        scope_status = self.status(selected)
+        metadata = {
+            **{key: value for key, value in scope_status.items() if key.startswith("rotation_")},
+            "rotation_scope": scope,
+            "rotation_cycle_id": cycle,
+            "rotation_universe_count": universe,
+            "rotation_analyzed_before_run": analyzed_before,
+            "rotation_selected_identifiers": identifiers,
+            "rotation_analyzed_this_run": 0,
+            "rotation_remaining_after_run": max(0, universe - analyzed_before),
+            "run_budget": "all" if budget is None else int(budget),
+            "sampled_identifier_count": len(selected_rows),
+            "sampling_strategy": "automatic_amazon_freshness_v1",
+            "rotation_selection_mode": "current_universe",
+        }
+        return selected_rows, metadata
+
     def commit_catalog_results(
         self, job_id: str, statuses: dict[str, Any], *, now: str | None = None,
     ) -> dict[str, Any]:

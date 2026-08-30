@@ -323,7 +323,10 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         self.rotation_path = root / "rotation.sqlite3"
         self.environment = patch.dict(
             os.environ,
-            {"DISCOVERY_ROTATION_DATABASE": str(self.rotation_path)},
+            {
+                "DISCOVERY_ROTATION_DATABASE": str(self.rotation_path),
+                "DISCOVERY_INCREMENTAL_DATABASE": str(root / "incremental.sqlite3"),
+            },
         )
         self.environment.start()
         original_init = SupplierCatalogStore.__init__
@@ -414,6 +417,11 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             str(option).startswith("Tutto il catalogo —")
             for option in budget_select.options
         ))
+        self.assertTrue(any(
+            str(option).endswith("prodotti") and "rimanenti" not in str(option)
+            for option in budget_select.options
+        ))
+        self.assertTrue(any(row.label == "Dettagli tecnici" for row in app.expander))
 
     def test_tutti_tracks_individual_selection(self):
         app = self.discovery_app()

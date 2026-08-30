@@ -51,6 +51,9 @@ from supplier_catalog import SupplierCatalogStore, canonical_gtin14
 from discovery_rotation import DiscoveryRotationStore
 from discovery_jobs import DiscoveryJobRegistry
 from notifications import EmailConfig, NotificationOutbox
+from discovery_freshness import AmazonFreshnessPolicy, POLICY_VERSION
+from discovery_freshness import DiscoveryAmazonCache
+from discovery_incremental import DiscoveryIncrementalStore
 
 
 DISCOVERY_OPERATIONAL_SUPPLIERS = ("qogita", "umma", "abw", "qudo")
@@ -742,6 +745,20 @@ def discovery_supplier_universe(selected_suppliers):
     return {**result, **rotation}
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def discovery_amazon_plan_preview(selected_suppliers):
+    if not selected_suppliers:
+        return {
+            "requested_universe_count": 0, "cache_reuse_count": 0,
+            "refresh_count": 0, "new_lookup_count": 0,
+        }
+    identifiers = SupplierCatalogStore().active_identifiers(selected_suppliers)
+    eligible = [value for value in identifiers if canonical_gtin14(value) is not None]
+    return DiscoveryAmazonCache(DiscoveryIncrementalStore()).preview_counts(
+        eligible, AmazonFreshnessPolicy.from_environment(),
+    )
+
+
 def new_discovery_search():
     st.session_state["ui_state"] = "discovery"
     st.session_state.pop("discovery_result", None)
@@ -1430,7 +1447,8 @@ elif ui_state == "discovery":
         except Exception:
             universe = {"total": 0, "eligible": 0}
         remaining = int(universe.get("rotation_remaining_count") or 0)
-        all_catalog_label = f"Tutto il catalogo — {remaining:,} rimanenti".replace(",", ".")
+        eligible = int(universe.get("eligible") or 0)
+        all_catalog_label = f"Tutto il catalogo — {eligible:,} prodotti".replace(",", ".")
         budget_labels = [str(value) for value in DISCOVERY_BUDGET_OPTIONS] + [all_catalog_label]
         budget_label = st.selectbox(
             "Prodotti da analizzare in questa ricerca",
@@ -1443,24 +1461,34 @@ elif ui_state == "discovery":
             ),
         )
         run_budget = "all" if budget_label == all_catalog_label else int(budget_label)
-        effective_count = remaining if run_budget == "all" else min(int(run_budget), remaining)
-        st.markdown("**Copertura Discovery**")
+        effective_count = eligible if run_budget == "all" else min(int(run_budget), eligible)
         st.caption(
-            f"Scope: {universe.get('rotation_scope') or '—'} · "
-            f"ciclo {int(universe.get('rotation_cycle_id') or 1)} · "
-            f"universo {universe['total']:,} EAN · idonei {universe['eligible']:,} · "
-            f"{int(universe.get('rotation_analyzed_count') or 0):,} analizzati · "
-            f"{remaining:,} rimanenti · copertura "
-            f"{float(universe.get('rotation_coverage_percent') or 0):.1f}% · "
-            f"prossima ricerca {effective_count:,}"
-            .replace(",", ".")
+            "Scout riutilizzerà automaticamente i dati Amazon recenti e "
+            "aggiornerà solo quelli necessari."
         )
         global_analyzed = int(universe.get("rotation_global_analyzed_count") or 0)
         new_identifiers = int(universe.get("rotation_new_identifier_count") or 0)
-        st.caption(
-            f"Storico Amazon globale: {global_analyzed:,} EAN già analizzati · "
-            f"nuovi nello scope/catalogo corrente: {new_identifiers:,}".replace(",", ".")
+        try:
+            cache_preview = discovery_amazon_plan_preview(tuple(selected_suppliers))
+        except Exception:
+            cache_preview = {
+                "cache_reuse_count": 0,
+                "refresh_count": min(eligible, global_analyzed),
+                "new_lookup_count": max(0, eligible - global_analyzed),
+            }
+        ratio = (effective_count / eligible) if eligible else 0
+        cache_estimate = round(int(cache_preview.get("cache_reuse_count") or 0) * ratio)
+        refresh_estimate = round(int(cache_preview.get("refresh_count") or 0) * ratio)
+        new_estimate = max(
+            0,
+            effective_count - cache_estimate - refresh_estimate,
         )
+        st.markdown("**Anteprima**")
+        preview_columns = st.columns(4)
+        preview_columns[0].metric("Prodotti da valutare", f"{effective_count:,}".replace(",", "."))
+        preview_columns[1].metric("Dalla cache", f"{cache_estimate:,}".replace(",", "."))
+        preview_columns[2].metric("Da aggiornare", f"{refresh_estimate:,}".replace(",", "."))
+        preview_columns[3].metric("Nuovi", f"{new_estimate:,}".replace(",", "."))
         added_suppliers = universe.get("rotation_added_suppliers") or []
         if universe.get("rotation_previous_scope") and added_suppliers:
             added_labels = " · ".join(
@@ -1476,66 +1504,47 @@ elif ui_state == "discovery":
                 ).replace(",", "."),
                 "info",
             )
-        if universe.get("rotation_cycle_complete"):
-            ui_alert(
-                "Il ciclo corrente è completo. Avvia esplicitamente un nuovo ciclo "
-                "prima di una nuova Discovery.",
-                "info",
-            )
         all_confirmed = True
-        if run_budget == "all" and remaining > 5000:
+        if run_budget == "all" and eligible > 5000:
             all_confirmed = st.checkbox(
                 "Confermo di voler analizzare tutto il catalogo",
                 key="discovery_confirm_all_catalog",
                 help="La ricerca completa può generare molte chiamate Amazon e richiedere molto tempo.",
             )
-        st.markdown("**Gestione ciclo**")
-        can_start_new_cycle = bool(universe.get("rotation_scope_initialized"))
-        if st.button(
-            "Nuovo ciclo Discovery", key="discovery_new_cycle",
-            disabled=bool(active_discovery) or not can_start_new_cycle,
-            help=(
-                "Il primo ciclo verrà creato con la prima Discovery per questo insieme fornitori."
-                if not can_start_new_cycle else None
-            ),
-        ):
-            st.session_state["discovery_new_cycle_confirmation_scope"] = universe.get(
-                "rotation_scope"
+        with st.expander("Dettagli tecnici", expanded=False):
+            st.caption(
+                f"Scope {universe.get('rotation_scope') or '—'} · "
+                f"ciclo {int(universe.get('rotation_cycle_id') or 1)} · "
+                f"universo {universe['total']:,} · analizzati "
+                f"{int(universe.get('rotation_analyzed_count') or 0):,} · "
+                f"rimanenti {remaining:,} · storico globale {global_analyzed:,} · "
+                f"nuovi {new_identifiers:,} · policy {POLICY_VERSION}"
+                .replace(",", ".")
             )
-            st.rerun()
-        confirmation_scope = st.session_state.get(
-            "discovery_new_cycle_confirmation_scope"
-        )
-        if confirmation_scope == universe.get("rotation_scope"):
-            st.warning(
-                (
-                    "Vuoi iniziare un nuovo ciclo? "
-                    f"I {universe['eligible']:,} prodotti dell'universo corrente torneranno "
-                    "eleggibili. Lo storico dei cicli, dei job e delle analisi Amazon sarà conservato."
-                ).replace(",", ".")
-            )
-            confirm_columns = st.columns(2)
-            if confirm_columns[0].button(
-                "Conferma nuovo ciclo", key="discovery_confirm_new_cycle",
-                type="primary",
+            can_start_new_cycle = bool(universe.get("rotation_scope_initialized"))
+            if st.button(
+                "Nuovo ciclo Discovery", key="discovery_new_cycle",
+                disabled=bool(active_discovery) or not can_start_new_cycle,
             ):
-                try:
-                    DiscoveryRotationStore().start_new_cycle(
-                        selected_suppliers, confirmed=True,
-                    )
+                st.session_state["discovery_new_cycle_confirmation_scope"] = universe.get(
+                    "rotation_scope"
+                )
+                st.rerun()
+            confirmation_scope = st.session_state.get("discovery_new_cycle_confirmation_scope")
+            if confirmation_scope == universe.get("rotation_scope"):
+                st.warning("Conferma il nuovo ciclo tecnico. Lo storico globale sarà preservato.")
+                confirm_columns = st.columns(2)
+                if confirm_columns[0].button(
+                    "Conferma nuovo ciclo", key="discovery_confirm_new_cycle", type="primary",
+                ):
+                    DiscoveryRotationStore().start_new_cycle(selected_suppliers, confirmed=True)
                     discovery_supplier_universe.clear()
                     st.session_state.pop("discovery_new_cycle_confirmation_scope", None)
                     st.rerun()
-                except Exception as exc:
-                    ui_alert(f"Impossibile avviare il nuovo ciclo: {exc}", "warning")
-            if confirm_columns[1].button(
-                "Annulla", key="discovery_cancel_new_cycle",
-            ):
-                st.session_state.pop("discovery_new_cycle_confirmation_scope", None)
-                st.rerun()
+                if confirm_columns[1].button("Annulla", key="discovery_cancel_new_cycle"):
+                    st.session_state.pop("discovery_new_cycle_confirmation_scope", None)
+                    st.rerun()
         validation_error = discovery_filter_error(filters, selected_suppliers)
-        if not validation_error and universe.get("rotation_cycle_complete"):
-            validation_error = "Il ciclo corrente è completo: avvia un nuovo ciclo Discovery."
         if not validation_error and not all_confirmed:
             validation_error = "Conferma esplicitamente l'analisi di tutto il catalogo."
         if validation_error:
@@ -1552,6 +1561,8 @@ elif ui_state == "discovery":
             state = store.create(filters)
             state["selected_suppliers"] = selected_suppliers
             state["run_budget"] = run_budget
+            state["discovery_planner_version"] = "automatic_amazon_freshness_v1"
+            state["freshness_policy_version"] = AmazonFreshnessPolicy.from_environment().version
             state["progress_phase"] = "initialized"
             state["progress_current"] = 0
             state["progress_total"] = int(run_budget) if run_budget != "all" else 0
