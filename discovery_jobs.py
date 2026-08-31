@@ -30,6 +30,12 @@ RESUMABLE_CHECKPOINT_STATUSES = {
     "computed", "export_pending", "export_running", "export_resource_paused",
     "export_complete", "notification_pending",
 }
+TERMINAL_STATUSES = {
+    "completed", "cancelled", "canceled", "legacy_incompatible",
+}
+STATE_SOURCE_AUTHORITY = {
+    "legacy": 0, "compact": 1, "incremental": 2, "registry": 3,
+}
 
 
 SCHEMA = """
@@ -82,6 +88,61 @@ def process_alive(pid: int | None) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def reconcile_discovery_state(**sources: dict[str, Any] | None) -> dict[str, Any]:
+    """Merge persisted views without allowing legacy state to revive a terminal job."""
+    available = [
+        (name, dict(value)) for name, value in sources.items()
+        if name in STATE_SOURCE_AUTHORITY and isinstance(value, dict) and value
+    ]
+    if not available:
+        return {}
+
+    def timestamp(value):
+        return max(
+            filter(None, (
+                _parse_time(value.get("completed_at")),
+                _parse_time(value.get("updated_at")),
+            )),
+            default=datetime.min.replace(tzinfo=timezone.utc),
+        )
+
+    def terminal(value):
+        status = str(value.get("status") or "").casefold()
+        return status in TERMINAL_STATUSES or (
+            status == "failed" and value.get("resumable") in (False, 0)
+        )
+
+    terminal_sources = [
+        entry for entry in available
+        if entry[0] != "legacy" and terminal(entry[1])
+    ]
+    candidates = terminal_sources or available
+    controller_name, controller = max(
+        candidates,
+        key=lambda entry: (
+            STATE_SOURCE_AUTHORITY[entry[0]], timestamp(entry[1]),
+        ),
+    )
+    merged: dict[str, Any] = {}
+    for _, value in sorted(
+        available, key=lambda entry: STATE_SOURCE_AUTHORITY[entry[0]],
+    ):
+        merged.update({key: item for key, item in value.items() if item is not None})
+    controlled_fields = {
+        "status", "phase", "progress_current", "progress_total", "resumable",
+        "worker_pid", "lease_expires_at", "updated_at", "completed_at", "error",
+    }
+    for field in controlled_fields:
+        if field in controller:
+            merged[field] = controller[field]
+    merged["state_source"] = controller_name
+    if terminal(controller):
+        merged["resumable"] = False
+        merged["worker_pid"] = None
+        merged["lease_expires_at"] = None
+    return merged
 
 
 class DiscoveryJobRegistry:
@@ -221,9 +282,8 @@ class DiscoveryJobRegistry:
             if row is None:
                 connection.rollback()
                 return False
-            lease = _parse_time(row["lease_expires_at"])
             owner_alive = process_alive(row["worker_pid"])
-            if row["status"] == "running" and owner_alive and lease and lease > now:
+            if row["status"] == "running" and owner_alive:
                 connection.rollback()
                 return False
             other = connection.execute(
@@ -236,7 +296,6 @@ class DiscoveryJobRegistry:
                     active["status"] == "launching" and active_lease and active_lease > now
                 ) or (
                     process_alive(active["worker_pid"])
-                    and (active_lease is None or active_lease > now)
                 ):
                     connection.rollback()
                     return False
@@ -329,8 +388,7 @@ class DiscoveryJobRegistry:
                 connection.rollback()
                 return False
             owner = row["worker_pid"]
-            lease = _parse_time(row["lease_expires_at"])
-            if owner and int(owner) != int(pid) and process_alive(owner) and lease and lease > now:
+            if owner and int(owner) != int(pid) and process_alive(owner):
                 connection.rollback()
                 return False
             next_status = (
@@ -458,7 +516,7 @@ class DiscoveryJobRegistry:
                 lease = _parse_time(row["lease_expires_at"])
                 if row["status"] == "launching" and lease and lease > now:
                     continue
-                if process_alive(row["worker_pid"]) and (lease is None or lease > now):
+                if process_alive(row["worker_pid"]):
                     continue
                 connection.execute(
                     """UPDATE discovery_job_runtime SET status='resumable',resumable=1,

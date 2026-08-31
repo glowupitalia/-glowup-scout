@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 from streamlit.testing.v1 import AppTest
 
 from discovery import DiscoveryCheckpointStore, default_filters
-from discovery_jobs import DiscoveryJobRegistry
+from discovery_jobs import DiscoveryJobRegistry, reconcile_discovery_state
 from notifications import DEFAULT_RECIPIENT
 from supplier_catalog import SupplierCatalogStore
 
@@ -91,6 +91,63 @@ class DiscoveryJobRegistryTests(unittest.TestCase):
         status = self.registry.get(state["job_id"])
         self.assertEqual(status["status"], "resumable")
         self.assertTrue(status["resumable"])
+
+    def test_stale_lease_with_live_pid_never_allows_second_worker(self):
+        state = self.state()
+        self.registry.register_checkpoint(state)
+        with self.registry._connect() as connection:
+            connection.execute(
+                "UPDATE discovery_job_runtime SET status='running',worker_pid=?,"
+                "lease_expires_at='2000-01-01T00:00:00Z' WHERE job_id=?",
+                (os.getpid(), state["job_id"]),
+            )
+            connection.commit()
+        self.registry.reconcile()
+        runtime = self.registry.get(state["job_id"])
+        self.assertEqual(runtime["status"], "running")
+        self.assertEqual(runtime["worker_pid"], os.getpid())
+        self.assertFalse(
+            self.registry.claim(state["job_id"], pid=os.getpid() + 100_000)
+        )
+
+    def test_authoritative_completed_state_overrides_legacy_running(self):
+        state = reconcile_discovery_state(
+            legacy={
+                "job_id": "qudo", "status": "running", "phase": "initialized",
+                "progress_current": 0, "progress_total": 3902,
+                "updated_at": "2026-08-31T15:54:56Z",
+            },
+            compact={
+                "job_id": "qudo", "status": "completed", "phase": "completed",
+                "progress_current": 3902, "progress_total": 3902,
+                "updated_at": "2026-08-31T16:30:00Z",
+            },
+            registry={
+                "job_id": "qudo", "status": "completed", "phase": "completed",
+                "progress_current": 3902, "progress_total": 3902,
+                "resumable": False, "updated_at": "2026-08-31T16:30:01Z",
+            },
+        )
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["phase"], "completed")
+        self.assertEqual(state["progress_current"], 3902)
+        self.assertFalse(state["resumable"])
+        self.assertEqual(state["state_source"], "registry")
+
+    def test_real_resumable_state_remains_resumable_without_live_worker(self):
+        state = reconcile_discovery_state(
+            legacy={"status": "running", "phase": "initialized"},
+            incremental={
+                "status": "running", "phase": "catalog", "selected_count": 3902,
+                "updated_at": "2026-08-31T16:00:00Z",
+            },
+            registry={
+                "status": "resumable", "phase": "catalog", "resumable": True,
+                "worker_pid": None, "updated_at": "2026-08-31T16:01:00Z",
+            },
+        )
+        self.assertEqual(state["status"], "resumable")
+        self.assertTrue(state["resumable"])
 
     def test_resume_preserves_same_job_and_selection(self):
         state = self.state("same-job")
@@ -197,7 +254,7 @@ class DiscoveryJobUiTests(unittest.TestCase):
             self.assertIn("Apri avanzamento", labels)
             self.assertNotIn("Riprendi ultima Discovery incompleta", labels)
 
-    def test_completed_job_is_discoverable_after_new_browser_session(self):
+    def test_completed_qudo_job_overrides_stale_legacy_after_new_browser_session(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint_root = Path(temporary) / "checkpoints"
             checkpoint_root.mkdir()
@@ -205,20 +262,28 @@ class DiscoveryJobUiTests(unittest.TestCase):
             state = {
                 "job_id": "ui-running-job", "status": "completed", "phase": "completed",
                 "started_at": "2026-08-27T09:20:27Z",
-                "completed_at": "2026-08-27T10:20:27Z", "run_budget": 5000,
-                "sampled_identifier_count": 5000, "progress_current": 5000,
-                "progress_total": 5000, "selected_suppliers": ["abw", "umma", "qudo"],
+                "completed_at": "2026-08-27T10:20:27Z", "run_budget": "all",
+                "sampled_identifier_count": 3902, "progress_current": 3902,
+                "progress_total": 3902, "selected_suppliers": ["qudo"],
                 "filters": default_filters(), "errors": [],
             }
             registry.finish(state["job_id"], state)
             (checkpoint_root / "ui-running-job.state.json").write_text(json.dumps({
-                **state, "selected_count": 5000, "final_opportunity_count": 370,
-                "fee_target_count": 4472, "fee_valid_count": 4413,
-                "fee_unavailable_count": 57,
+                **state, "selected_count": 3902, "final_opportunity_count": 11,
+                "fee_target_count": 142, "fee_valid_count": 142,
+                "fee_unavailable_count": 0,
+            }), encoding="utf-8")
+            (checkpoint_root / "ui-running-job.json").write_text(json.dumps({
+                **state, "status": "running", "phase": "initialized",
+                "progress_current": 0, "progress_total": 3902,
+                "updated_at": "2026-08-27T09:20:28Z",
             }), encoding="utf-8")
             with patch.dict(os.environ, {
                 "DISCOVERY_JOB_DATABASE": str(registry.path),
                 "DISCOVERY_CHECKPOINT_ROOT": str(checkpoint_root),
+                "DISCOVERY_INCREMENTAL_DATABASE": str(
+                    Path(temporary) / "incremental.sqlite3"
+                ),
             }):
                 app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
             self.assertEqual(len(app.exception), 0)
@@ -226,9 +291,10 @@ class DiscoveryJobUiTests(unittest.TestCase):
             labels = [row.label for row in app.button]
             self.assertIn("Visualizza risultati / Scarica Excel", labels)
             self.assertIn("Nuova ricerca", labels)
+            self.assertNotIn("Riprendi Discovery", labels)
             rendered = " ".join(row.value for row in app.caption)
-            self.assertIn("370 opportunità", rendered)
-            self.assertIn("98.68%", rendered)
+            self.assertIn("11 opportunità", rendered)
+            self.assertIn("100.00%", rendered)
             self.assertTrue(any(row.value == "Discovery recenti" for row in app.subheader))
 
     def test_no_job_home_offers_discovery_start(self):

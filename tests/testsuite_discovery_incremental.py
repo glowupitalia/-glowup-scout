@@ -1,6 +1,8 @@
 import json
 import os
+import sqlite3
 import tempfile
+import threading
 import tracemalloc
 import unittest
 import requests
@@ -103,6 +105,113 @@ class IncrementalStoreTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def _hold_write_lock(self):
+        acquired = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            connection = sqlite3.connect(self.store.path, timeout=1)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                acquired.set()
+                release.wait(5)
+                connection.rollback()
+            finally:
+                connection.close()
+
+        thread = threading.Thread(target=holder, daemon=True)
+        thread.start()
+        self.assertTrue(acquired.wait(2))
+        return release, thread
+
+    def test_create_job_retries_real_transient_write_lock_without_duplicates(self):
+        self.store.initialize()
+        release, thread = self._hold_write_lock()
+        timer = threading.Timer(0.08, release.set)
+        timer.start()
+        retrying = DiscoveryIncrementalStore(
+            self.store.path, busy_timeout_ms=1, lock_retry_attempts=10,
+            lock_retry_base_seconds=0.01, lock_retry_max_seconds=0.02,
+            lock_retry_jitter_fraction=0,
+        )
+        try:
+            summary = retrying.create_job(
+                {"job_id": "locked", "phase": "suppliers_loaded", "prepared_total": 3},
+                [candidate(1), candidate(2), candidate(3)], batch_size=2,
+            )
+        finally:
+            release.set()
+            timer.cancel()
+            thread.join(2)
+        self.assertEqual(summary["selected_count"], 3)
+        self.assertEqual(retrying.counts("locked")["items"], 3)
+        self.assertEqual(retrying.counts("locked")["scenarios"], 3)
+
+    def test_create_job_persistent_lock_exhausts_bounded_budget_without_partial_row(self):
+        self.store.initialize()
+        release, thread = self._hold_write_lock()
+        sleeps = []
+        retrying = DiscoveryIncrementalStore(
+            self.store.path, busy_timeout_ms=1, lock_retry_attempts=3,
+            lock_retry_base_seconds=0.001, lock_retry_max_seconds=0.002,
+            lock_retry_jitter_fraction=0, sleep_func=sleeps.append,
+        )
+        try:
+            with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                retrying.create_job(
+                    {"job_id": "exhausted", "phase": "suppliers_loaded"},
+                    [candidate(1)],
+                )
+        finally:
+            release.set()
+            thread.join(2)
+        self.assertEqual(len(sleeps), 2)
+        self.assertFalse(retrying.has_job("exhausted"))
+
+    def test_permanent_sqlite_error_is_not_retried(self):
+        self.store.initialize()
+        sleeps = []
+        retrying = DiscoveryIncrementalStore(
+            self.store.path, lock_retry_attempts=5, sleep_func=sleeps.append,
+        )
+        with self.assertRaisesRegex(sqlite3.OperationalError, "no such table"):
+            retrying._immediate_transaction(
+                lambda connection: connection.execute(
+                    "INSERT INTO table_that_does_not_exist VALUES (1)"
+                ),
+                job_id="permanent", name="test.permanent",
+            )
+        self.assertEqual(sleeps, [])
+
+    def test_preparation_batch_retries_lock_and_remains_restart_safe(self):
+        self.store.initialize()
+        lock = {}
+
+        def rows():
+            release, thread = self._hold_write_lock()
+            lock.update(release=release, thread=thread)
+            threading.Timer(0.08, release.set).start()
+            yield candidate(1)
+            yield candidate(2)
+
+        retrying = DiscoveryIncrementalStore(
+            self.store.path, busy_timeout_ms=1, lock_retry_attempts=10,
+            lock_retry_base_seconds=0.01, lock_retry_max_seconds=0.02,
+            lock_retry_jitter_fraction=0,
+        )
+        try:
+            summary = retrying.create_job(
+                {"job_id": "batch-locked", "phase": "suppliers_loaded", "prepared_total": 2},
+                rows(), batch_size=2,
+            )
+        finally:
+            lock.get("release", threading.Event()).set()
+            if lock.get("thread"):
+                lock["thread"].join(2)
+        self.assertTrue(summary["preparation_complete"])
+        self.assertEqual(retrying.counts("batch-locked")["items"], 2)
+        self.assertEqual(retrying.counts("batch-locked")["scenarios"], 2)
 
     def test_batch_commit_is_idempotent_and_resume_skips_committed(self):
         self.store.create_job(

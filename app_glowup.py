@@ -2,6 +2,7 @@ import logging
 import html
 import json
 import os
+import sqlite3
 import time
 import urllib.parse
 from datetime import datetime
@@ -46,7 +47,7 @@ from purchase_scenarios import (
 from supplier_preparation import SUPPORTED_SUPPLIERS
 from supplier_catalog import SupplierCatalogStore, canonical_gtin14
 from discovery_rotation import DiscoveryRotationStore
-from discovery_jobs import DiscoveryJobRegistry
+from discovery_jobs import DiscoveryJobRegistry, reconcile_discovery_state
 from discovery_ui import (
     discovery_phase_eta_seconds,
     discovery_phase_progress,
@@ -797,8 +798,8 @@ def _start_discovery_worker(state):
 
 
 def _load_discovery_result(job_id, runtime=None):
-    state = DiscoveryCheckpointStore().load(job_id)
     runtime = runtime or DiscoveryJobRegistry().get(job_id) or {}
+    state = _load_authoritative_discovery_state(job_id, runtime=runtime)
     operational = dict(state.get("operational_export") or {})
     technical = dict(state.get("technical_export") or {})
     output_path = operational.get("path") or runtime.get("export_path")
@@ -857,6 +858,59 @@ def _discovery_compact_state(job_id):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+def _load_authoritative_discovery_state(job_id, *, runtime=None):
+    """Resolve UI state by persistence authority, never by legacy mtime alone."""
+    root = Path(os.environ.get("DISCOVERY_CHECKPOINT_ROOT", "data/discovery_jobs"))
+    compact = _discovery_compact_state(job_id)
+    legacy = {}
+    legacy_path = root / f"{job_id}.json"
+    try:
+        legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    incremental = {}
+    try:
+        store = DiscoveryIncrementalStore()
+        if store.has_job(job_id):
+            incremental = store.summary(job_id)
+    except (OSError, sqlite3.Error, KeyError):
+        logger.warning(
+            "DISCOVERY STATE FALLBACK | job_id=%s source=incremental",
+            job_id, exc_info=True,
+        )
+    registry = runtime or DiscoveryJobRegistry().get(job_id) or {}
+    state = reconcile_discovery_state(
+        legacy=legacy, compact=compact, incremental=incremental, registry=registry,
+    )
+    # Completed result rows remain incrementally hydrated and are never copied
+    # into the compact UI state.
+    if state.get("status") == "completed" and compact:
+        try:
+            hydrated = DiscoveryCheckpointStore(root).load(job_id)
+            state.update({
+                key: value for key, value in hydrated.items()
+                if key not in {
+                    "status", "phase", "progress_current", "progress_total",
+                    "resumable", "worker_pid", "lease_expires_at", "updated_at",
+                    "completed_at", "error",
+                }
+            })
+        except (OSError, ValueError, KeyError, sqlite3.Error):
+            logger.warning(
+                "DISCOVERY RESULT HYDRATION FALLBACK | job_id=%s", job_id,
+                exc_info=True,
+            )
+    return state
+
+
+def _authoritative_discovery_runtime(runtime):
+    if not runtime:
+        return runtime
+    return _load_authoritative_discovery_state(
+        runtime["job_id"], runtime=runtime,
+    )
 
 
 def _discovery_local_time(value):
@@ -950,6 +1004,7 @@ def _render_discovery_runtime(job_id):
     if not runtime:
         ui_alert("Stato Discovery non disponibile.", "warning")
         return
+    runtime = _authoritative_discovery_runtime(runtime)
     if runtime["status"] in {
         "launching", "running", "computed", "export_pending",
         "export_running", "notification_pending",
@@ -981,7 +1036,9 @@ def _render_discovery_runtime(job_id):
         _load_discovery_result(runtime["job_id"], runtime)
         st.rerun(scope="app")
     elif runtime["status"] in {"resource_paused", "export_resource_paused"}:
-        state = DiscoveryCheckpointStore().load(runtime["job_id"])
+        state = _load_authoritative_discovery_state(
+            runtime["job_id"], runtime=runtime,
+        )
         pause = state.get("resource_pause") or {}
         st.warning("Discovery sospesa per proteggere HomeServer")
         st.caption(
@@ -996,7 +1053,9 @@ def _render_discovery_runtime(job_id):
                 _start_discovery_worker(state)
             st.rerun(scope="app")
     elif runtime.get("resumable"):
-        state = DiscoveryCheckpointStore().load(runtime["job_id"])
+        state = _load_authoritative_discovery_state(
+            runtime["job_id"], runtime=runtime,
+        )
         st.warning(
             f"Discovery interrotta alla fase {state.get('phase')}. "
             "Il checkpoint e lo stesso campione sono disponibili."
@@ -1022,6 +1081,13 @@ if ui_state == "home":
     discovery_registry = DiscoveryJobRegistry()
     active_discovery = discovery_registry.latest_active()
     latest_discovery = discovery_registry.latest()
+    active_discovery = _authoritative_discovery_runtime(active_discovery)
+    if active_discovery and active_discovery.get("status") not in {
+        "launching", "running", "computed", "export_pending",
+        "export_running", "notification_pending",
+    }:
+        active_discovery = None
+    latest_discovery = _authoritative_discovery_runtime(latest_discovery)
     if active_discovery:
         with st.container(border=True):
             _render_active_discovery(active_discovery, key_prefix="home_active")
@@ -1430,7 +1496,14 @@ elif ui_state == "discovery":
             f"Notifiche email: {'attive' if email_config.configured else 'disattive'} · "
             f"Destinatario: {email_config.recipient}"
         )
-        active_discovery = DiscoveryJobRegistry().latest_active()
+        active_discovery = _authoritative_discovery_runtime(
+            DiscoveryJobRegistry().latest_active()
+        )
+        if active_discovery and active_discovery.get("status") not in {
+            "launching", "running", "computed", "export_pending",
+            "export_running", "notification_pending",
+        }:
+            active_discovery = None
         if active_discovery:
             current = int(active_discovery.get("progress_current") or 0)
             total = int(active_discovery.get("progress_total") or 0)
@@ -1806,7 +1879,11 @@ elif ui_state == "discovery_result":
         if state.get("checkpoint_compatibility") == "legacy_incompatible":
             ui_alert(LEGACY_CHECKPOINT_MESSAGE, "warning")
             st.stop()
-        result_count = len(state.get("results") or [])
+        result_count = int(
+            state.get("final_opportunity_count")
+            or state.get("final_products")
+            or len(state.get("results") or [])
+        )
         evaluated_count = int(
             state.get("selected_count") or state.get("sampled_identifier_count") or 0
         )

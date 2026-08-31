@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import mmap
 import os
+import random
 import sqlite3
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from itertools import islice
@@ -28,6 +31,29 @@ SCHEMA_VERSION = 1
 TERMINAL_CATALOG_STATUSES = {
     "resolved", "ambiguous", "not_found", "invalid_identifier",
 }
+SQLITE_LOCK_RETRY_ATTEMPTS = 5
+SQLITE_LOCK_RETRY_BASE_SECONDS = 0.05
+SQLITE_LOCK_RETRY_MAX_SECONDS = 0.5
+SQLITE_LOCK_RETRY_JITTER_FRACTION = 0.2
+
+
+logger = logging.getLogger(__name__)
+
+
+def _transient_sqlite_lock(error: BaseException) -> bool:
+    """Return true only for SQLite BUSY/LOCKED acquisition failures."""
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None and (int(code) & 0xFF) in {
+        sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED,
+    }:
+        return True
+    message = str(error).casefold()
+    return any(value in message for value in (
+        "database is locked", "database table is locked",
+        "database schema is locked",
+    ))
 
 
 SCHEMA = """
@@ -260,18 +286,39 @@ def read_legacy_metadata(path: str | Path) -> dict[str, Any]:
 
 
 class DiscoveryIncrementalStore:
-    def __init__(self, path: str | Path | None = None):
+    def __init__(
+        self, path: str | Path | None = None, *,
+        lock_retry_attempts: int = SQLITE_LOCK_RETRY_ATTEMPTS,
+        lock_retry_base_seconds: float = SQLITE_LOCK_RETRY_BASE_SECONDS,
+        lock_retry_max_seconds: float = SQLITE_LOCK_RETRY_MAX_SECONDS,
+        lock_retry_jitter_fraction: float = SQLITE_LOCK_RETRY_JITTER_FRACTION,
+        busy_timeout_ms: int = 30_000, sleep_func=time.sleep,
+        random_func=random.random,
+    ):
         configured = path or os.environ.get("DISCOVERY_INCREMENTAL_DATABASE")
         self.path = Path(configured or DEFAULT_DATABASE).expanduser().resolve()
+        self.lock_retry_attempts = max(1, int(lock_retry_attempts))
+        self.lock_retry_base_seconds = max(0.0, float(lock_retry_base_seconds))
+        self.lock_retry_max_seconds = max(
+            self.lock_retry_base_seconds, float(lock_retry_max_seconds)
+        )
+        self.lock_retry_jitter_fraction = max(
+            0.0, float(lock_retry_jitter_fraction)
+        )
+        self.busy_timeout_ms = max(0, int(busy_timeout_ms))
+        self._sleep = sleep_func
+        self._random = random_func
 
     def _new_connection(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path, timeout=30)
+        connection = sqlite3.connect(
+            self.path, timeout=max(0.001, self.busy_timeout_ms / 1000.0)
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
-        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         return connection
 
     @contextmanager
@@ -300,6 +347,48 @@ class DiscoveryIncrementalStore:
                     "ALTER TABLE discovery_purchase_scenarios ADD COLUMN supplier TEXT"
                 )
             connection.executescript(SCHEMA)
+
+    def _immediate_transaction(self, operation, *, job_id: str, name: str):
+        """Run one idempotent write unit with bounded BUSY/LOCKED recovery."""
+        started = time.monotonic()
+        for attempt in range(1, self.lock_retry_attempts + 1):
+            try:
+                with self._connect() as connection:
+                    try:
+                        connection.execute("BEGIN IMMEDIATE")
+                        result = operation(connection)
+                        connection.commit()
+                        return result
+                    except BaseException:
+                        if connection.in_transaction:
+                            connection.rollback()
+                        raise
+            except sqlite3.OperationalError as error:
+                if not _transient_sqlite_lock(error):
+                    raise
+                elapsed = time.monotonic() - started
+                if attempt >= self.lock_retry_attempts:
+                    logger.error(
+                        "DISCOVERY SQLITE LOCK EXHAUSTED | job_id=%s operation=%s "
+                        "attempt=%s elapsed=%.3f",
+                        job_id, name, attempt, elapsed,
+                    )
+                    raise
+                base_delay = min(
+                    self.lock_retry_base_seconds * (2 ** (attempt - 1)),
+                    self.lock_retry_max_seconds,
+                )
+                jitter = (
+                    base_delay * self.lock_retry_jitter_fraction * self._random()
+                )
+                delay = min(base_delay + jitter, self.lock_retry_max_seconds)
+                logger.warning(
+                    "DISCOVERY SQLITE LOCK RETRY | job_id=%s operation=%s "
+                    "attempt=%s elapsed=%.3f backoff=%.3f",
+                    job_id, name, attempt, elapsed, delay,
+                )
+                self._sleep(delay)
+        raise AssertionError("unreachable SQLite retry state")
 
     @staticmethod
     def _replace_classification_projection(
@@ -390,8 +479,7 @@ class DiscoveryIncrementalStore:
             "prepared_total": total, "preparation_complete": False,
         })
         observed = _now()
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        def initialize_job(connection):
             connection.execute(
                 """INSERT INTO discovery_incremental_jobs
                    (job_id,schema_version,status,phase,metadata_json,
@@ -418,8 +506,7 @@ class DiscoveryIncrementalStore:
                 )
             )
             if existing and not preparation_incomplete:
-                connection.commit()
-                return self.summary(job_id, connection=connection)
+                return True, existing, completed
             compact_metadata["prepared_current"] = existing
             connection.execute(
                 """UPDATE discovery_incremental_jobs
@@ -427,7 +514,13 @@ class DiscoveryIncrementalStore:
                     WHERE job_id=?""",
                 (_dump(compact_metadata), observed, job_id),
             )
-            connection.commit()
+            return False, existing, completed
+
+        already_prepared, existing, completed = self._immediate_transaction(
+            initialize_job, job_id=job_id, name="create_job.initialize",
+        )
+        if already_prepared:
+            return self.summary(job_id)
 
         iterator = iter(candidates)
         supplied_start = int(metadata.get("preparation_start_sequence") or 0)
@@ -490,8 +583,7 @@ class DiscoveryIncrementalStore:
             next_selected = selected + len(rows)
             next_completed = completed + batch_completed
             compact_metadata["prepared_current"] = next_selected
-            with self._connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
+            def write_preparation_batch(connection):
                 connection.executemany(
                     """INSERT INTO discovery_job_items
                        (job_id,sequence_no,canonical_identifier,identifier_type,
@@ -536,7 +628,10 @@ class DiscoveryIncrementalStore:
                        WHERE job_id=?""",
                     (next_selected, next_completed, _dump(compact_metadata), observed, job_id),
                 )
-                connection.commit()
+            self._immediate_transaction(
+                write_preparation_batch, job_id=job_id,
+                name="create_job.preparation_batch",
+            )
             selected, completed = next_selected, next_completed
             if progress is not None:
                 progress("preparing", selected, total or selected)
@@ -550,8 +645,7 @@ class DiscoveryIncrementalStore:
             "prepared_current": selected, "prepared_total": total or selected,
             "preparation_complete": True, "preparation_completed_at": _now(),
         })
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        def complete_preparation(connection):
             connection.execute(
                 """UPDATE discovery_incremental_jobs
                      SET status=?,phase=?,selected_count=?,catalog_completed_count=?,
@@ -561,7 +655,10 @@ class DiscoveryIncrementalStore:
                     _dump(compact_metadata), _now(), job_id,
                 ),
             )
-            connection.commit()
+        self._immediate_transaction(
+            complete_preparation, job_id=job_id,
+            name="create_job.complete_preparation",
+        )
         return self.summary(job_id)
 
     def migrate_legacy_checkpoint(
