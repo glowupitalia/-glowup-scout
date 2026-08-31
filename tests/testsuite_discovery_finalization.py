@@ -2,12 +2,17 @@ import sqlite3
 import tempfile
 import tracemalloc
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from openpyxl import load_workbook
 
 from discovery_finalize_worker import export_offline, finalization_state, finalize
+from discovery_excel import (
+    EXCEL_MAX_HYPERLINKS_PER_WORKSHEET,
+    validate_excel_compatibility,
+)
 from discovery_incremental import (
     DiscoveryIncrementalStore,
     IncrementalCandidateCollection,
@@ -175,7 +180,34 @@ class FinalizationTests(unittest.TestCase):
                 )
         self.assertEqual(workbook["Dati"].sheet_state, "hidden")
         self.assertEqual(workbook["Opportunità"].freeze_panes, "A2")
+        listing_link = workbook["Listing Amazon"]["V2"]
+        self.assertEqual(listing_link.data_type, "f")
+        self.assertTrue(str(listing_link.value).startswith('=HYPERLINK("https://'))
+        self.assertIsNone(listing_link.hyperlink)
+        compatibility = validate_excel_compatibility(target)
+        self.assertTrue(all(
+            count <= EXCEL_MAX_HYPERLINKS_PER_WORKSHEET
+            for count in compatibility["hyperlinks_by_part"].values()
+        ))
         workbook.close()
+
+    def test_excel_compatibility_rejects_worksheet_hyperlink_limit(self):
+        target = self.root / "too-many-hyperlinks.xlsx"
+        relationships = "".join(
+            '<Relationship Id="rId{0}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+            'Target="https://example.test/{0}" TargetMode="External"/>'.format(index)
+            for index in range(1, EXCEL_MAX_HYPERLINKS_PER_WORKSHEET + 2)
+        )
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as package:
+            package.writestr(
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                f"{relationships}</Relationships>",
+            )
+        with self.assertRaisesRegex(ValueError, "hyperlink limit exceeded"):
+            validate_excel_compatibility(target)
 
     def test_finalizer_is_restart_safe_and_does_not_rewrite_valid_export(self):
         target = self.root / "final.xlsx"

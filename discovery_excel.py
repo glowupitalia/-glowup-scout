@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 import os
 import tempfile
+import zipfile
 from decimal import Decimal
+from xml.etree import ElementTree
 
 from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
@@ -61,6 +63,11 @@ LISTING_COLUMNS = [
 RUN_COLUMNS = ["Parametro", "Valore"]
 # Backwards-compatible import name; Discovery now exports Opportunita, not Risultati.
 DISCOVERY_COLUMNS = OPPORTUNITY_COLUMNS
+EXCEL_MAX_HYPERLINKS_PER_WORKSHEET = 65_530
+_RELATIONSHIP_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_HYPERLINK_RELATIONSHIP_TYPE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
+)
 
 
 def _value(value):
@@ -69,6 +76,47 @@ def _value(value):
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
+
+
+def _hyperlink_formula(url):
+    """Return a relationship-free hyperlink accepted by desktop Excel.
+
+    Excel limits external hyperlink relationships to 65,530 per worksheet.
+    Large audit sheets can exceed that limit even though the XLSX package is
+    otherwise valid. A HYPERLINK formula keeps every URL clickable without
+    creating one package relationship per row.
+    """
+    if not url:
+        return None
+    text = str(url).replace('"', '""')
+    return f'=HYPERLINK("{text}","{text}")'
+
+
+def validate_excel_compatibility(path):
+    """Validate package constraints that openpyxl/ZIP checks do not enforce."""
+    result = {"hyperlinks_by_part": {}}
+    with zipfile.ZipFile(path) as package:
+        package.testzip()
+        for name in package.namelist():
+            if not (name.startswith("xl/worksheets/_rels/") and name.endswith(".rels")):
+                continue
+            root = ElementTree.fromstring(package.read(name))
+            identifiers = set()
+            hyperlink_count = 0
+            for relationship in root.findall(f"{{{_RELATIONSHIP_NS}}}Relationship"):
+                relationship_id = relationship.get("Id")
+                if relationship_id in identifiers:
+                    raise ValueError(f"Duplicate relationship ID in {name}: {relationship_id}")
+                identifiers.add(relationship_id)
+                if relationship.get("Type") == _HYPERLINK_RELATIONSHIP_TYPE:
+                    hyperlink_count += 1
+            result["hyperlinks_by_part"][name] = hyperlink_count
+            if hyperlink_count > EXCEL_MAX_HYPERLINKS_PER_WORKSHEET:
+                raise ValueError(
+                    f"Excel worksheet hyperlink limit exceeded in {name}: "
+                    f"{hyperlink_count} > {EXCEL_MAX_HYPERLINKS_PER_WORKSHEET}"
+                )
+    return result
 
 
 def _as_decimal(value):
@@ -455,7 +503,8 @@ def _style_sheet(ws, *, visible_columns, cost_column, hidden_columns, data_ws):
 
 
 def _style_audit_sheet(ws, widths, *, currency_columns=(), percent_columns=(),
-                       integer_columns=(), text_columns=(), hyperlink_column=None):
+                       integer_columns=(), text_columns=(), hyperlink_column=None,
+                       formula_hyperlink=False):
     header_fill = PatternFill("solid", fgColor="1F4E78")
     for cell in ws[1]:
         cell.font = Font(color="FFFFFF", bold=True)
@@ -484,7 +533,10 @@ def _style_audit_sheet(ws, widths, *, currency_columns=(), percent_columns=(),
         if hyperlink_column:
             cell = ws.cell(row, hyperlink_column)
             if cell.value:
-                cell.hyperlink = str(cell.value)
+                if formula_hyperlink:
+                    cell.value = _hyperlink_formula(cell.value)
+                else:
+                    cell.hyperlink = str(cell.value)
                 cell.style = "Hyperlink"
 
 
@@ -835,7 +887,7 @@ def write_discovery_excel(results, output_file, *, progress=None):
             [16, 14, 46, 20, 20, 42, 10, 32, 12, 18, 12, 12, 12, 16,
              14, 15, 18, 20, 16, 12, 44, 42],
             currency_columns=(11, 12, 13), integer_columns=(9, 15, 16, 20),
-            text_columns=(1, 2), hyperlink_column=22,
+            text_columns=(1, 2), hyperlink_column=22, formula_hyperlink=True,
         )
         _style_audit_sheet(run_ws, [28, 54])
         run_ws.auto_filter.ref = None
@@ -864,6 +916,7 @@ def write_discovery_excel(results, output_file, *, progress=None):
         workbook.calculation.forceFullCalc = True
         workbook.calculation.calcOnSave = True
         workbook.save(temporary_path)
+        validate_excel_compatibility(temporary_path)
         os.replace(temporary_path, output_path)
     except Exception:
         try:
@@ -894,7 +947,8 @@ def _stream_cell(ws, value, *, header=False, number_format=None, unlocked=False,
 
 def _stream_append(ws, values, *, header=False, currency_columns=(),
                    percent_columns=(), integer_columns=(), text_columns=(),
-                   unlocked_columns=(), hyperlink_columns=()):
+                   unlocked_columns=(), hyperlink_columns=(),
+                   formula_hyperlink_columns=()):
     cells = []
     for index, value in enumerate(values, start=1):
         fmt = None
@@ -911,11 +965,15 @@ def _stream_append(ws, values, *, header=False, currency_columns=(),
         elif index in text_columns:
             fmt = '@'
         hyperlink = value if index in hyperlink_columns and value else None
+        if index in formula_hyperlink_columns and value:
+            value = _hyperlink_formula(value)
         cells.append(_stream_cell(
             ws, _excel_number(value) if numeric and not header else value,
             header=header, number_format=fmt,
             unlocked=index in unlocked_columns, hyperlink=hyperlink,
         ))
+        if index in formula_hyperlink_columns and value:
+            cells[-1].style = "Hyperlink"
     ws.append(cells)
 
 
@@ -1156,7 +1214,7 @@ def _write_incremental_discovery_excel(
                     listing.get("pricing_status"), listing.get("competition_status"), listing.get("fee_status"),
                     listing.get("fee_attempts"), listing.get("exclusion_reason") or reason, link,
                 ], currency_columns=(11, 12, 13), integer_columns=(9, 15, 16, 20),
-                    text_columns=(1, 2), hyperlink_columns=(22,))
+                    text_columns=(1, 2), formula_hyperlink_columns=(22,))
             processed += 1
             if progress and processed % 250 == 0:
                 progress("export_rows", processed, len(candidates))
@@ -1188,6 +1246,7 @@ def _write_incremental_discovery_excel(
         if progress:
             progress("saving", processed, len(candidates))
         workbook.save(temporary_path)
+        validate_excel_compatibility(temporary_path)
         os.replace(temporary_path, output_path)
     except Exception:
         try:
