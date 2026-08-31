@@ -218,6 +218,81 @@ class QogitaServingStore:
             connection.commit()
         return self.duty_state(bootstrap_run_id)
 
+    def recover_auto_stopped_window(
+        self, bootstrap_run_id: str, *, expected_serving_generation_id: str,
+        now: str | datetime | None = None,
+    ) -> dict[str, Any]:
+        """Close an interrupted window without publishing a serving snapshot.
+
+        Authoritative product/scenario reconciliation is performed by the
+        bootstrap store first. This transition only records the normal REST
+        boundary so the next invocation opens a fresh numbered window.
+        """
+        self.initialize()
+        now_text = _timestamp(now)
+        connection = _connect(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                """SELECT status,stop_reason,health_json FROM qogita_bootstrap_runs
+                   WHERE bootstrap_run_id=? AND run_mode='production'""",
+                (bootstrap_run_id,),
+            ).fetchone()
+            duty = connection.execute(
+                """SELECT * FROM qogita_bootstrap_duty_cycles
+                   WHERE bootstrap_run_id=?""",
+                (bootstrap_run_id,),
+            ).fetchone()
+            active = connection.execute(
+                "SELECT serving_generation_id FROM qogita_serving_active WHERE supplier='qogita'"
+            ).fetchone()
+            claims = connection.execute(
+                """SELECT COUNT(*) FROM qogita_bootstrap_products
+                   WHERE bootstrap_run_id=? AND worker_id IS NOT NULL""",
+                (bootstrap_run_id,),
+            ).fetchone()[0]
+            if not run or not duty:
+                raise ValueError("Qogita production recovery state is missing")
+            if run["status"] != "auto_stopped" or duty["state"] != "auto_stopped":
+                raise ValueError("Qogita production bootstrap is not auto-stopped")
+            if not active or active["serving_generation_id"] != expected_serving_generation_id:
+                raise RuntimeError("Qogita active serving snapshot changed during recovery")
+            if int(claims or 0):
+                raise RuntimeError("Qogita recovery requires zero active claims")
+            deadline = _datetime(duty["current_window_deadline"])
+            rest_until = _timestamp(
+                deadline + timedelta(seconds=int(duty["rest_window_seconds"]))
+            )
+            health = json.loads(run["health_json"] or "{}")
+            health["interrupted_window_recovery"] = {
+                "window_number": int(duty["window_number"]),
+                "previous_stop_reason": run["stop_reason"],
+                "reconciled_at": now_text,
+                "serving_generation_id_preserved": expected_serving_generation_id,
+                "next_action": "open_next_window_after_rest",
+            }
+            connection.execute(
+                """UPDATE qogita_bootstrap_runs SET status='running',stop_reason=NULL,
+                          health_json=?,updated_at=? WHERE bootstrap_run_id=?""",
+                (json_dumps(health), now_text, bootstrap_run_id),
+            )
+            connection.execute(
+                """UPDATE qogita_bootstrap_duty_cycles SET state='resting',
+                          last_window_completed_at=?,rest_until=?,updated_at=?
+                   WHERE bootstrap_run_id=?""",
+                (duty["current_window_deadline"], rest_until, now_text, bootstrap_run_id),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+        result = self.duty_state(bootstrap_run_id)
+        result["active_serving_generation_id"] = expected_serving_generation_id
+        return result
+
     def mark_completed(
         self, bootstrap_run_id: str, *, serving_generation_id: str, now=None,
     ) -> dict[str, Any]:

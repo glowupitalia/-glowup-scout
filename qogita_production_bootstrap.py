@@ -21,7 +21,7 @@ from qogita_bootstrap import (
     QogitaBootstrapStore,
     run_qogita_bootstrap_concurrent,
 )
-from supplier_catalog import DEFAULT_DATABASE_PATH
+from supplier_catalog import DEFAULT_DATABASE_PATH, utc_now
 from qogita_serving import (
     QogitaServingStore, REST_WINDOW_SECONDS, RUN_WINDOW_SECONDS,
 )
@@ -347,8 +347,29 @@ def main(argv=None):
             return 0
     except Exception as exc:
         logging.exception("Qogita production bootstrap stopped safely: %s", type(exc).__name__)
-        store.mark_stopped(pointer["bootstrap_run_id"], str(exc))
-        serving_store.mark_auto_stopped(pointer["bootstrap_run_id"])
+        sqlite_context = getattr(exc, "qogita_sqlite_context", None)
+        health = None
+        if sqlite_context:
+            health = {
+                "primary_error": type(exc).__name__,
+                "sqlite_lock_exhausted": True,
+                "sqlite_context": sqlite_context,
+                "stopped_at": utc_now(),
+            }
+        try:
+            store.mark_stopped(pointer["bootstrap_run_id"], str(exc), health=health)
+        except Exception:
+            logging.exception(
+                "Qogita stop-state persistence failed; primary error remains %s",
+                type(exc).__name__,
+            )
+        try:
+            serving_store.mark_auto_stopped(pointer["bootstrap_run_id"])
+        except Exception:
+            logging.exception(
+                "Qogita duty auto-stop persistence failed; primary error remains %s",
+                type(exc).__name__,
+            )
         return 0
     finally:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)

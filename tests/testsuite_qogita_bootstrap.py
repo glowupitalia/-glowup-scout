@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from qogita_bootstrap import (
     qogita_scenarios_from_offers,
     run_qogita_bootstrap,
     run_qogita_bootstrap_concurrent,
+    transient_sqlite_lock,
 )
 from qogita_production_bootstrap import ProductionHealthGuard
 from qogita_serving import QogitaServingStore
@@ -362,6 +364,7 @@ class QogitaBootstrapTests(unittest.TestCase):
         self.assertEqual(result["offers_success"], 12)
         self.assertEqual(result["claim_summary"]["claimed"], 0)
         self.assertEqual(sum(len(client.resolve_calls) for client in clients), 12)
+        self.assertEqual(self.store.sqlite_metrics["sqlite_busy"], 0)
         with sqlite3.connect(self.database) as connection:
             rows = connection.execute(
                 "SELECT COUNT(*),COUNT(DISTINCT scenario_id) FROM supplier_catalog_scenarios WHERE run_id=?",
@@ -401,6 +404,196 @@ class QogitaBootstrapTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertEqual(len(result), 1)
         self.assertGreater(self.store.sqlite_metrics["lock_wait_seconds"], 0)
+
+    def test_sqlite_lock_classification_and_permanent_error(self):
+        busy = sqlite3.OperationalError("busy")
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        locked = sqlite3.OperationalError("locked")
+        locked.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+        self.assertTrue(transient_sqlite_lock(busy))
+        self.assertTrue(transient_sqlite_lock(locked))
+        self.assertTrue(transient_sqlite_lock(
+            sqlite3.OperationalError("database is locked")
+        ))
+        self.assertFalse(transient_sqlite_lock(
+            sqlite3.OperationalError("no such table: missing")
+        ))
+
+        class PermanentFailure:
+            calls = 0
+            def execute(inner_self, _sql):
+                inner_self.calls += 1
+                raise sqlite3.OperationalError("no such table: missing")
+
+        connection = PermanentFailure()
+        with self.assertRaisesRegex(sqlite3.OperationalError, "no such table"):
+            self.store._begin_immediate(
+                connection, operation="test", bootstrap_run_id="run",
+            )
+        self.assertEqual(connection.calls, 1)
+
+    def test_external_lock_retry_is_bounded_and_recovers(self):
+        run_id = self.staging(1)
+        store = QogitaBootstrapStore(
+            self.database, busy_timeout_ms=10, lock_retry_attempts=5,
+            lock_retry_base_seconds=0.01, lock_retry_max_seconds=0.02,
+            lock_retry_jitter_fraction=0, random_func=lambda: 0,
+        )
+        bootstrap = store.create_bootstrap(run_id, target_count=1, batch_size=1)
+        blocker = sqlite3.connect(self.database)
+        blocker.execute("BEGIN IMMEDIATE")
+        result = []
+        failure = []
+        def claim():
+            try:
+                result.extend(store.claim_batch(
+                    bootstrap["bootstrap_run_id"], worker_id="worker", limit=1,
+                ))
+            except Exception as exc:
+                failure.append(exc)
+        thread = threading.Thread(target=claim)
+        thread.start()
+        time.sleep(0.04)
+        blocker.rollback()
+        blocker.close()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failure, [])
+        self.assertEqual(len(result), 1)
+        self.assertGreaterEqual(store.sqlite_metrics["transaction_retries"], 1)
+
+    def test_external_persistent_lock_exhaustion_keeps_claims_clean(self):
+        run_id = self.staging(1)
+        store = QogitaBootstrapStore(
+            self.database, busy_timeout_ms=5, lock_retry_attempts=2,
+            lock_retry_base_seconds=0, lock_retry_max_seconds=0,
+            lock_retry_jitter_fraction=0,
+        )
+        bootstrap = store.create_bootstrap(run_id, target_count=1, batch_size=1)
+        blocker = sqlite3.connect(self.database)
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as raised:
+                store.claim_batch(
+                    bootstrap["bootstrap_run_id"], worker_id="worker", limit=1,
+                )
+            context = getattr(raised.exception, "qogita_sqlite_context")
+            self.assertEqual(context["operation"], "claim_batch")
+            self.assertEqual(context["attempt"], 2)
+        finally:
+            blocker.rollback()
+            blocker.close()
+        self.assertEqual(store.claim_summary(bootstrap["bootstrap_run_id"])["claimed"], 0)
+
+    def test_checkpoint_reads_finish_before_serialized_write(self):
+        run_id = self.staging(2)
+        bootstrap = self.store.create_bootstrap(run_id, target_count=2, batch_size=1)
+        events = []
+        original_read = self.store._read_connection
+        original_write = self.store._write_transaction
+
+        @contextmanager
+        def observed_read():
+            events.append("read-open")
+            with original_read() as connection:
+                yield connection
+            events.append("read-close")
+
+        @contextmanager
+        def observed_write(**kwargs):
+            events.append("write-open")
+            with original_write(**kwargs) as connection:
+                yield connection
+            events.append("write-close")
+
+        self.store._read_connection = observed_read
+        self.store._write_transaction = observed_write
+        self.store.checkpoint_concurrent(
+            bootstrap["bootstrap_run_id"], metrics={}, worker_count=2,
+            batch_attempted=0, wall_elapsed_seconds=0,
+        )
+        self.assertLess(events.index("read-close"), events.index("write-open"))
+
+    def test_sqlite_metric_hydration_preserves_current_process_deltas(self):
+        self.store.sqlite_metrics.update({
+            "sqlite_busy": 2,
+            "transaction_retries": 1,
+            "lock_wait_seconds": 0.25,
+            "write_latency_seconds": 0.5,
+        })
+        self.store._hydrate_sqlite_metrics({
+            "sqlite_busy_count": 40,
+            "transaction_retry_count": 30,
+            "lock_wait_seconds": 10.0,
+            "write_latency_seconds": 20.0,
+        })
+        self.assertEqual(self.store.sqlite_metrics["sqlite_busy"], 42)
+        self.assertEqual(self.store.sqlite_metrics["transaction_retries"], 31)
+        self.assertEqual(self.store.sqlite_metrics["lock_wait_seconds"], 10.25)
+        self.assertEqual(self.store.sqlite_metrics["write_latency_seconds"], 20.5)
+
+    def test_persist_offers_rolls_back_complete_product_on_error(self):
+        run_id = self.staging(1)
+        bootstrap = self.store.create_bootstrap(run_id, target_count=1, batch_size=1)
+        run_qogita_bootstrap(
+            bootstrap["bootstrap_run_id"], store=self.store,
+            client=BootstrapFakeClient(), max_products=1,
+            product_link_pacing=0, offers_pacing=0, sleep_func=lambda _: None,
+        )
+        product = self.store.products(bootstrap["bootstrap_run_id"])[0]
+        fixture = {
+            "canonical_product_key": product["canonical_product_key"],
+            "gtin": product["gtin"], "brand": "Brand", "title": "Product",
+            "product_url": "https://example.test",
+        }
+        scenarios, diagnostics = qogita_scenarios_from_offers(
+            fixture, product["variant_fid"], BootstrapFakeClient().fetch_offers(
+                product["variant_fid"]
+            )["payload"], staging_run_id=run_id,
+            observed_at="2026-08-31T00:00:00Z",
+        )
+        with self.assertRaises(KeyError):
+            self.store.persist_offers(
+                bootstrap["bootstrap_run_id"], product["canonical_product_key"],
+                scenarios=[scenarios[0], {}], diagnostics=diagnostics,
+                observed_at="2026-08-31T00:00:00Z", elapsed_seconds=0.1,
+                attempts=1,
+            )
+        with sqlite3.connect(self.database) as connection:
+            count = connection.execute(
+                """SELECT COUNT(*) FROM supplier_catalog_scenarios
+                   WHERE run_id=? AND canonical_product_key=?""",
+                (run_id, product["canonical_product_key"]),
+            ).fetchone()[0]
+            status = connection.execute(
+                """SELECT status FROM qogita_bootstrap_products
+                   WHERE bootstrap_run_id=? AND canonical_product_key=?""",
+                (bootstrap["bootstrap_run_id"], product["canonical_product_key"]),
+            ).fetchone()[0]
+        self.assertEqual(count, 2)
+        self.assertEqual(status, "enriched")
+
+    def test_cleanup_failure_does_not_mask_primary_worker_error(self):
+        class BrokenStore:
+            def bootstrap(self, _run_id):
+                return {"target_count": 1, "staging_run_id": "stage",
+                        "run_mode": "production", "offers_pacing": 1.15}
+            def requeue_expired_auth_failures(self, _run_id):
+                return 0
+            def claim_batch(self, *_args, **_kwargs):
+                raise ValueError("primary worker failure")
+            def release_worker_claims(self, *_args, **_kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+        with self.assertLogs("qogita_bootstrap", level="ERROR"):
+            with self.assertRaisesRegex(ValueError, "primary worker failure"):
+                run_qogita_bootstrap_concurrent(
+                    "run", store=BrokenStore(),
+                    client_factory=lambda _auth, _limiter: BootstrapFakeClient(),
+                    base_url="https://example.test", email="x", password="y",
+                    workers=2, max_products=1, offers_pacing=1.15,
+                    product_link_pacing=0, sleep_func=lambda _: None,
+                )
 
     def test_production_bootstrap_reuses_carried_forward_and_prioritizes_delta(self):
         run_id = self.staging(4)
@@ -541,6 +734,57 @@ class QogitaBootstrapTests(unittest.TestCase):
         self.assertEqual(resumed["state"], "running")
         self.assertEqual(resumed["window_number"], 2)
         self.assertEqual(resumed["current_window_deadline"], "2026-08-27T11:00:00Z")
+
+    def test_auto_stopped_window_reconciles_without_publishing_snapshot(self):
+        run_id = self.staging(3)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        duty = QogitaServingStore(self.database)
+        duty.ensure_running_window(
+            bootstrap["bootstrap_run_id"], now="2026-08-27T00:00:00Z",
+        )
+        run_qogita_bootstrap(
+            bootstrap["bootstrap_run_id"], store=self.store,
+            client=BootstrapFakeClient(), max_products=2,
+            product_link_pacing=0, offers_pacing=0, sleep_func=lambda _: None,
+        )
+        snapshot = duty.build_snapshot(
+            bootstrap["bootstrap_run_id"], window_number=0,
+            bootstrap_state="resting", now="2026-08-26T23:00:00Z",
+        )
+        self.store.mark_stopped(bootstrap["bootstrap_run_id"], "database is locked")
+        duty.mark_auto_stopped(
+            bootstrap["bootstrap_run_id"], now="2026-08-27T04:00:01Z",
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """UPDATE qogita_bootstrap_runs SET products_attempted=0,
+                          offers_success=0,scenarios_written=0
+                   WHERE bootstrap_run_id=?""",
+                (bootstrap["bootstrap_run_id"],),
+            )
+        reconciled = self.store.reconcile_interrupted_window(
+            bootstrap["bootstrap_run_id"]
+        )
+        self.assertEqual(reconciled["products_attempted"], 2)
+        self.assertEqual(reconciled["offers_success"], 2)
+        self.assertEqual(reconciled["scenarios_written"], 4)
+        recovered = duty.recover_auto_stopped_window(
+            bootstrap["bootstrap_run_id"],
+            expected_serving_generation_id=snapshot["serving_generation_id"],
+            now="2026-08-27T04:00:02Z",
+        )
+        self.assertEqual(recovered["state"], "resting")
+        self.assertEqual(recovered["window_number"], 1)
+        self.assertEqual(recovered["rest_until"], "2026-08-27T07:00:00Z")
+        self.assertEqual(
+            duty.active_snapshot()["serving_generation_id"],
+            snapshot["serving_generation_id"],
+        )
+        next_window = duty.ensure_running_window(
+            bootstrap["bootstrap_run_id"], now="2026-08-27T07:00:00Z",
+        )
+        self.assertEqual(next_window["state"], "running")
+        self.assertEqual(next_window["window_number"], 2)
 
     def test_partial_serving_snapshot_is_atomic_and_reuses_source_scenarios(self):
         run_id = self.staging(3)

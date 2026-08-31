@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import random
 import re
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -32,6 +35,53 @@ FINAL_PRODUCT_STATES = {
     "enriched", "resolver_permanent", "offers_permanent", "parsing_failure",
 }
 RETRYABLE_PRODUCT_STATES = {"pending", "fid_resolved", "resolver_retryable", "offers_retryable"}
+SQLITE_LOCK_RETRY_ATTEMPTS = 5
+SQLITE_LOCK_RETRY_BASE_SECONDS = 0.05
+SQLITE_LOCK_RETRY_MAX_SECONDS = 0.5
+SQLITE_LOCK_RETRY_JITTER_FRACTION = 0.2
+SQLITE_BUSY_TIMEOUT_MS = 1_000
+
+
+logger = logging.getLogger(__name__)
+
+
+def transient_sqlite_lock(error: BaseException) -> bool:
+    """Return true only for SQLite BUSY/LOCKED acquisition failures."""
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None and (int(code) & 0xFF) in {
+        sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED,
+    }:
+        return True
+    message = str(error).casefold()
+    return any(value in message for value in (
+        "database is locked", "database table is locked",
+        "database schema is locked",
+    ))
+
+
+class _FairWriteCoordinator:
+    """FIFO process-local serialization for the two Qogita HTTP workers."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._next_ticket = 0
+        self._serving_ticket = 0
+
+    @contextmanager
+    def acquire(self):
+        with self._condition:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            while ticket != self._serving_ticket:
+                self._condition.wait()
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._serving_ticket += 1
+                self._condition.notify_all()
 
 
 class QogitaBootstrapError(RuntimeError):
@@ -146,10 +196,12 @@ CREATE TABLE IF NOT EXISTS qogita_bootstrap_milestones (
 def _connect(path: str | Path) -> sqlite3.Connection:
     absolute = Path(path).expanduser().resolve()
     absolute.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(absolute, timeout=60)
+    connection = sqlite3.connect(
+        absolute, timeout=max(0.001, SQLITE_BUSY_TIMEOUT_MS / 1000.0)
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA busy_timeout=60000")
+    connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     return connection
 
 
@@ -610,35 +662,141 @@ class QogitaBootstrapClient:
 
 
 class QogitaBootstrapStore:
-    def __init__(self, path: str | Path = DEFAULT_DATABASE_PATH):
+    def __init__(
+        self, path: str | Path = DEFAULT_DATABASE_PATH, *,
+        lock_retry_attempts: int = SQLITE_LOCK_RETRY_ATTEMPTS,
+        lock_retry_base_seconds: float = SQLITE_LOCK_RETRY_BASE_SECONDS,
+        lock_retry_max_seconds: float = SQLITE_LOCK_RETRY_MAX_SECONDS,
+        lock_retry_jitter_fraction: float = SQLITE_LOCK_RETRY_JITTER_FRACTION,
+        busy_timeout_ms: int = SQLITE_BUSY_TIMEOUT_MS,
+        sleep_func=time.sleep, random_func=random.random,
+    ):
         self.path = Path(path).expanduser().resolve()
+        self.lock_retry_attempts = max(1, int(lock_retry_attempts))
+        self.lock_retry_base_seconds = max(0.0, float(lock_retry_base_seconds))
+        self.lock_retry_max_seconds = max(
+            self.lock_retry_base_seconds, float(lock_retry_max_seconds)
+        )
+        self.lock_retry_jitter_fraction = max(
+            0.0, float(lock_retry_jitter_fraction)
+        )
+        self.busy_timeout_ms = max(0, int(busy_timeout_ms))
+        self._sleep = sleep_func
+        self._random = random_func
+        self._write_coordinator = _FairWriteCoordinator()
         self._metrics_lock = threading.Lock()
+        self._metrics_hydrated = False
+        self._initialize_lock = threading.Lock()
+        self._initialized = False
         self.sqlite_metrics = {
             "sqlite_busy": 0, "transaction_retries": 0,
             "lock_wait_seconds": 0.0, "write_latency_seconds": 0.0,
         }
 
-    def _begin_immediate(self, connection, *, attempts: int = 5):
+    def _new_connection(self):
+        connection = sqlite3.connect(
+            self.path, timeout=max(0.001, self.busy_timeout_ms / 1000.0)
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        return connection
+
+    @contextmanager
+    def _read_connection(self):
+        connection = self._new_connection()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    def _begin_immediate(self, connection, *, operation: str = "write",
+                         bootstrap_run_id: str = "-", worker_id: str | None = None,
+                         product: str | None = None):
         started = time.monotonic()
-        for attempt in range(1, attempts + 1):
+        for attempt in range(1, self.lock_retry_attempts + 1):
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 with self._metrics_lock:
                     self.sqlite_metrics["lock_wait_seconds"] += time.monotonic() - started
                 return
             except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).casefold() or attempt >= attempts:
+                if not transient_sqlite_lock(exc):
                     raise
                 with self._metrics_lock:
                     self.sqlite_metrics["sqlite_busy"] += 1
-                    self.sqlite_metrics["transaction_retries"] += 1
-                time.sleep(min(0.05 * (2 ** (attempt - 1)), 0.5))
+                    if attempt < self.lock_retry_attempts:
+                        self.sqlite_metrics["transaction_retries"] += 1
+                elapsed = time.monotonic() - started
+                context = {
+                    "operation": operation, "bootstrap_run_id": bootstrap_run_id,
+                    "worker_id": worker_id, "product": product,
+                    "attempt": attempt, "elapsed_seconds": elapsed,
+                }
+                setattr(exc, "qogita_sqlite_context", context)
+                if attempt >= self.lock_retry_attempts:
+                    with self._metrics_lock:
+                        self.sqlite_metrics["lock_wait_seconds"] += elapsed
+                    logger.error(
+                        "QOGITA SQLITE LOCK EXHAUSTED | run_id=%s worker=%s "
+                        "operation=%s product=%s attempt=%s elapsed=%.3f",
+                        bootstrap_run_id, worker_id or "-", operation,
+                        product or "-", attempt, elapsed,
+                    )
+                    raise
+                base_delay = min(
+                    self.lock_retry_base_seconds * (2 ** (attempt - 1)),
+                    self.lock_retry_max_seconds,
+                )
+                jitter = base_delay * self.lock_retry_jitter_fraction * self._random()
+                delay = min(base_delay + jitter, self.lock_retry_max_seconds)
+                logger.warning(
+                    "QOGITA SQLITE LOCK RETRY | run_id=%s worker=%s operation=%s "
+                    "product=%s attempt=%s elapsed=%.3f backoff=%.3f",
+                    bootstrap_run_id, worker_id or "-", operation, product or "-",
+                    attempt, elapsed, delay,
+                )
+                self._sleep(delay)
+
+    @contextmanager
+    def _write_transaction(self, *, operation: str, bootstrap_run_id: str,
+                           worker_id: str | None = None,
+                           product: str | None = None):
+        """Serialize one short write unit and always rollback/close safely."""
+        write_started = time.monotonic()
+        with self._write_coordinator.acquire():
+            connection = self._new_connection()
+            try:
+                self._begin_immediate(
+                    connection, operation=operation,
+                    bootstrap_run_id=bootstrap_run_id,
+                    worker_id=worker_id, product=product,
+                )
+                try:
+                    yield connection
+                    connection.commit()
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise
+            finally:
+                connection.close()
+                self._record_write(write_started)
 
     def _record_write(self, started: float):
         with self._metrics_lock:
             self.sqlite_metrics["write_latency_seconds"] += time.monotonic() - started
 
     def initialize(self):
+        if self._initialized:
+            return
+        with self._initialize_lock:
+            if self._initialized:
+                return
+            self._initialize_once()
+            self._initialized = True
+
+    def _initialize_once(self):
         from supplier_catalog import SupplierCatalogStore
         from qogita_catalog_pipeline import QogitaCatalogPipelineStore
 
@@ -921,8 +1079,9 @@ class QogitaBootstrapStore:
 
     def mark_stopped(self, bootstrap_run_id: str, reason: str, *, health=None):
         now = utc_now()
-        with _connect(self.path) as connection:
-            self._begin_immediate(connection)
+        with self._write_transaction(
+            operation="mark_stopped", bootstrap_run_id=bootstrap_run_id,
+        ) as connection:
             connection.execute(
                 """UPDATE qogita_bootstrap_runs SET status='auto_stopped',stop_reason=?,
                           health_json=?,updated_at=? WHERE bootstrap_run_id=?""",
@@ -933,17 +1092,17 @@ class QogitaBootstrapStore:
                           lease_expires_at=NULL WHERE bootstrap_run_id=?""",
                 (bootstrap_run_id,),
             )
-            connection.commit()
         return self.bootstrap(bootstrap_run_id)
 
     def update_health(self, bootstrap_run_id: str, health: dict[str, Any]):
-        with _connect(self.path) as connection:
+        with self._write_transaction(
+            operation="update_health", bootstrap_run_id=bootstrap_run_id,
+        ) as connection:
             connection.execute(
                 """UPDATE qogita_bootstrap_runs SET health_json=?,updated_at=?
                      WHERE bootstrap_run_id=?""",
                 (json_dumps(health), utc_now(), bootstrap_run_id),
             )
-            connection.commit()
 
     def database_integrity(self):
         with _connect(self.path) as connection:
@@ -958,23 +1117,21 @@ class QogitaBootstrapStore:
         return {"quick_check": str(result), "duplicate_scenario_identities": int(duplicates)}
 
     def resume_production(self, bootstrap_run_id: str):
-        with _connect(self.path) as connection:
-            self._begin_immediate(connection)
+        with self._write_transaction(
+            operation="resume_production", bootstrap_run_id=bootstrap_run_id,
+        ) as connection:
             row = connection.execute(
                 "SELECT run_mode,status FROM qogita_bootstrap_runs WHERE bootstrap_run_id=?",
                 (bootstrap_run_id,),
             ).fetchone()
             if not row or row["run_mode"] != "production":
                 raise ValueError("Production bootstrap not found")
-            if row["status"] == "awaiting_promotion_review":
-                connection.rollback()
-                return self.bootstrap(bootstrap_run_id)
-            connection.execute(
-                """UPDATE qogita_bootstrap_runs SET status='running',stop_reason=NULL,
-                          updated_at=? WHERE bootstrap_run_id=?""",
-                (utc_now(), bootstrap_run_id),
-            )
-            connection.commit()
+            if row["status"] != "awaiting_promotion_review":
+                connection.execute(
+                    """UPDATE qogita_bootstrap_runs SET status='running',stop_reason=NULL,
+                              updated_at=? WHERE bootstrap_run_id=?""",
+                    (utc_now(), bootstrap_run_id),
+                )
         return self.bootstrap(bootstrap_run_id)
 
     def record_milestones(self, bootstrap_run_id: str, *, metrics: dict[str, Any],
@@ -984,8 +1141,9 @@ class QogitaBootstrapStore:
             milestones = (*milestones, int(metrics.get("selected") or completed))
         now = utc_now()
         recorded = []
-        with _connect(self.path) as connection:
-            self._begin_immediate(connection)
+        with self._write_transaction(
+            operation="record_milestones", bootstrap_run_id=bootstrap_run_id,
+        ) as connection:
             for milestone in sorted(set(int(value) for value in milestones if int(value) > 0)):
                 if completed < milestone:
                     continue
@@ -997,7 +1155,6 @@ class QogitaBootstrapStore:
                 )
                 if cursor.rowcount:
                     recorded.append(milestone)
-            connection.commit()
         return recorded
 
     def milestones(self, bootstrap_run_id: str):
@@ -1039,9 +1196,10 @@ class QogitaBootstrapStore:
         lease_at = (_as_datetime(claimed_at) + timedelta(seconds=max(1, lease_seconds)))
         lease_expires = lease_at.isoformat().replace("+00:00", "Z")
         placeholders = ",".join("?" for _ in RETRYABLE_PRODUCT_STATES)
-        write_started = time.monotonic()
-        with _connect(self.path) as connection:
-            self._begin_immediate(connection)
+        with self._write_transaction(
+            operation="claim_batch", bootstrap_run_id=bootstrap_run_id,
+            worker_id=worker_id,
+        ) as connection:
             connection.execute(
                 f"""UPDATE qogita_bootstrap_products
                        SET worker_id=NULL,claimed_at=NULL,lease_expires_at=NULL
@@ -1062,8 +1220,6 @@ class QogitaBootstrapStore:
                        WHERE bootstrap_run_id=? AND canonical_product_key=? AND worker_id IS NULL""",
                     (worker_id, claimed_at, lease_expires, bootstrap_run_id, key),
                 )
-            connection.commit()
-        self._record_write(write_started)
         if not keys:
             return []
         with _connect(self.path) as connection:
@@ -1084,9 +1240,10 @@ class QogitaBootstrapStore:
         return [dict(row) for row in rows]
 
     def release_worker_claims(self, bootstrap_run_id: str, worker_id: str) -> int:
-        write_started = time.monotonic()
-        with _connect(self.path) as connection:
-            self._begin_immediate(connection)
+        with self._write_transaction(
+            operation="release_worker_claims", bootstrap_run_id=bootstrap_run_id,
+            worker_id=worker_id,
+        ) as connection:
             cursor = connection.execute(
                 """UPDATE qogita_bootstrap_products
                       SET worker_id=NULL,claimed_at=NULL,lease_expires_at=NULL
@@ -1094,8 +1251,6 @@ class QogitaBootstrapStore:
                       AND status NOT IN ('enriched','resolver_permanent','offers_permanent','parsing_failure')""",
                 (bootstrap_run_id, worker_id),
             )
-            connection.commit()
-        self._record_write(write_started)
         return int(cursor.rowcount)
 
     def claim_summary(self, bootstrap_run_id: str, *, now: str | None = None):
@@ -1116,7 +1271,10 @@ class QogitaBootstrapStore:
         """Recover rows written by clients that lacked token refresh on HTTP 401."""
         self.initialize()
         now = utc_now()
-        with _connect(self.path) as connection:
+        with self._write_transaction(
+            operation="requeue_expired_auth_failures",
+            bootstrap_run_id=bootstrap_run_id,
+        ) as connection:
             cursor = connection.execute(
                 """UPDATE qogita_bootstrap_products
                       SET status='offers_retryable',
@@ -1126,15 +1284,17 @@ class QogitaBootstrapStore:
                       AND error_message='Qogita offers failed with HTTP 401'""",
                 (now, bootstrap_run_id),
             )
-            connection.commit()
-            return int(cursor.rowcount)
+        return int(cursor.rowcount)
 
     def persist_fid(self, bootstrap_run_id: str, canonical_product_key: str,
-                    variant_fid: str, *, elapsed_seconds: float, attempts: int):
+                    variant_fid: str, *, elapsed_seconds: float, attempts: int,
+                    worker_id: str | None = None, gtin: str | None = None):
         now = utc_now()
-        write_started = time.monotonic()
-        with _connect(self.path) as connection:
-            self._begin_immediate(connection)
+        conflict = False
+        with self._write_transaction(
+            operation="persist_fid", bootstrap_run_id=bootstrap_run_id,
+            worker_id=worker_id, product=gtin or canonical_product_key,
+        ) as connection:
             selected = connection.execute(
                 """SELECT staging_run_id,gtin FROM qogita_bootstrap_products
                    WHERE bootstrap_run_id=? AND canonical_product_key=?""",
@@ -1164,45 +1324,45 @@ class QogitaBootstrapStore:
                        WHERE bootstrap_run_id=? AND canonical_product_key=?""",
                     (attempts, elapsed_seconds, now, now, bootstrap_run_id, canonical_product_key),
                 )
-                connection.commit()
-                self._record_write(write_started)
-                raise QogitaFidConflict()
-            metadata = json.loads(product["metadata_json"] or "{}")
-            metadata["variant_fid"] = variant_fid
-            metadata["variant_fid_source"] = PRODUCT_LINK_SOURCE
-            connection.execute(
-                """UPDATE supplier_catalog_products SET variant_fid=?,variant_fid_source=?,
-                   enrichment_status='enrichment_pending',enrichment_error_code=NULL,
-                   enrichment_error_message=NULL,metadata_json=?
-                   WHERE run_id=? AND canonical_product_key=?""",
-                (variant_fid, PRODUCT_LINK_SOURCE, json_dumps(metadata),
-                 selected["staging_run_id"], canonical_product_key),
-            )
-            connection.execute(
-                """UPDATE qogita_bootstrap_products SET status='fid_resolved',variant_fid=?,
-                   resolver_attempts=resolver_attempts+?,resolver_elapsed_seconds=resolver_elapsed_seconds+?,
-                   error_code=NULL,error_message=NULL,updated_at=?
-                   WHERE bootstrap_run_id=? AND canonical_product_key=?""",
-                (variant_fid, attempts, elapsed_seconds, now, bootstrap_run_id, canonical_product_key),
-            )
-            connection.execute(
-                """UPDATE qogita_enrichment_queue SET status='completed',variant_fid=?
-                   WHERE run_id=? AND canonical_product_key=? AND task_type='resolve_variant'""",
-                (variant_fid, selected["staging_run_id"], canonical_product_key),
-            )
-            connection.execute(
-                """INSERT INTO qogita_enrichment_queue (
-                    run_id,canonical_product_key,variant_fid,task_type,reason,priority,
-                    status,source_observed_at,created_at
-                ) VALUES (?,?,?,'offers_enrichment','fid_resolved',100,'pending',NULL,?)
-                ON CONFLICT(run_id,canonical_product_key,task_type) DO UPDATE SET
-                    variant_fid=excluded.variant_fid,status=CASE
-                        WHEN qogita_enrichment_queue.status='completed' THEN 'completed'
-                        ELSE 'pending' END""",
-                (selected["staging_run_id"], canonical_product_key, variant_fid, now),
-            )
-            connection.commit()
-        self._record_write(write_started)
+                conflict = True
+            else:
+                metadata = json.loads(product["metadata_json"] or "{}")
+                metadata["variant_fid"] = variant_fid
+                metadata["variant_fid_source"] = PRODUCT_LINK_SOURCE
+                connection.execute(
+                    """UPDATE supplier_catalog_products SET variant_fid=?,variant_fid_source=?,
+                       enrichment_status='enrichment_pending',enrichment_error_code=NULL,
+                       enrichment_error_message=NULL,metadata_json=?
+                       WHERE run_id=? AND canonical_product_key=?""",
+                    (variant_fid, PRODUCT_LINK_SOURCE, json_dumps(metadata),
+                     selected["staging_run_id"], canonical_product_key),
+                )
+                connection.execute(
+                    """UPDATE qogita_bootstrap_products SET status='fid_resolved',variant_fid=?,
+                       resolver_attempts=resolver_attempts+?,resolver_elapsed_seconds=resolver_elapsed_seconds+?,
+                       error_code=NULL,error_message=NULL,updated_at=?
+                       WHERE bootstrap_run_id=? AND canonical_product_key=?""",
+                    (variant_fid, attempts, elapsed_seconds, now, bootstrap_run_id,
+                     canonical_product_key),
+                )
+                connection.execute(
+                    """UPDATE qogita_enrichment_queue SET status='completed',variant_fid=?
+                       WHERE run_id=? AND canonical_product_key=? AND task_type='resolve_variant'""",
+                    (variant_fid, selected["staging_run_id"], canonical_product_key),
+                )
+                connection.execute(
+                    """INSERT INTO qogita_enrichment_queue (
+                        run_id,canonical_product_key,variant_fid,task_type,reason,priority,
+                        status,source_observed_at,created_at
+                    ) VALUES (?,?,?,'offers_enrichment','fid_resolved',100,'pending',NULL,?)
+                    ON CONFLICT(run_id,canonical_product_key,task_type) DO UPDATE SET
+                        variant_fid=excluded.variant_fid,status=CASE
+                            WHEN qogita_enrichment_queue.status='completed' THEN 'completed'
+                            ELSE 'pending' END""",
+                    (selected["staging_run_id"], canonical_product_key, variant_fid, now),
+                )
+        if conflict:
+            raise QogitaFidConflict()
         return {"status": "fid_resolved", "variant_fid": variant_fid, "no_op": current == variant_fid}
 
     def persist_failure(self, bootstrap_run_id: str, canonical_product_key: str, *,
@@ -1217,9 +1377,10 @@ class QogitaBootstrapStore:
         )
         attempt_column = "resolver_attempts" if phase == "resolver" else "offers_attempts"
         elapsed_column = "resolver_elapsed_seconds" if phase == "resolver" else "offers_elapsed_seconds"
-        write_started = time.monotonic()
-        with _connect(self.path) as connection:
-            self._begin_immediate(connection)
+        with self._write_transaction(
+            operation="persist_failure", bootstrap_run_id=bootstrap_run_id,
+            product=canonical_product_key,
+        ) as connection:
             row = connection.execute(
                 """SELECT staging_run_id FROM qogita_bootstrap_products
                    WHERE bootstrap_run_id=? AND canonical_product_key=?""",
@@ -1248,16 +1409,18 @@ class QogitaBootstrapStore:
                 ("pending" if error.retryable else "failed", attempts,
                  row["staging_run_id"], canonical_product_key, task),
             )
-            connection.commit()
-        self._record_write(write_started)
 
     def persist_offers(self, bootstrap_run_id: str, canonical_product_key: str, *,
                        scenarios: list[dict[str, Any]], diagnostics: dict[str, int],
-                       observed_at: str, elapsed_seconds: float, attempts: int):
+                       observed_at: str, elapsed_seconds: float, attempts: int,
+                       worker_id: str | None = None, gtin: str | None = None,
+                       variant_fid: str | None = None):
         now = utc_now()
-        write_started = time.monotonic()
-        with _connect(self.path) as connection:
-            self._begin_immediate(connection)
+        with self._write_transaction(
+            operation="persist_offers", bootstrap_run_id=bootstrap_run_id,
+            worker_id=worker_id,
+            product=gtin or variant_fid or canonical_product_key,
+        ) as connection:
             row = connection.execute(
                 """SELECT staging_run_id,variant_fid FROM qogita_bootstrap_products
                    WHERE bootstrap_run_id=? AND canonical_product_key=?""",
@@ -1328,14 +1491,11 @@ class QogitaBootstrapStore:
                    AND task_type='offers_enrichment'""",
                 (attempts, observed_at, row["staging_run_id"], canonical_product_key),
             )
-            connection.commit()
-        self._record_write(write_started)
 
     def checkpoint_batch(self, bootstrap_run_id: str, *, client_metrics: dict[str, Any],
                          batch_attempted: int):
         now = utc_now()
-        with _connect(self.path) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        with self._read_connection() as connection:
             run = connection.execute(
                 "SELECT staging_run_id,target_count FROM qogita_bootstrap_runs WHERE bootstrap_run_id=?",
                 (bootstrap_run_id,),
@@ -1359,6 +1519,18 @@ class QogitaBootstrapStore:
                 "waiting_retry" if counts["retryable"] else "running"
             )
             progress = {**counts, "remaining": remaining, "last_batch_attempted": batch_attempted}
+            scenario_count = connection.execute(
+                "SELECT COUNT(*) FROM supplier_catalog_scenarios WHERE run_id=?",
+                (run["staging_run_id"],),
+            ).fetchone()[0]
+            enriched_products = connection.execute(
+                """SELECT COUNT(*) FROM supplier_catalog_products
+                   WHERE run_id=? AND enrichment_status IN ('enriched','carried_forward')""",
+                (run["staging_run_id"],),
+            ).fetchone()[0]
+        with self._write_transaction(
+            operation="checkpoint_batch", bootstrap_run_id=bootstrap_run_id,
+        ) as connection:
             connection.execute(
                 """UPDATE qogita_bootstrap_runs SET updated_at=?,status=?,
                    completed_batches=completed_batches+1,products_attempted=?,fid_resolved=?,
@@ -1376,15 +1548,6 @@ class QogitaBootstrapStore:
                  client_metrics["resolver_elapsed_seconds"], client_metrics["offers_elapsed_seconds"],
                  json_dumps(progress), bootstrap_run_id),
             )
-            scenario_count = connection.execute(
-                "SELECT COUNT(*) FROM supplier_catalog_scenarios WHERE run_id=?",
-                (run["staging_run_id"],),
-            ).fetchone()[0]
-            enriched_products = connection.execute(
-                """SELECT COUNT(*) FROM supplier_catalog_products
-                   WHERE run_id=? AND enrichment_status IN ('enriched','carried_forward')""",
-                (run["staging_run_id"],),
-            ).fetchone()[0]
             enrichment_status = "partial" if enriched_products else "none"
             connection.execute(
                 """UPDATE supplier_catalog_runs SET scenario_count=?,scenario_enrichment_count=?,
@@ -1392,8 +1555,21 @@ class QogitaBootstrapStore:
                 (scenario_count, enriched_products, enrichment_status,
                  now if enriched_products else None, run["staging_run_id"]),
             )
-            connection.commit()
         return self.bootstrap(bootstrap_run_id)
+
+    def _hydrate_sqlite_metrics(self, run: dict[str, Any]) -> None:
+        with self._metrics_lock:
+            if self._metrics_hydrated:
+                return
+            persisted = {
+                "sqlite_busy": int(run.get("sqlite_busy_count") or 0),
+                "transaction_retries": int(run.get("transaction_retry_count") or 0),
+                "lock_wait_seconds": float(run.get("lock_wait_seconds") or 0),
+                "write_latency_seconds": float(run.get("write_latency_seconds") or 0),
+            }
+            for key, value in persisted.items():
+                self.sqlite_metrics[key] += value
+            self._metrics_hydrated = True
 
     def checkpoint_concurrent(self, bootstrap_run_id: str, *, metrics: dict[str, Any],
                               worker_count: int, batch_attempted: int,
@@ -1402,11 +1578,9 @@ class QogitaBootstrapStore:
         now = utc_now()
         wal = Path(str(self.path) + "-wal")
         wal_size = wal.stat().st_size if wal.exists() else 0
-        write_started = time.monotonic()
-        with _connect(self.path) as connection:
-            self._begin_immediate(connection)
+        with self._read_connection() as connection:
             run = connection.execute(
-                "SELECT staging_run_id,run_mode,status FROM qogita_bootstrap_runs WHERE bootstrap_run_id=?",
+                "SELECT * FROM qogita_bootstrap_runs WHERE bootstrap_run_id=?",
                 (bootstrap_run_id,),
             ).fetchone()
             counts = dict(connection.execute(
@@ -1428,10 +1602,25 @@ class QogitaBootstrapStore:
             ))
             if run["status"] == "auto_stopped" and remaining:
                 status = "auto_stopped"
-            progress = {**counts, "remaining": remaining,
-                        "last_batch_attempted": batch_attempted,
-                        "claims": self.claim_summary(bootstrap_run_id, now=now)}
+            scenario_count = connection.execute(
+                "SELECT COUNT(*) FROM supplier_catalog_scenarios WHERE run_id=?",
+                (run["staging_run_id"],),
+            ).fetchone()[0]
+            enriched_products = connection.execute(
+                """SELECT COUNT(*) FROM supplier_catalog_products
+                   WHERE run_id=? AND enrichment_status IN ('enriched','carried_forward')""",
+                (run["staging_run_id"],),
+            ).fetchone()[0]
+        claims = self.claim_summary(bootstrap_run_id, now=now)
+        progress = {**counts, "remaining": remaining,
+                    "last_batch_attempted": batch_attempted, "claims": claims}
+        run_dict = dict(run)
+        self._hydrate_sqlite_metrics(run_dict)
+        with self._metrics_lock:
             sqlite_values = dict(self.sqlite_metrics)
+        with self._write_transaction(
+            operation="checkpoint_concurrent", bootstrap_run_id=bootstrap_run_id,
+        ) as connection:
             connection.execute(
                 """UPDATE qogita_bootstrap_runs SET updated_at=?,status=?,
                    completed_batches=completed_batches+1,products_attempted=?,fid_resolved=?,
@@ -1454,24 +1643,37 @@ class QogitaBootstrapStore:
                  sqlite_values["write_latency_seconds"], wal_size, wall_elapsed_seconds,
                  json_dumps(progress), bootstrap_run_id),
             )
-            scenario_count = connection.execute(
-                "SELECT COUNT(*) FROM supplier_catalog_scenarios WHERE run_id=?",
-                (run["staging_run_id"],),
-            ).fetchone()[0]
-            enriched_products = connection.execute(
-                """SELECT COUNT(*) FROM supplier_catalog_products
-                   WHERE run_id=? AND enrichment_status IN ('enriched','carried_forward')""",
-                (run["staging_run_id"],),
-            ).fetchone()[0]
             connection.execute(
                 """UPDATE supplier_catalog_runs SET scenario_count=?,scenario_enrichment_count=?,
                    scenario_enrichment_status=?,scenario_enrichment_observed_at=? WHERE run_id=?""",
                 (scenario_count, enriched_products, "partial" if enriched_products else "none",
                  now if enriched_products else None, run["staging_run_id"]),
             )
-            connection.commit()
-        self._record_write(write_started)
         return self.bootstrap(bootstrap_run_id)
+
+    def reconcile_interrupted_window(self, bootstrap_run_id: str):
+        """Recompute authoritative aggregates without changing product/scenario rows."""
+        run = self.bootstrap(bootstrap_run_id)
+        if not run or run.get("run_mode") != "production":
+            raise ValueError("Production bootstrap not found")
+        if run.get("status") != "auto_stopped":
+            raise ValueError("Bootstrap is not auto-stopped")
+        metrics = {
+            "product_link_requests": run.get("product_link_requests", 0),
+            "offers_requests": run.get("offers_requests", 0),
+            "retries": run.get("retry_count", 0),
+            "http_401": run.get("http_401_count", 0),
+            "auth_refreshes": run.get("auth_refresh_count", 0),
+            "http_429": run.get("rate_limit_count", 0),
+            "http_5xx": run.get("server_error_count", 0),
+            "resolver_elapsed_seconds": run.get("resolver_elapsed_seconds", 0),
+            "offers_elapsed_seconds": run.get("offers_elapsed_seconds", 0),
+        }
+        return self.checkpoint_concurrent(
+            bootstrap_run_id, metrics=metrics,
+            worker_count=int(run.get("worker_count") or 2), batch_attempted=0,
+            wall_elapsed_seconds=float(run.get("wall_elapsed_seconds") or 0),
+        )
 
     def products(self, bootstrap_run_id: str):
         self.initialize()
@@ -1639,6 +1841,7 @@ def _process_claimed_product(
                 store.persist_fid(
                     bootstrap_run_id, selected["canonical_product_key"], fid,
                     elapsed_seconds=elapsed, attempts=attempts,
+                    worker_id=selected.get("worker_id"), gtin=selected.get("gtin"),
                 )
                 break
             except QogitaFidConflict:
@@ -1673,6 +1876,8 @@ def _process_claimed_product(
                 bootstrap_run_id, selected["canonical_product_key"], scenarios=scenarios,
                 diagnostics=diagnostics, observed_at=observed_at,
                 elapsed_seconds=elapsed, attempts=attempts,
+                worker_id=selected.get("worker_id"), gtin=selected.get("gtin"),
+                variant_fid=fid,
             )
             return {"status": "success", "scenario_count": diagnostics["scenario_count"]}
         except QogitaBootstrapError as exc:
@@ -1780,6 +1985,7 @@ def run_qogita_bootstrap_concurrent(
         nonlocal processed, queue_wait_seconds, budget, stop_reason, graceful_stop
         worker_id = f"worker-{worker_number}-{uuid4().hex[:8]}"
         client = client_factory(auth, limiter)
+        primary_error: BaseException | None = None
         with clients_lock:
             clients.append(client)
         try:
@@ -1832,9 +2038,23 @@ def run_qogita_bootstrap_concurrent(
                         checkpoint(checkpoint_every)
                     if stop_event.is_set():
                         break
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            store.release_worker_claims(bootstrap_run_id, worker_id)
-            client.close()
+            try:
+                store.release_worker_claims(bootstrap_run_id, worker_id)
+            except Exception:
+                logger.exception(
+                    "QOGITA CLAIM CLEANUP FAILED | run_id=%s worker=%s "
+                    "primary_error=%s",
+                    bootstrap_run_id, worker_id,
+                    type(primary_error).__name__ if primary_error else "none",
+                )
+                if primary_error is None:
+                    raise
+            finally:
+                client.close()
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="qogita-bootstrap") as executor:
         futures = [executor.submit(worker, number + 1) for number in range(workers)]
