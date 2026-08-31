@@ -60,6 +60,11 @@ from notifications import EmailConfig, NotificationOutbox
 from discovery_freshness import AmazonFreshnessPolicy, POLICY_VERSION
 from discovery_freshness import DiscoveryAmazonCache
 from discovery_incremental import DiscoveryIncrementalStore
+from discovery_taxonomy import (
+    BEAUTY_PARENT_IDS,
+    QOGITA_CATEGORY_TREE,
+    default_qogita_category_filter,
+)
 
 
 DISCOVERY_OPERATIONAL_SUPPLIERS = ("qogita", "umma", "abw", "qudo")
@@ -1582,6 +1587,73 @@ elif ui_state == "discovery":
             "minimum_margin": minimum_margin,
             "minimum_qogita_stock": defaults["minimum_qogita_stock"],
         }
+        category_filter = default_qogita_category_filter()
+        if "qogita" in selected_suppliers:
+            st.markdown("**Categorie Qogita**")
+            all_categories = st.checkbox(
+                "Tutte le categorie", value=True,
+                key="discovery_qogita_all_categories",
+                help="Include anche categorie Amazon nuove o non ancora classificate.",
+            )
+            if not all_categories:
+                only_beauty = st.checkbox(
+                    "Solo Beauty", value=False,
+                    key="discovery_qogita_only_beauty",
+                    help="Si applica esclusivamente agli scenari Qogita.",
+                )
+                parent_options = [
+                    node_id for node_id in QOGITA_CATEGORY_TREE
+                    if not only_beauty or node_id in BEAUTY_PARENT_IDS
+                ]
+                selected_parent_ids = st.multiselect(
+                    "Categorie principali",
+                    options=parent_options,
+                    default=parent_options,
+                    format_func=lambda value: QOGITA_CATEGORY_TREE[value]["label"],
+                    key=f"discovery_qogita_category_parents_{int(only_beauty)}",
+                )
+                include_unknown = st.checkbox(
+                    "Includi prodotti non classificati", value=True,
+                    key="discovery_qogita_include_unknown",
+                )
+                child_overrides = {}
+                for parent_id in selected_parent_ids:
+                    children = QOGITA_CATEGORY_TREE[parent_id]["children"]
+                    if not children:
+                        continue
+                    with st.expander(
+                        f"Dettaglio · {QOGITA_CATEGORY_TREE[parent_id]['label']}",
+                        expanded=False,
+                    ):
+                        excluded_ids = st.multiselect(
+                            "Escludi sottocategorie o tipologie",
+                            options=list(children), default=[],
+                            format_func=lambda value, values=children: values[value],
+                            key=f"discovery_qogita_excluded_{parent_id}",
+                        )
+                    if excluded_ids:
+                        child_overrides[parent_id] = {"excluded_ids": excluded_ids}
+                category_filter.update({
+                    "qogita_category_filter_enabled": True,
+                    "qogita_category_selected_parent_ids": selected_parent_ids,
+                    "qogita_category_child_overrides": child_overrides,
+                    "qogita_category_include_unknown": include_unknown,
+                    "qogita_category_only_beauty": only_beauty,
+                })
+                selected_labels = [
+                    QOGITA_CATEGORY_TREE[value]["label"]
+                    for value in selected_parent_ids
+                ]
+                selection_summary = (
+                    ", ".join(selected_labels)
+                    if 0 < len(selected_labels) <= 4
+                    else f"{len(selected_labels)} categorie selezionate"
+                    if selected_labels else "nessuna categoria nota"
+                )
+                st.caption(
+                    "Qogita: " + selection_summary
+                    + (" · non classificati inclusi" if include_unknown else "")
+                )
         try:
             universe = discovery_supplier_universe(tuple(selected_suppliers))
         except Exception:
@@ -1599,6 +1671,7 @@ elif ui_state == "discovery":
             ui_alert(validation_error, "warning")
         confirmation_signature = (
             tuple(selected_suppliers), tuple(sorted(filters.items())), eligible,
+            json.dumps(category_filter, sort_keys=True, separators=(",", ":")),
         )
         pending_confirmation = st.session_state.get("discovery_full_confirmation")
         if pending_confirmation != confirmation_signature:
@@ -1637,6 +1710,7 @@ elif ui_state == "discovery":
                 state["freshness_policy_version"] = (
                     AmazonFreshnessPolicy.from_environment().version
                 )
+                state.update(category_filter)
                 state["progress_phase"] = "initialized"
                 state["progress_current"] = 0
                 state["progress_total"] = eligible

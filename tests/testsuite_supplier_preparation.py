@@ -432,6 +432,40 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         ))
         details = next(row for row in app.toggle if row.label == "Dettagli tecnici")
         self.assertFalse(details.value)
+        if qogita_available:
+            category_all = next(
+                row for row in app.checkbox if row.label == "Tutte le categorie"
+            )
+            self.assertTrue(category_all.value)
+            self.assertFalse(any(
+                row.label == "Categorie principali" for row in app.multiselect
+            ))
+
+    def test_qogita_category_controls_are_optional_and_supplier_scoped(self):
+        with patch.object(
+            SupplierCatalogStore, "serving_generation_metadata",
+            return_value={"serving_snapshot": True, "product_count": 1},
+        ):
+            app = self.discovery_app()
+            qogita = next(row for row in app.checkbox if row.label == "Qogita")
+            self.assertFalse(qogita.disabled)
+            all_categories = next(
+                row for row in app.checkbox if row.label == "Tutte le categorie"
+            )
+            app = all_categories.set_value(False).run()
+            labels = {row.label for row in app.checkbox}
+            self.assertIn("Solo Beauty", labels)
+            self.assertIn("Includi prodotti non classificati", labels)
+            parents = next(
+                row for row in app.multiselect if row.label == "Categorie principali"
+            )
+            self.assertIn("Fragranze e profumi", parents.options)
+            self.assertIn("Trucco", parents.options)
+            qogita = next(row for row in app.checkbox if row.label == "Qogita")
+            app = qogita.set_value(False).run()
+            self.assertFalse(any(
+                row.label == "Tutte le categorie" for row in app.checkbox
+            ))
 
     def test_full_catalog_start_requires_simple_second_confirmation(self):
         registry = DiscoveryJobRegistry()

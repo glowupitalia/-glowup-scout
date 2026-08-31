@@ -1391,6 +1391,11 @@ def _evaluate_product_combinations(product, observation_by_id, minimum_margin):
         )
         shared_total = total_seller_points(observation.get("total_sellers"))
         for scenario in product.get("scenarios") or []:
+            if str(scenario.get("supplier") or "").strip().lower() in {
+                str(value).strip().lower()
+                for value in listing.get("excluded_suppliers") or []
+            }:
+                continue
             economics = calculate_economics(
                 observation.get("reference_price"),
                 scenario.get("cost_gross_unit_eur"),

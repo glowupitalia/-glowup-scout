@@ -22,6 +22,10 @@ from discovery_incremental import (
     LightweightCheckpointStore,
 )
 from discovery_resources import DiscoveryResourceGovernor, ResourcePause
+from discovery_taxonomy import (
+    apply_qogita_listing_filter,
+    normalize_qogita_category_filter,
+)
 
 
 def _valid_price(value: Any) -> bool:
@@ -128,38 +132,65 @@ def run_incremental_discovery(
     # record-by-record so the phase remains restart-safe and memory-bounded.
     if store.summary(job_id)["phase"] == "catalog_complete":
         processed = 0
-        transformed = []
-        for candidate in store.iter_candidates(job_id):
-            for listing in candidate.get("amazon_listings") or []:
-                if listing.get("compatibility_status") != "compatible":
-                    listing["evaluation_status"] = "catalog_incompatible"
-                    continue
-                bsr = listing.get("bsr_beauty")
-                if listing.get("beauty_status") != "display_group_beauty":
-                    listing["evaluation_status"] = "beauty_filtered"
-                    listing["exclusion_reason"] = "not_beauty_display_group"
-                elif not isinstance(bsr, int) or isinstance(bsr, bool) or bsr <= 0:
-                    listing["evaluation_status"] = "bsr_filtered"
-                    listing["exclusion_reason"] = "invalid_bsr"
-                elif not filters["bsr_min"] <= bsr <= filters["bsr_max"]:
-                    listing["evaluation_status"] = "bsr_filtered"
-                    listing["exclusion_reason"] = "bsr_out_of_range"
-                else:
-                    listing["evaluation_status"] = "bsr_passed"
-            transformed.append(candidate)
-            processed += 1
-            if len(transformed) == 250:
-                store.update_candidates(job_id, transformed)
-                transformed = []
-                governor.before_next_batch()
-                if progress:
-                    progress("catalog_filtering", {
-                        "progress_phase": "catalog_filtering",
-                        "progress_current": processed,
-                        "progress_total": selected,
-                    })
-        if transformed:
-            store.update_candidates(job_id, transformed)
+        category_filter = normalize_qogita_category_filter(state)
+        for transformed in store.iter_candidate_batches(job_id, batch_size=250):
+            identifiers = [
+                str(candidate.get("canonical_ean") or candidate.get("gtin") or "")
+                for candidate in transformed
+            ]
+            paths_by_listing = store.classification_paths_for_listings(
+                job_id, identifiers,
+            )
+            remove_qogita = []
+            for candidate, identifier in zip(transformed, identifiers):
+                listings = list(candidate.get("amazon_listings") or [])
+                listing_paths = paths_by_listing.get(identifier) or {}
+                if apply_qogita_listing_filter(
+                    candidate, listing_paths, category_filter,
+                ):
+                    remove_qogita.append(identifier)
+                scenarios = list(candidate.get("scenarios") or [])
+                no_supplier_scenario = not scenarios
+                for listing in listings:
+                    excluded_suppliers = {
+                        str(value).strip().lower()
+                        for value in listing.get("excluded_suppliers") or []
+                    }
+                    listing_has_scenario = any(
+                        str(scenario.get("supplier") or "").strip().lower()
+                        not in excluded_suppliers
+                        for scenario in scenarios
+                    )
+                    if no_supplier_scenario or not listing_has_scenario:
+                        listing["evaluation_status"] = "qogita_category_filtered"
+                        listing["exclusion_reason"] = "qogita_category_excluded"
+                        continue
+                    if listing.get("compatibility_status") != "compatible":
+                        listing["evaluation_status"] = "catalog_incompatible"
+                        continue
+                    bsr = listing.get("bsr_beauty")
+                    if listing.get("beauty_status") != "display_group_beauty":
+                        listing["evaluation_status"] = "beauty_filtered"
+                        listing["exclusion_reason"] = "not_beauty_display_group"
+                    elif not isinstance(bsr, int) or isinstance(bsr, bool) or bsr <= 0:
+                        listing["evaluation_status"] = "bsr_filtered"
+                        listing["exclusion_reason"] = "invalid_bsr"
+                    elif not filters["bsr_min"] <= bsr <= filters["bsr_max"]:
+                        listing["evaluation_status"] = "bsr_filtered"
+                        listing["exclusion_reason"] = "bsr_out_of_range"
+                    else:
+                        listing["evaluation_status"] = "bsr_passed"
+                processed += 1
+            store.update_candidates(
+                job_id, transformed, remove_qogita_scenarios=remove_qogita,
+            )
+            governor.before_next_batch()
+            if progress:
+                progress("catalog_filtering", {
+                    "progress_phase": "catalog_filtering",
+                    "progress_current": processed,
+                    "progress_total": selected,
+                })
         store.set_phase(job_id, "bsr_filtered")
         _checkpoint(
             store, metadata_store, job_id, progress_phase="bsr_filtered",

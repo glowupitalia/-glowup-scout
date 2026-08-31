@@ -19,6 +19,8 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from discovery_taxonomy import projection_rows
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATABASE = PROJECT_ROOT / "data" / "discovery_incremental.sqlite3"
@@ -64,7 +66,23 @@ CREATE TABLE IF NOT EXISTS discovery_purchase_scenarios (
     canonical_identifier TEXT NOT NULL,
     scenario_id TEXT NOT NULL,
     scenario_json TEXT NOT NULL,
+    supplier TEXT,
     PRIMARY KEY (job_id, canonical_identifier, scenario_id)
+);
+CREATE TABLE IF NOT EXISTS discovery_listing_classifications (
+    job_id TEXT NOT NULL,
+    canonical_identifier TEXT NOT NULL,
+    asin TEXT NOT NULL,
+    marketplace_id TEXT NOT NULL,
+    path_hash TEXT NOT NULL,
+    classification_id TEXT NOT NULL,
+    parent_id TEXT,
+    depth INTEGER NOT NULL,
+    display_name TEXT,
+    is_leaf INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (
+        job_id,canonical_identifier,asin,marketplace_id,path_hash,classification_id
+    )
 );
 CREATE TABLE IF NOT EXISTS discovery_catalog_results (
     job_id TEXT NOT NULL,
@@ -109,6 +127,14 @@ CREATE INDEX IF NOT EXISTS idx_discovery_items_catalog_pending
 ON discovery_job_items(job_id, catalog_status, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_discovery_listings_asin
 ON discovery_listings(job_id, asin);
+CREATE INDEX IF NOT EXISTS idx_discovery_scenarios_supplier
+ON discovery_purchase_scenarios(job_id,supplier,canonical_identifier);
+CREATE INDEX IF NOT EXISTS idx_discovery_taxonomy_node_identifier
+ON discovery_listing_classifications(marketplace_id,classification_id,canonical_identifier);
+CREATE INDEX IF NOT EXISTS idx_discovery_taxonomy_identifier
+ON discovery_listing_classifications(canonical_identifier,marketplace_id);
+CREATE INDEX IF NOT EXISTS idx_discovery_taxonomy_job_identifier
+ON discovery_listing_classifications(job_id,canonical_identifier);
 """
 
 
@@ -200,6 +226,11 @@ def read_legacy_metadata(path: str | Path) -> dict[str, Any]:
         "rotation_remaining_after_run", "sampling_strategy", "funnel",
         "progress_phase", "progress_current", "progress_total", "errors",
         "export_state",
+        "qogita_category_filter_enabled",
+        "qogita_category_selected_parent_ids",
+        "qogita_category_child_overrides",
+        "qogita_category_include_unknown", "qogita_category_only_beauty",
+        "qogita_taxonomy_schema_version", "qogita_category_marketplace_id",
     )
     decoder = json.JSONDecoder()
     result: dict[str, Any] = {}
@@ -259,7 +290,80 @@ class DiscoveryIncrementalStore:
 
     def initialize(self):
         with self._connect() as connection:
+            columns = {
+                str(row[1]) for row in connection.execute(
+                    "PRAGMA table_info(discovery_purchase_scenarios)"
+                )
+            }
+            if columns and "supplier" not in columns:
+                connection.execute(
+                    "ALTER TABLE discovery_purchase_scenarios ADD COLUMN supplier TEXT"
+                )
             connection.executescript(SCHEMA)
+
+    @staticmethod
+    def _replace_classification_projection(
+        connection, job_id: str, identifier: str,
+        listings: Iterable[dict[str, Any]],
+    ) -> None:
+        connection.execute(
+            "DELETE FROM discovery_listing_classifications WHERE job_id=? AND canonical_identifier=?",
+            (job_id, identifier),
+        )
+        rows = [
+            row for listing in listings
+            for row in projection_rows(job_id, identifier, listing)
+        ]
+        if rows:
+            connection.executemany(
+                """INSERT INTO discovery_listing_classifications
+                   (job_id,canonical_identifier,asin,marketplace_id,path_hash,
+                    classification_id,parent_id,depth,display_name,is_leaf)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT DO UPDATE SET parent_id=excluded.parent_id,
+                     depth=excluded.depth,display_name=excluded.display_name,
+                     is_leaf=excluded.is_leaf""",
+                rows,
+            )
+
+    @classmethod
+    def _replace_classification_projection_batch(
+        cls, connection, job_id: str,
+        candidates: Iterable[dict[str, Any]],
+    ) -> None:
+        values = list(candidates)
+        identifiers = [
+            str(value.get("canonical_ean") or value.get("gtin") or "").strip()
+            for value in values
+        ]
+        identifiers = [value for value in identifiers if value]
+        if identifiers:
+            placeholders = ",".join("?" for _ in identifiers)
+            connection.execute(
+                f"""DELETE FROM discovery_listing_classifications
+                    WHERE job_id=? AND canonical_identifier IN ({placeholders})""",
+                (job_id, *identifiers),
+            )
+        rows = [
+            row for candidate in values
+            for listing in candidate.get("amazon_listings") or []
+            for row in projection_rows(
+                job_id,
+                str(candidate.get("canonical_ean") or candidate.get("gtin") or "").strip(),
+                listing,
+            )
+        ]
+        if rows:
+            connection.executemany(
+                """INSERT INTO discovery_listing_classifications
+                   (job_id,canonical_identifier,asin,marketplace_id,path_hash,
+                    classification_id,parent_id,depth,display_name,is_leaf)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT DO UPDATE SET parent_id=excluded.parent_id,
+                     depth=excluded.depth,display_name=excluded.display_name,
+                     is_leaf=excluded.is_leaf""",
+                rows,
+            )
 
     def has_job(self, job_id: str) -> bool:
         self.initialize()
@@ -369,7 +473,10 @@ class DiscoveryIncrementalStore:
                     scenario_id = _scenario_identity(identifier, scenario, index)
                     payload = dict(scenario)
                     payload.setdefault("scenario_id", scenario_id)
-                    scenario_rows.append((job_id, identifier, scenario_id, _dump(payload)))
+                    scenario_rows.append((
+                        job_id, identifier, scenario_id, _dump(payload),
+                        str(payload.get("supplier") or "").strip().lower() or None,
+                    ))
                 if catalog_status:
                     catalog_rows.append((
                         job_id, identifier, catalog_status,
@@ -399,10 +506,10 @@ class DiscoveryIncrementalStore:
                 )
                 connection.executemany(
                     """INSERT INTO discovery_purchase_scenarios
-                       (job_id,canonical_identifier,scenario_id,scenario_json)
-                       VALUES (?,?,?,?)
+                       (job_id,canonical_identifier,scenario_id,scenario_json,supplier)
+                       VALUES (?,?,?,?,?)
                        ON CONFLICT(job_id,canonical_identifier,scenario_id) DO UPDATE SET
-                         scenario_json=excluded.scenario_json""",
+                         scenario_json=excluded.scenario_json,supplier=excluded.supplier""",
                     scenario_rows,
                 )
                 connection.executemany(
@@ -422,6 +529,7 @@ class DiscoveryIncrementalStore:
                          listing_json=excluded.listing_json,updated_at=excluded.updated_at""",
                     listing_rows,
                 )
+                self._replace_classification_projection_batch(connection, job_id, rows)
                 connection.execute(
                     """UPDATE discovery_incremental_jobs
                          SET selected_count=?,catalog_completed_count=?,metadata_json=?,updated_at=?
@@ -582,20 +690,101 @@ class DiscoveryIncrementalStore:
         return product
 
     def iter_candidates(self, job_id: str, *, batch_size: int = 250) -> Iterator[dict[str, Any]]:
+        for batch in self.iter_candidate_batches(job_id, batch_size=batch_size):
+            yield from batch
+
+    def iter_candidate_batches(
+        self, job_id: str, *, batch_size: int = 250,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Hydrate one bounded page with three set-based reads, without N+1."""
         self.initialize()
-        offset = 0
+        last_sequence = -1
         while True:
             with self._connect() as connection:
                 rows = connection.execute(
                     """SELECT * FROM discovery_job_items WHERE job_id=?
-                       ORDER BY sequence_no LIMIT ? OFFSET ?""",
-                    (job_id, int(batch_size), offset),
+                         AND sequence_no>?
+                       ORDER BY sequence_no LIMIT ?""",
+                    (job_id, last_sequence, int(batch_size)),
                 ).fetchall()
-                hydrated = [self._hydrate_item(connection, row) for row in rows]
+                if not rows:
+                    return
+                identifiers = [str(row["canonical_identifier"]) for row in rows]
+                placeholders = ",".join("?" for _ in identifiers)
+                parameters = (job_id, *identifiers)
+                scenarios: dict[str, list[dict[str, Any]]] = {}
+                for scenario in connection.execute(
+                    f"""SELECT canonical_identifier,scenario_json
+                        FROM discovery_purchase_scenarios
+                        WHERE job_id=? AND canonical_identifier IN ({placeholders})
+                        ORDER BY canonical_identifier,scenario_id""", parameters,
+                ):
+                    scenarios.setdefault(str(scenario["canonical_identifier"]), []).append(
+                        json.loads(scenario["scenario_json"])
+                    )
+                listings: dict[str, list[dict[str, Any]]] = {}
+                for listing in connection.execute(
+                    f"""SELECT canonical_identifier,listing_json
+                        FROM discovery_listings
+                        WHERE job_id=? AND canonical_identifier IN ({placeholders})
+                        ORDER BY canonical_identifier,asin""", parameters,
+                ):
+                    listings.setdefault(str(listing["canonical_identifier"]), []).append(
+                        json.loads(listing["listing_json"])
+                    )
+                hydrated = []
+                for row in rows:
+                    identifier = str(row["canonical_identifier"])
+                    product = json.loads(row["product_json"])
+                    product["scenarios"] = scenarios.get(identifier, [])
+                    product["amazon_listings"] = listings.get(identifier, [])
+                    if row["catalog_status"]:
+                        product["catalog_status"] = row["catalog_status"]
+                    hydrated.append(product)
+                last_sequence = int(rows[-1]["sequence_no"])
             if not hydrated:
                 return
-            yield from hydrated
-            offset += len(hydrated)
+            yield hydrated
+
+    def classification_paths_for_identifiers(
+        self, job_id: str, identifiers: Iterable[str],
+    ) -> dict[str, list[tuple[str, ...]]]:
+        """Read normalized taxonomy paths for a bounded identifier batch."""
+        by_listing = self.classification_paths_for_listings(job_id, identifiers)
+        return {
+            identifier: [path for paths in listings.values() for path in paths]
+            for identifier, listings in by_listing.items()
+        }
+
+    def classification_paths_for_listings(
+        self, job_id: str, identifiers: Iterable[str],
+    ) -> dict[str, dict[str, list[tuple[str, ...]]]]:
+        """Read normalized paths grouped by product and Amazon listing."""
+        values = list(dict.fromkeys(str(value) for value in identifiers if value))
+        result: dict[str, dict[str, list[tuple[str, ...]]]] = {
+            value: {} for value in values
+        }
+        if not values:
+            return result
+        placeholders = ",".join("?" for _ in values)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT canonical_identifier,asin,path_hash,classification_id,depth
+                    FROM discovery_listing_classifications
+                    WHERE job_id=? AND canonical_identifier IN ({placeholders})
+                    ORDER BY canonical_identifier,path_hash,depth""",
+                (job_id, *values),
+            ).fetchall()
+        grouped: dict[tuple[str, str, str], list[str]] = {}
+        for row in rows:
+            key = (
+                str(row["canonical_identifier"]), str(row["asin"]),
+                str(row["path_hash"]),
+            )
+            grouped.setdefault(key, []).append(str(row["classification_id"]))
+        for (identifier, asin, _), path in grouped.items():
+            result.setdefault(identifier, {}).setdefault(asin, []).append(tuple(path))
+        return result
 
     def iter_export_candidates(
         self, job_id: str, *, batch_size: int = 250, final_only: bool = False,
@@ -750,6 +939,7 @@ class DiscoveryIncrementalStore:
                        WHERE job_id=? AND canonical_identifier=?""",
                     (_dump(product), status, observed, job_id, identifier),
                 )
+            self._replace_classification_projection_batch(connection, job_id, rows)
             completed = connection.execute(
                 """SELECT COUNT(*) FROM discovery_job_items
                    WHERE job_id=? AND catalog_status IN ('resolved','ambiguous','not_found','invalid_identifier')""",
@@ -773,6 +963,7 @@ class DiscoveryIncrementalStore:
     def update_candidates(
         self, job_id: str, candidates: Iterable[dict[str, Any]], *,
         phase: str | None = None, replace_scenarios: bool = False,
+        remove_qogita_scenarios: Iterable[str] | None = None,
     ) -> int:
         """Persist a bounded transformed candidate batch idempotently."""
         observed = _now()
@@ -822,9 +1013,12 @@ class DiscoveryIncrementalStore:
                         payload.setdefault("scenario_id", scenario_id)
                         connection.execute(
                             """INSERT INTO discovery_purchase_scenarios
-                               (job_id,canonical_identifier,scenario_id,scenario_json)
-                               VALUES (?,?,?,?)""",
-                            (job_id, identifier, scenario_id, _dump(payload)),
+                               (job_id,canonical_identifier,scenario_id,scenario_json,supplier)
+                               VALUES (?,?,?,?,?)""",
+                            (
+                                job_id, identifier, scenario_id, _dump(payload),
+                                str(payload.get("supplier") or "").strip().lower() or None,
+                            ),
                         )
                 for combination in combinations:
                     combination_id = str(
@@ -839,6 +1033,20 @@ class DiscoveryIncrementalStore:
                              updated_at=excluded.updated_at""",
                         (job_id, combination_id, identifier, _dump(combination), observed),
                     )
+            identifiers_to_filter = list(dict.fromkeys(
+                str(value) for value in (remove_qogita_scenarios or []) if value
+            ))
+            if identifiers_to_filter:
+                placeholders = ",".join("?" for _ in identifiers_to_filter)
+                connection.execute(
+                    f"""DELETE FROM discovery_purchase_scenarios
+                        WHERE job_id=? AND canonical_identifier IN ({placeholders})
+                          AND (supplier='qogita' OR (
+                            supplier IS NULL
+                            AND lower(json_extract(scenario_json,'$.supplier'))='qogita'
+                          ))""",
+                    (job_id, *identifiers_to_filter),
+                )
             if phase:
                 connection.execute(
                     """UPDATE discovery_incremental_jobs SET phase=?,updated_at=?
@@ -846,6 +1054,51 @@ class DiscoveryIncrementalStore:
                 )
             connection.commit()
         return len(rows)
+
+    def backfill_classification_projection(
+        self, job_id: str | None = None, *, batch_size: int = 500,
+    ) -> int:
+        """Idempotently derive normalized taxonomy rows from stored listings."""
+        self.initialize()
+        last_rowid = 0
+        written = 0
+        while True:
+            with self._connect() as connection:
+                if job_id:
+                    rows = connection.execute(
+                        """SELECT rowid,job_id,canonical_identifier,listing_json
+                           FROM discovery_listings WHERE job_id=? AND rowid>?
+                           ORDER BY rowid LIMIT ?""",
+                        (job_id, last_rowid, int(batch_size)),
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        """SELECT rowid,job_id,canonical_identifier,listing_json
+                           FROM discovery_listings WHERE rowid>?
+                           ORDER BY rowid LIMIT ?""",
+                        (last_rowid, int(batch_size)),
+                    ).fetchall()
+                if not rows:
+                    return written
+                projection = []
+                for row in rows:
+                    listing = json.loads(row["listing_json"])
+                    projection.extend(projection_rows(
+                        str(row["job_id"]), str(row["canonical_identifier"]), listing,
+                    ))
+                if projection:
+                    before_changes = connection.total_changes
+                    connection.executemany(
+                        """INSERT INTO discovery_listing_classifications
+                           (job_id,canonical_identifier,asin,marketplace_id,path_hash,
+                           classification_id,parent_id,depth,display_name,is_leaf)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT DO NOTHING""",
+                        projection,
+                    )
+                    written += connection.total_changes - before_changes
+                last_rowid = int(rows[-1]["rowid"])
+                connection.commit()
 
     def set_phase(self, job_id: str, phase: str, *, status: str | None = None):
         values = {"phase": phase}
