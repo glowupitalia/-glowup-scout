@@ -17,6 +17,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATABASE = PROJECT_ROOT / "data" / "discovery_jobs.sqlite3"
 DEFAULT_LOG_DIR = PROJECT_ROOT / "data" / "logs"
 ACTIVE_STATUSES = {
+    "launching", "running", "computed", "export_pending", "export_running",
+    "export_complete", "notification_pending",
+}
+OWNED_ACTIVE_STATUSES = {
     "launching", "running", "export_running", "notification_pending",
 }
 RESUMABLE_CHECKPOINT_STATUSES = {
@@ -46,7 +50,9 @@ CREATE TABLE IF NOT EXISTS discovery_job_runtime (
     selected_suppliers_json TEXT NOT NULL DEFAULT '[]',
     filters_json TEXT NOT NULL DEFAULT '{}',
     checkpoint_path TEXT,
-    export_path TEXT
+    export_path TEXT,
+    phase_started_at TEXT,
+    phase_progress_start INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_job_runtime_updated
 ON discovery_job_runtime(updated_at DESC);
@@ -102,6 +108,21 @@ class DiscoveryJobRegistry:
     def initialize(self):
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            existing = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(discovery_job_runtime)"
+                ).fetchall()
+            }
+            if "phase_started_at" not in existing:
+                connection.execute(
+                    "ALTER TABLE discovery_job_runtime ADD COLUMN phase_started_at TEXT"
+                )
+            if "phase_progress_start" not in existing:
+                connection.execute(
+                    "ALTER TABLE discovery_job_runtime ADD COLUMN phase_progress_start "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.commit()
 
     @staticmethod
     def _row(row):
@@ -162,6 +183,19 @@ class DiscoveryJobRegistry:
             ).fetchone()
         return self._row(row)
 
+    def recent(self, limit: int = 5, *, status: str | None = None):
+        self.initialize()
+        query = "SELECT * FROM discovery_job_runtime"
+        values: list[Any] = []
+        if status:
+            query += " WHERE status=?"
+            values.append(status)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        values.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return [self._row(row) for row in rows]
+
     def latest_active(self):
         self.reconcile()
         self.initialize()
@@ -208,8 +242,12 @@ class DiscoveryJobRegistry:
                     return False
             connection.execute(
                 """UPDATE discovery_job_runtime SET status='running',worker_pid=?,
-                   lease_expires_at=?,updated_at=?,error=NULL WHERE job_id=?""",
-                (pid, expires, observed, job_id),
+                   lease_expires_at=?,updated_at=?,error=NULL,
+                   phase_started_at=COALESCE(phase_started_at,?),
+                   phase_progress_start=CASE WHEN phase_started_at IS NULL
+                     THEN progress_current ELSE phase_progress_start END
+                   WHERE job_id=?""",
+                (pid, expires, observed, observed, job_id),
             )
             connection.commit()
         return True
@@ -224,6 +262,16 @@ class DiscoveryJobRegistry:
         updates = ["updated_at=?", "lease_expires_at=?"]
         values: list[Any] = [observed.isoformat().replace("+00:00", "Z"), expires]
         if phase:
+            updates.append(
+                "phase_started_at=CASE WHEN phase<>? OR phase_started_at IS NULL "
+                "THEN ? ELSE phase_started_at END"
+            )
+            values.extend([phase, observed.isoformat().replace("+00:00", "Z")])
+            updates.append(
+                "phase_progress_start=CASE WHEN phase<>? OR phase_started_at IS NULL "
+                "THEN ? ELSE phase_progress_start END"
+            )
+            values.extend([phase, int(current or 0)])
             updates.append("phase=?")
             values.append(phase)
         if current is not None:
@@ -400,11 +448,11 @@ class DiscoveryJobRegistry:
     def reconcile(self):
         self.initialize()
         now = datetime.now(timezone.utc)
-        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+        placeholders = ",".join("?" for _ in OWNED_ACTIVE_STATUSES)
         with self._connect() as connection:
             rows = connection.execute(
                 f"SELECT * FROM discovery_job_runtime WHERE status IN ({placeholders})",
-                tuple(sorted(ACTIVE_STATUSES)),
+                tuple(sorted(OWNED_ACTIVE_STATUSES)),
             ).fetchall()
             for row in rows:
                 lease = _parse_time(row["lease_expires_at"])

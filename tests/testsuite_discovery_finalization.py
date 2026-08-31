@@ -192,7 +192,11 @@ class FinalizationTests(unittest.TestCase):
         )
         self.assertEqual(first["export_state"]["sha256"], second["export_state"]["sha256"])
         self.assertEqual(target.stat().st_mtime_ns, first_mtime)
-        self.assertEqual(self.registry.get("job")["status"], "completed")
+        runtime = self.registry.get("job")
+        self.assertEqual(runtime["status"], "completed")
+        self.assertIsNone(runtime["worker_pid"])
+        self.assertIsNone(runtime["lease_expires_at"])
+        self.assertEqual(list(self.root.glob(".*.xlsx")), [])
 
     def test_resource_pause_is_export_specific_and_resumable(self):
         snapshot = ResourceSnapshot(

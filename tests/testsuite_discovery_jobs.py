@@ -63,6 +63,22 @@ class DiscoveryJobRegistryTests(unittest.TestCase):
         status = DiscoveryJobRegistry(self.registry.path).get(state["job_id"])
         self.assertEqual((status["phase"], status["progress_current"], status["progress_total"]), ("catalog", 320, 5000))
 
+    def test_heartbeat_and_lease_cover_every_long_running_phase(self):
+        state = self.state()
+        self.registry.register_checkpoint(state)
+        self.assertTrue(self.registry.claim(state["job_id"], pid=os.getpid()))
+        phases = ("preparing", "catalog", "pricing", "competition", "fees", "economics")
+        for index, phase in enumerate(phases, start=1):
+            self.registry.heartbeat(
+                state["job_id"], pid=os.getpid(), phase=phase,
+                current=index, total=len(phases),
+            )
+            runtime = self.registry.get(state["job_id"])
+            self.assertEqual(runtime["phase"], phase)
+            self.assertEqual(runtime["worker_pid"], os.getpid())
+            self.assertIsNotNone(runtime["lease_expires_at"])
+            self.assertIsNotNone(runtime["phase_started_at"])
+
     def test_dead_running_job_becomes_resumable(self):
         state = self.state()
         self.registry.register_checkpoint(state)
@@ -165,8 +181,10 @@ class DiscoveryJobUiTests(unittest.TestCase):
             with patch.dict(os.environ, {"DISCOVERY_JOB_DATABASE": str(registry.path)}):
                 app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
             self.assertEqual(len(app.exception), 0)
-            self.assertTrue(any(row.value == "Discovery in corso" for row in app.subheader))
-            self.assertTrue(any(row.label == "Apri Discovery" for row in app.button))
+            self.assertTrue(any(row.value == "DISCOVERY IN CORSO" for row in app.subheader))
+            labels = [row.label for row in app.button]
+            self.assertIn("Apri avanzamento", labels)
+            self.assertNotIn("Apri Discovery", labels)
 
     def test_running_job_shows_open_progress_and_not_resume(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -181,6 +199,8 @@ class DiscoveryJobUiTests(unittest.TestCase):
 
     def test_completed_job_is_discoverable_after_new_browser_session(self):
         with tempfile.TemporaryDirectory() as temporary:
+            checkpoint_root = Path(temporary) / "checkpoints"
+            checkpoint_root.mkdir()
             registry = self._running_registry(temporary)
             state = {
                 "job_id": "ui-running-job", "status": "completed", "phase": "completed",
@@ -191,11 +211,34 @@ class DiscoveryJobUiTests(unittest.TestCase):
                 "filters": default_filters(), "errors": [],
             }
             registry.finish(state["job_id"], state)
-            with patch.dict(os.environ, {"DISCOVERY_JOB_DATABASE": str(registry.path)}):
+            (checkpoint_root / "ui-running-job.state.json").write_text(json.dumps({
+                **state, "selected_count": 5000, "final_opportunity_count": 370,
+                "fee_target_count": 4472, "fee_valid_count": 4413,
+                "fee_unavailable_count": 57,
+            }), encoding="utf-8")
+            with patch.dict(os.environ, {
+                "DISCOVERY_JOB_DATABASE": str(registry.path),
+                "DISCOVERY_CHECKPOINT_ROOT": str(checkpoint_root),
+            }):
                 app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
             self.assertEqual(len(app.exception), 0)
-            self.assertTrue(any(row.value == "Ultima Discovery completata" for row in app.subheader))
-            self.assertTrue(any(row.label == "Apri risultati Discovery" for row in app.button))
+            self.assertTrue(any(row.value == "DISCOVERY COMPLETATA" for row in app.subheader))
+            labels = [row.label for row in app.button]
+            self.assertIn("Visualizza risultati / Scarica Excel", labels)
+            self.assertIn("Nuova ricerca", labels)
+            rendered = " ".join(row.value for row in app.caption)
+            self.assertIn("370 opportunità", rendered)
+            self.assertIn("98.68%", rendered)
+            self.assertTrue(any(row.value == "Discovery recenti" for row in app.subheader))
+
+    def test_no_job_home_offers_discovery_start(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {"DISCOVERY_JOB_DATABASE": str(Path(temporary) / "runtime.sqlite3")},
+        ):
+            app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn("Apri Discovery", [row.label for row in app.button])
 
     def test_discovery_configuration_shows_notification_status(self):
         with tempfile.TemporaryDirectory() as temporary:

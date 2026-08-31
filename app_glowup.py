@@ -1,8 +1,12 @@
 import logging
 import html
+import json
 import os
 import time
 import urllib.parse
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 from PIL import Image
@@ -46,6 +50,12 @@ from supplier_preparation import SUPPORTED_SUPPLIERS
 from supplier_catalog import SupplierCatalogStore, canonical_gtin14
 from discovery_rotation import DiscoveryRotationStore
 from discovery_jobs import DiscoveryJobRegistry
+from discovery_ui import (
+    discovery_phase_eta_seconds,
+    discovery_phase_progress,
+    format_eta,
+    format_phase_steps,
+)
 from notifications import EmailConfig, NotificationOutbox
 from discovery_freshness import AmazonFreshnessPolicy, POLICY_VERSION
 from discovery_freshness import DiscoveryAmazonCache
@@ -817,6 +827,99 @@ def discovery_notification_status(job_id, database_path=None):
     return "Email: attiva" if config.configured else "Email: non configurata"
 
 
+def _discovery_compact_state(job_id):
+    root = Path(os.environ.get("DISCOVERY_CHECKPOINT_ROOT", "data/discovery_jobs"))
+    path = root / f"{job_id}.state.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _discovery_local_time(value):
+    if not value:
+        return "—"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return "—"
+    return parsed.astimezone(ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M")
+
+
+def _discovery_completion_counts(runtime):
+    state = _discovery_compact_state(runtime["job_id"])
+    evaluated = int(
+        state.get("selected_count") or state.get("sampled_identifier_count")
+        or runtime.get("progress_total") or 0
+    )
+    opportunities = int(
+        state.get("final_opportunity_count") or state.get("final_products") or 0
+    )
+    fee_target = int(state.get("fee_target_count") or 0)
+    fee_valid = int(state.get("fee_valid_count") or 0)
+    fee_unavailable = int(state.get("fee_unavailable_count") or 0)
+    coverage = (100.0 * fee_valid / fee_target) if fee_target else None
+    return {
+        "state": state, "evaluated": evaluated, "opportunities": opportunities,
+        "fee_target": fee_target, "fee_valid": fee_valid,
+        "fee_unavailable": fee_unavailable, "fee_coverage": coverage,
+    }
+
+
+def _render_active_discovery(runtime, *, key_prefix):
+    progress = discovery_phase_progress(runtime)
+    st.subheader("DISCOVERY IN CORSO")
+    st.markdown(f"**{progress['phase_label']}**")
+    if progress["numeric"]:
+        st.progress(progress["fraction"])
+        st.caption(
+            f"{progress['progress_label']}: {progress['current']:,} / "
+            f"{progress['total']:,} · {progress['fraction'] * 100:.1f}%"
+            .replace(",", ".")
+        )
+    else:
+        st.caption("Fase in corso · avanzamento numerico non disponibile")
+    st.caption(
+        f"Ultimo aggiornamento: {_discovery_local_time(runtime.get('updated_at'))} · "
+        f"{format_eta(discovery_phase_eta_seconds(runtime))}"
+    )
+    if st.button(
+        "Apri avanzamento", key=f"{key_prefix}_open_progress", type="primary",
+        use_container_width=True,
+    ):
+        _open_discovery_job(runtime["job_id"])
+        st.rerun()
+
+
+def _render_completed_discovery(runtime, *, key_prefix):
+    counts = _discovery_completion_counts(runtime)
+    st.subheader("DISCOVERY COMPLETATA")
+    st.caption(
+        f"{counts['opportunities']:,} opportunità · "
+        f"{counts['evaluated']:,} prodotti valutati · "
+        f"completata il {_discovery_local_time(runtime.get('completed_at'))}"
+        .replace(",", ".")
+    )
+    if counts["fee_coverage"] is not None:
+        st.caption(
+            f"Copertura Fee {counts['fee_coverage']:.2f}% · "
+            f"{counts['fee_unavailable']:,} non disponibili".replace(",", ".")
+        )
+    columns = st.columns(2)
+    if columns[0].button(
+        "Visualizza risultati / Scarica Excel",
+        key=f"{key_prefix}_open_results", type="primary",
+        use_container_width=True,
+    ):
+        _load_discovery_result(runtime["job_id"], runtime)
+        st.rerun()
+    if columns[1].button(
+        "Nuova ricerca", key=f"{key_prefix}_new_search", use_container_width=True,
+    ):
+        new_discovery_search()
+        st.rerun()
+
+
 @st.fragment(run_every=2)
 def _render_discovery_runtime(job_id):
     registry = DiscoveryJobRegistry()
@@ -828,20 +931,21 @@ def _render_discovery_runtime(job_id):
         "launching", "running", "computed", "export_pending",
         "export_running", "notification_pending",
     }:
-        current = int(runtime.get("progress_current") or 0)
-        total = int(runtime.get("progress_total") or 0)
-        progress_value = min(1.0, current / total) if total else 0.02
-        st.progress(progress_value)
-        phase = str(runtime.get("phase") or "preparazione")
-        progress_label = (
-            "Preparazione Discovery"
-            if phase.startswith("preparing") else "Prodotti valutati"
-        )
+        progress = discovery_phase_progress(runtime)
+        st.subheader(progress["phase_label"])
+        st.caption(format_phase_steps(runtime))
+        if progress["numeric"]:
+            st.progress(progress["fraction"])
+            st.caption(
+                f"{progress['progress_label']}: {progress['current']:,} / "
+                f"{progress['total']:,} · {progress['fraction'] * 100:.1f}%"
+                .replace(",", ".")
+            )
+        else:
+            st.info("Fase in corso. Il progresso numerico non è ancora disponibile.")
         st.caption(
-            f"{progress_label}: {current:,} / {total:,} · "
-            f"fase {phase.replace('_', ' ')} · "
-            f"ultimo aggiornamento {runtime.get('updated_at') or '—'}"
-            .replace(",", ".")
+            f"Ultimo aggiornamento: {_discovery_local_time(runtime.get('updated_at'))} · "
+            f"{format_eta(discovery_phase_eta_seconds(runtime))}"
         )
         if runtime["status"] in {"computed", "export_pending", "export_running"}:
             st.info("Calcolo completato. Generazione Excel in corso con memoria protetta.")
@@ -894,34 +998,42 @@ ui_state = st.session_state["ui_state"]
 if ui_state == "home":
     discovery_registry = DiscoveryJobRegistry()
     active_discovery = discovery_registry.latest_active()
+    latest_discovery = discovery_registry.latest()
     if active_discovery:
         with st.container(border=True):
-            st.subheader("Discovery in corso")
-            current = int(active_discovery.get("progress_current") or 0)
-            total = int(active_discovery.get("progress_total") or 0)
-            phase = str(active_discovery.get("phase") or "preparazione").replace("_", " ")
+            _render_active_discovery(active_discovery, key_prefix="home_active")
+    elif latest_discovery and latest_discovery.get("status") == "completed":
+        with st.container(border=True):
+            _render_completed_discovery(latest_discovery, key_prefix="home_completed")
+    elif latest_discovery and latest_discovery.get("resumable"):
+        with st.container(border=True):
+            st.subheader("DISCOVERY SOSPESA")
             st.caption(
-                f"Prodotti valutati: {current:,} / {total:,} · fase {phase} · "
-                f"avviata {active_discovery.get('started_at') or '—'}".replace(",", ".")
+                "Il job persistito può essere aperto e ripreso senza creare un nuovo campione."
             )
-            if st.button("Apri Discovery", key="open_active_discovery", type="primary"):
-                _open_discovery_job(active_discovery["job_id"])
+            if st.button(
+                "Apri avanzamento", key="home_resumable_open", type="primary"
+            ):
+                _open_discovery_job(latest_discovery["job_id"])
                 st.rerun()
     else:
-        latest_discovery = discovery_registry.latest()
-        if latest_discovery and latest_discovery.get("status") == "completed":
-            with st.container(border=True):
-                st.subheader("Ultima Discovery completata")
-                st.caption(
-                    f"{latest_discovery.get('budget') or '—'} prodotti · "
-                    f"completata {latest_discovery.get('completed_at') or '—'}"
-                )
-                if st.button(
-                    "Apri risultati Discovery", key="open_completed_discovery",
-                    type="primary",
-                ):
-                    _load_discovery_result(latest_discovery["job_id"], latest_discovery)
-                    st.rerun()
+        with st.container(border=True):
+            st.subheader("Scopri opportunità")
+            st.caption(
+                "Trova automaticamente i prodotti più interessanti da acquistare "
+                "e vendere su Amazon"
+            )
+            email_config = EmailConfig.from_runtime()
+            st.caption(
+                f"Notifiche email: {'attive' if email_config.configured else 'disattive'} · "
+                f"Destinatario: {email_config.recipient}"
+            )
+            if st.button(
+                "Apri Discovery", key="open_discovery", type="primary",
+                use_container_width=True,
+            ):
+                st.session_state["ui_state"] = "discovery"
+                st.rerun()
     with st.container(border=True):
         st.subheader("Ricerca singola")
         st.markdown(
@@ -986,26 +1098,31 @@ if ui_state == "home":
                     st.session_state["ui_state"] = "batch_running"
                     st.rerun()
 
-    st.markdown("<div style='height:.55rem'></div>", unsafe_allow_html=True)
-    with st.container(border=True):
-        st.subheader("Scopri opportunità")
-        st.caption(
-            "Trova automaticamente i prodotti più interessanti da acquistare "
-            "e vendere su Amazon"
-        )
-        email_config = EmailConfig.from_runtime()
-        st.caption(
-            f"Notifiche email: {'attive' if email_config.configured else 'disattive'} · "
-            f"Destinatario: {email_config.recipient}"
-        )
-        if st.button(
-            "Apri Discovery",
-            key="open_discovery",
-            type="primary",
-            use_container_width=True,
-        ):
-            st.session_state["ui_state"] = "discovery"
-            st.rerun()
+    recent_discoveries = discovery_registry.recent(5, status="completed")
+    if recent_discoveries:
+        st.markdown("<div style='height:.55rem'></div>", unsafe_allow_html=True)
+        st.subheader("Discovery recenti")
+        for recent in recent_discoveries:
+            counts = _discovery_completion_counts(recent)
+            with st.container(border=True):
+                columns = st.columns([3, 1])
+                supplier_names = ", ".join(
+                    str(value).upper()
+                    for value in recent.get("selected_suppliers") or []
+                )
+                columns[0].markdown(
+                    f"**{_discovery_local_time(recent.get('completed_at'))}**  \n"
+                    f"{counts['evaluated']:,} prodotti · {counts['opportunities']:,} "
+                    f"opportunità · fornitori {supplier_names or '—'} · "
+                    f"Excel {'disponibile' if recent.get('export_path') else 'non disponibile'}"
+                    .replace(",", ".")
+                )
+                if columns[1].button(
+                    "Apri", key=f"history_open_{recent['job_id']}",
+                    use_container_width=True,
+                ):
+                    _load_discovery_result(recent["job_id"], recent)
+                    st.rerun()
 
 elif ui_state == "single_result":
     st.button(
@@ -1644,15 +1761,43 @@ elif ui_state == "discovery_result":
             ui_alert(LEGACY_CHECKPOINT_MESSAGE, "warning")
             st.stop()
         result_count = len(state.get("results") or [])
+        evaluated_count = int(
+            state.get("selected_count") or state.get("sampled_identifier_count") or 0
+        )
+        fee_target_count = int(state.get("fee_target_count") or 0)
+        fee_valid_count = int(state.get("fee_valid_count") or 0)
+        fee_unavailable_count = int(state.get("fee_unavailable_count") or 0)
+        fee_coverage_percent = (
+            100.0 * fee_valid_count / fee_target_count if fee_target_count else 0.0
+        )
+        st.subheader("DISCOVERY COMPLETATA")
+        completion_columns = st.columns(3)
+        completion_columns[0].metric("Opportunità trovate", result_count)
+        completion_columns[1].metric("Prodotti valutati", f"{evaluated_count:,}".replace(",", "."))
+        completion_columns[2].metric("Copertura Fee", f"{fee_coverage_percent:.2f}%")
+        st.caption(
+            f"{fee_unavailable_count:,} Fee non disponibili · completata il "
+            f"{_discovery_local_time(state.get('completed_at'))}".replace(",", ".")
+        )
         st.caption(discovery_notification_status(state.get("job_id")))
         ui_alert(
             f"{result_count} opportunità trovate" if result_count
             else "Nessuna opportunità con i filtri utilizzati.",
             "success" if result_count else "info",
         )
-        if st.button(
+        action_columns = st.columns(2)
+        if discovery_result.get("output_bytes") is not None:
+            action_columns[0].download_button(
+                "Scarica Discovery Excel",
+                data=discovery_result["output_bytes"],
+                file_name=f"glowup_scout_discovery_{state['job_id']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary", use_container_width=True, on_click="ignore",
+            )
+        if action_columns[1].button(
             "← Nuova ricerca", key="new_discovery_search",
             type="secondary", on_click=new_discovery_search,
+            use_container_width=True,
         ):
             pass
         snapshot_set = state.get("supplier_snapshot_set") or {}
@@ -1692,13 +1837,6 @@ elif ui_state == "discovery_result":
                 f"prodotti valutati: {int(state.get('sampled_identifier_count') or len(state.get('candidates') or [])):,}"
                 .replace(",", ".")
             )
-            if state.get("rotation_scope"):
-                st.caption(
-                    f"Copertura Discovery · ciclo {state.get('rotation_cycle_id')} · "
-                    f"{int(state.get('rotation_analyzed_this_run') or 0):,} analizzati in questa run · "
-                    f"{int(state.get('rotation_remaining_after_run') or 0):,} rimanenti"
-                    .replace(",", ".")
-                )
             summary_columns = st.columns(4)
             summary_columns[0].metric(
                 "Prodotti analizzati", funnel["suppliers"]["supplier_products_total"]
@@ -1937,11 +2075,3 @@ elif ui_state == "discovery_result":
             f"margine min {filters_used.get('minimum_margin')}% · "
             f"fornitori {', '.join(state.get('selected_suppliers') or ['Qogita'])}"
         )
-        if discovery_result.get("output_bytes") is not None:
-            st.download_button(
-                "Scarica Discovery Excel",
-                data=discovery_result["output_bytes"],
-                file_name=f"glowup_scout_discovery_{state['job_id']}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary", use_container_width=True, on_click="ignore",
-            )

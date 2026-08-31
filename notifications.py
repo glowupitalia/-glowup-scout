@@ -480,11 +480,17 @@ def prepare_discovery_attachment(
 def _content_with_attachment_note(
     content: NotificationContent, decision: AttachmentDecision,
 ) -> NotificationContent:
+    size_mb = (
+        f"{float(decision.size) / 1_000_000:.2f}".replace(".", ",")
+        if decision.size is not None else None
+    )
     notes = {
         "attached": "Il file Excel completo della Discovery è allegato a questa email.",
         "skipped_too_large": (
-            "Il file Excel è disponibile dalla UI Scout ma non è stato allegato "
-            "perché supera il limite email configurato."
+            "Il file Excel della Discovery è stato generato correttamente. "
+            + (f"Dimensione: {size_mb} MB. " if size_mb else "")
+            + "Non è stato allegato perché supera il limite email configurato. "
+            "È disponibile dalla UI Scout e puoi scaricarlo direttamente da Glow Up Scout."
         ),
         "unavailable": "File Excel non allegato perché non disponibile.",
         "invalid": "File Excel non allegato perché non ha superato la validazione.",

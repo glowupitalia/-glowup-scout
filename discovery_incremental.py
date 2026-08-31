@@ -942,6 +942,40 @@ class DiscoveryIncrementalStore:
                 ).fetchone()[0],
             }
 
+    def pricing_progress_asins(self, job_id: str) -> tuple[set[str], set[str]]:
+        """Return bounded phase-local Pricing identities from persisted listings."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT asin,listing_json FROM discovery_listings
+                   WHERE job_id=? AND json_extract(listing_json,'$.evaluation_status')='bsr_passed'""",
+                (job_id,),
+            ).fetchall()
+        target: set[str] = set()
+        completed: set[str] = set()
+        for row in rows:
+            asin = str(row["asin"] or "")
+            if not asin:
+                continue
+            target.add(asin)
+            listing = json.loads(row["listing_json"])
+            if listing.get("pricing_status"):
+                completed.add(asin)
+        return target, completed
+
+    def fee_progress_counts(self, job_id: str) -> tuple[int, int]:
+        """Return terminal Fee observations and target without hydrating payloads."""
+        terminal = ("valid", "unavailable", "invalid")
+        placeholders = ",".join("?" for _ in terminal)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""SELECT COUNT(*) total,
+                           SUM(CASE WHEN json_extract(observation_json,'$.fee_status')
+                             IN ({placeholders}) THEN 1 ELSE 0 END) completed
+                    FROM discovery_observations WHERE job_id=?""",
+                (*terminal, job_id),
+            ).fetchone()
+        return int(row["completed"] or 0), int(row["total"] or 0)
+
     def notification_summary(self, job_id: str) -> dict[str, Any]:
         """Return a bounded, authoritative terminal-notification projection.
 

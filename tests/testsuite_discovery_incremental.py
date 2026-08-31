@@ -320,12 +320,14 @@ class IncrementalStoreTests(unittest.TestCase):
             def get(self):
                 return "token"
 
+        progress = []
         result = run_incremental_discovery(
             "job", store=self.store, metadata_store=self.checkpoints,
             catalog_batch=catalog_success, pricing_batch=pricing_success,
             fees_batch=fees, token_provider=Token(), sleep_func=lambda *_: None,
             catalog_batch_interval=0, pricing_batch_interval=0,
             fee_batch_interval=0,
+            progress=lambda phase, state: progress.append((phase, dict(state))),
         )
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["fee_target_count"], 20)
@@ -342,6 +344,13 @@ class IncrementalStoreTests(unittest.TestCase):
         ]
         self.assertEqual(len(unavailable), 1)
         self.assertEqual(unavailable[0]["exclusion_reason"], "amazon_fee_unavailable")
+        phases = {phase for phase, _state in progress}
+        self.assertTrue(
+            {"catalog", "pricing", "competition", "fees", "economics"} <= phases
+        )
+        fee_updates = [state for phase, state in progress if phase == "fees"]
+        self.assertEqual(fee_updates[-1]["progress_total"], 20)
+        self.assertEqual(fee_updates[-1]["progress_current"], 20)
 
     def test_request_level_fee_connection_outage_waits_for_retry(self):
         filters = {

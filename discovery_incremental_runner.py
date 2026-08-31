@@ -152,6 +152,12 @@ def run_incremental_discovery(
                 store.update_candidates(job_id, transformed)
                 transformed = []
                 governor.before_next_batch()
+                if progress:
+                    progress("catalog_filtering", {
+                        "progress_phase": "catalog_filtering",
+                        "progress_current": processed,
+                        "progress_total": selected,
+                    })
         if transformed:
             store.update_candidates(job_id, transformed)
         store.set_phase(job_id, "bsr_filtered")
@@ -159,6 +165,17 @@ def run_incremental_discovery(
             store, metadata_store, job_id, progress_phase="bsr_filtered",
             progress_current=selected, progress_total=selected,
         )
+
+    pricing_targets: set[str] = set()
+    pricing_completed: set[str] = set()
+    if store.summary(job_id)["phase"] == "bsr_filtered":
+        pricing_targets, pricing_completed = store.pricing_progress_asins(job_id)
+        if progress:
+            progress("pricing", {
+                "progress_phase": "pricing",
+                "progress_current": len(pricing_completed),
+                "progress_total": len(pricing_targets),
+            })
 
     # Collect at most twenty unique pending ASINs for each Product Pricing call.
     while store.summary(job_id)["phase"] == "bsr_filtered":
@@ -207,6 +224,13 @@ def run_incremental_discovery(
                     "min_fbm_price": pricing.get("Prezzo minimo FBM Amount"),
                 })
             store.update_candidates(job_id, [candidate])
+        pricing_completed.update(asins)
+        if progress:
+            progress("pricing", {
+                "progress_phase": "pricing",
+                "progress_current": min(len(pricing_completed), len(pricing_targets)),
+                "progress_total": len(pricing_targets),
+            })
         if pricing_batch_interval:
             sleep_func(pricing_batch_interval)
 
@@ -260,15 +284,34 @@ def run_incremental_discovery(
                 store.update_candidates(job_id, transformed)
                 transformed, observations_batch = [], []
                 governor.before_next_batch()
+                if progress:
+                    progress("competition", {
+                        "progress_phase": "competition",
+                        "progress_current": processed,
+                        "progress_total": selected,
+                    })
         if transformed:
             store.upsert_observations(job_id, observations_batch)
             store.update_candidates(job_id, transformed)
+        if progress:
+            progress("competition", {
+                "progress_phase": "competition",
+                "progress_current": processed,
+                "progress_total": selected,
+            })
         store.set_phase(job_id, "competition_filtered")
         _checkpoint(
             store, metadata_store, job_id, progress_phase="competition_filtered",
             progress_current=selected, progress_total=selected,
         )
 
+    fee_completed, fee_total = store.fee_progress_counts(job_id)
+    if store.summary(job_id)["phase"] == "competition_filtered" and progress:
+        progress("fees", {
+            "progress_phase": "fees",
+            "progress_current": fee_completed,
+            "progress_total": fee_total,
+        })
     while store.summary(job_id)["phase"] == "competition_filtered":
         pending = store.pending_observations(job_id, 20)
         if not pending:
@@ -304,11 +347,15 @@ def run_incremental_discovery(
             if observation.get("fee_status") == "valid":
                 _sync_observation_fee_fields(observation)
         store.upsert_observations(job_id, pending)
+        fee_completed += sum(
+            observation.get("fee_status") in {"valid", "unavailable", "invalid"}
+            for observation in pending
+        )
         if progress:
             progress("fees", {
                 "progress_phase": "fees",
-                "progress_current": selected,
-                "progress_total": selected,
+                "progress_current": min(fee_completed, fee_total),
+                "progress_total": fee_total,
             })
         if fee_batch_interval:
             sleep_func(fee_batch_interval)
@@ -352,6 +399,12 @@ def run_incremental_discovery(
                     })
         if transformed:
             store.update_candidates(job_id, transformed, replace_scenarios=True)
+        if progress:
+            progress("economics", {
+                "progress_phase": "economics",
+                "progress_current": economics_processed,
+                "progress_total": selected,
+            })
         coverage = fee_coverage(coverage_observations.values())
         store.set_phase(job_id, "completed", status="completed")
         state = _checkpoint(

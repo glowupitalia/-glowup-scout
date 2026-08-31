@@ -11,6 +11,7 @@ from unittest.mock import patch
 from openpyxl import Workbook
 
 from notifications import (
+    AttachmentDecision,
     DEFAULT_RECIPIENT,
     DISCOVERY_COMPLETED,
     DISCOVERY_COMPLETED_ZERO_RESULTS,
@@ -25,6 +26,7 @@ from notifications import (
     render_discovery_notification,
     send_discovery_terminal_notification,
 )
+from notifications import _content_with_attachment_note
 
 
 def configured_email():
@@ -333,6 +335,19 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(preview["attachment_size"], path.stat().st_size)
         self.assertIn("disponibile dalla UI Scout", preview["text"])
         self.assertIsNone(NotificationOutbox(self.database).get("job-1"))
+
+    def test_large_workbook_message_reports_size_and_download_instead_of_attachment(self):
+        content = render_discovery_notification(completed_state())
+        rendered = _content_with_attachment_note(
+            content,
+            AttachmentDecision(
+                "skipped_too_large", name="Discovery.xlsx", size=68_940_642,
+                error="File Excel oltre il limite email configurato",
+            ),
+        )
+        self.assertIn("Dimensione: 68,94 MB", rendered.text)
+        self.assertIn("Non è stato allegato", rendered.text)
+        self.assertIn("scaricarlo direttamente da Glow Up Scout", rendered.text)
 
     def test_completion_variants_share_one_terminal_notification_identity(self):
         transport = FakeTransport()

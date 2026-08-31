@@ -20,7 +20,7 @@ from discovery_incremental_runner import run_incremental_discovery
 from discovery_rotation import DiscoveryRotationStore
 
 
-NOW = datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 FRESH = (NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
 STALE = (NOW - timedelta(days=40)).isoformat().replace("+00:00", "Z")
 
