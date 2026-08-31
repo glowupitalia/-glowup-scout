@@ -7,9 +7,10 @@ import hashlib
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
-from discovery_excel import write_discovery_excel
+from discovery_excel import write_discovery_excel, write_discovery_operational_excel
 from discovery_incremental import (
     DiscoveryIncrementalStore,
     IncrementalCandidateCollection,
@@ -42,14 +43,19 @@ def export_metadata(path: Path, state: dict) -> dict:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     details = path.stat()
+    created_at = datetime.fromtimestamp(
+        details.st_mtime, tz=timezone.utc,
+    ).isoformat().replace("+00:00", "Z")
     return {
         "status": "completed",
         "valid": True,
         "job_id": state["job_id"],
         "file_name": path.name,
+        "path": str(path),
         "file_size": details.st_size,
         "sha256": digest.hexdigest(),
-        "generated_at": state.get("completed_at") or state.get("updated_at"),
+        "created_at": created_at,
+        "generated_at": created_at,
         "result_products": int(state.get("final_products") or 0),
     }
 
@@ -104,6 +110,33 @@ def export_offline(
     final_snapshot = governor.before_next_batch()
     return {
         "path": str(target), "export_state": export_metadata(target, state),
+        "technical_export": export_metadata(target, state),
+        "resource_snapshot": final_snapshot.as_dict(),
+    }
+
+
+def export_operational_offline(
+    job_id: str, output_path: str | Path, *, store=None, checkpoints=None,
+    governor=None,
+) -> dict:
+    """Generate the daily-use workbook without changing persisted job state."""
+    store = store or DiscoveryIncrementalStore()
+    checkpoints = checkpoints or LightweightCheckpointStore()
+    governor = governor or DiscoveryResourceGovernor(
+        database_path=store.path, disk_path=Path(output_path).parent,
+    )
+    state = finalization_state(job_id, store, checkpoints)
+
+    def progress(_phase, _current, _total):
+        governor.before_next_batch()
+
+    target = Path(output_path).expanduser().resolve()
+    write_discovery_operational_excel(
+        export_payload(state, store, job_id), str(target), progress=progress,
+    )
+    final_snapshot = governor.before_next_batch()
+    return {
+        "path": str(target), "operational_export": export_metadata(target, state),
         "resource_snapshot": final_snapshot.as_dict(),
     }
 
@@ -135,7 +168,7 @@ def finalize(
         disk_path=PROJECT_ROOT / "data" / "discovery_jobs",
     )
     target = Path(output_path or (
-        PROJECT_ROOT / "data" / "discovery_jobs" / f"{job_id}.xlsx"
+        PROJECT_ROOT / "data" / "discovery_jobs" / f"{job_id}.operational.xlsx"
     )).expanduser().resolve()
 
     def heartbeat(phase, current, total):
@@ -145,7 +178,7 @@ def finalize(
         )
 
     try:
-        existing_state = dict(state.get("export_state") or {})
+        existing_state = dict(state.get("operational_export") or {})
         export_valid = (
             target.exists()
             and existing_state.get("status") == "completed"
@@ -156,10 +189,12 @@ def finalize(
             state.update({"status": "computed", "phase": "export_running"})
             checkpoints.save(state)
             heartbeat("export_running", 0, int(state["selected_count"]))
-            write_discovery_excel(
+            write_discovery_operational_excel(
                 export_payload(state, store, job_id), str(target), progress=heartbeat,
             )
-            state["export_state"] = export_metadata(target, state)
+            state["operational_export"] = export_metadata(target, state)
+            # Legacy readers continue to resolve the primary workbook here.
+            state["export_state"] = dict(state["operational_export"])
             state["finalization_metrics"] = governor.before_next_batch().as_dict()
             state.update({"status": "export_complete", "phase": "export_complete"})
             checkpoints.save(state)

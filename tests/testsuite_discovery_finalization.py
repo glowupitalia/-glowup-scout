@@ -8,7 +8,12 @@ from unittest.mock import Mock, patch
 
 from openpyxl import load_workbook
 
-from discovery_finalize_worker import export_offline, finalization_state, finalize
+from discovery_finalize_worker import (
+    export_offline,
+    export_operational_offline,
+    finalization_state,
+    finalize,
+)
 from discovery_excel import (
     EXCEL_MAX_HYPERLINKS_PER_WORKSHEET,
     validate_excel_compatibility,
@@ -40,6 +45,7 @@ def completed_fixture(job_id="job"):
         "canonical_ean": "8809562191179", "gtin": "8809562191179",
         "product_key": "product-1", "identifier_type": "EAN",
         "brand": "Arencia", "title": "Cleanser", "catalog_status": "resolved",
+        "amazon_offers_url": "https://www.amazon.it/dp/B012345678",
         "is_final_result": True,
         "scenario_roles": {"scenario_raccomandato": "scenario-1"},
         "combination_roles": {"recommended_combination": "combination-1"},
@@ -191,6 +197,34 @@ class FinalizationTests(unittest.TestCase):
         ))
         workbook.close()
 
+    def test_operational_export_is_minimal_and_keeps_editable_economics(self):
+        target = self.root / "job.operational.xlsx"
+        result = export_operational_offline(
+            "job", target, store=self.store, checkpoints=self.checkpoints,
+        )
+        self.assertEqual(result["operational_export"]["status"], "completed")
+        workbook = load_workbook(target, read_only=False, data_only=False)
+        self.assertEqual(
+            workbook.sheetnames, ["Opportunità", "Dati", "Parametri run"],
+        )
+        self.assertEqual(workbook["Opportunità"].max_row, 2)
+        self.assertEqual(workbook["Dati"].max_row, 2)
+        self.assertEqual(workbook["Dati"].sheet_state, "hidden")
+        self.assertEqual(workbook["Opportunità"]["G2"].data_type, "n")
+        self.assertFalse(workbook["Opportunità"]["G2"].protection.locked)
+        for coordinate in ("M2", "N2", "O2", "P2", "Q2", "R2", "S2"):
+            cell = workbook["Opportunità"][coordinate]
+            self.assertEqual(cell.data_type, "f")
+            self.assertTrue(cell.protection.locked)
+        self.assertIn("G2", workbook["Opportunità"]["N2"].value)
+        self.assertIn("Dati", workbook["Opportunità"]["R2"].value)
+        self.assertIsNotNone(workbook["Opportunità"]["V2"].hyperlink)
+        self.assertFalse(workbook["Opportunità"].protection.autoFilter)
+        self.assertFalse(workbook["Opportunità"].protection.sort)
+        workbook.close()
+        compatibility = validate_excel_compatibility(target)
+        self.assertEqual(sum(compatibility["hyperlinks_by_part"].values()), 1)
+
     def test_excel_compatibility_rejects_worksheet_hyperlink_limit(self):
         target = self.root / "too-many-hyperlinks.xlsx"
         relationships = "".join(
@@ -223,6 +257,7 @@ class FinalizationTests(unittest.TestCase):
             output_path=target,
         )
         self.assertEqual(first["export_state"]["sha256"], second["export_state"]["sha256"])
+        self.assertEqual(first["operational_export"], first["export_state"])
         self.assertEqual(target.stat().st_mtime_ns, first_mtime)
         runtime = self.registry.get("job")
         self.assertEqual(runtime["status"], "completed")

@@ -927,6 +927,160 @@ def write_discovery_excel(results, output_file, *, progress=None):
     return output_path
 
 
+def write_discovery_operational_excel(results, output_file, *, progress=None):
+    """Write the bounded, daily-use workbook for final opportunities only.
+
+    The full technical export remains available through ``write_discovery_excel``.
+    This workbook keeps the editable economics model but includes only the
+    observations referenced by final opportunities.
+    """
+    state, candidates, final_products = _export_context(results)
+    final_products = _sorted_final_products(final_products)
+    output_path = os.path.abspath(output_file)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".glowup_discovery_operational_", suffix=".xlsx",
+        dir=os.path.dirname(output_path) or ".",
+    )
+    os.close(descriptor)
+    try:
+        workbook = Workbook()
+        opportunities = workbook.active
+        opportunities.title = "Opportunità"
+        data_ws = workbook.create_sheet("Dati")
+        run_ws = workbook.create_sheet("Parametri run")
+        opportunities.append(OPPORTUNITY_COLUMNS + [
+            "ProductRowID", "ScenarioRowID", "ObservationRowID", "CombinationRowID",
+        ])
+        data_ws.append(TECHNICAL_COLUMNS)
+        run_ws.append(RUN_COLUMNS)
+
+        opportunity_records = []
+        observations = {}
+        for product in final_products:
+            product_id = product.get("product_key") or f"product-{_product_ean(product)}"
+            recommended_pair = recommended_combination(product)
+            scenario_by_id = {
+                row.get("scenario_id"): row for row in product.get("scenarios") or []
+            }
+            recommended = scenario_by_id.get(
+                (recommended_pair or {}).get("scenario_id")
+            ) or _recommended(product)
+            if not recommended:
+                continue
+            if recommended_pair:
+                observation = next(
+                    (row for row in _observations(product)
+                     if row.get("observation_id") == recommended_pair.get("amazon_observation_id")),
+                    product.get("amazon_observation") or {},
+                )
+            else:
+                observation = product.get("amazon_observation") or {}
+                recommended_pair = {
+                    "combination_id": f"legacy|{recommended.get('scenario_id')}",
+                    "scenario_id": recommended.get("scenario_id"),
+                    "asin": observation.get("asin"),
+                    "amazon_observation_id": observation.get("observation_id") or product_id,
+                }
+            observation_id = (
+                recommended_pair.get("amazon_observation_id")
+                or observation.get("observation_id") or product_id
+            )
+            observations.setdefault(observation_id, (product_id, observation))
+            opportunity_records.append((
+                product, product_id, recommended_pair, recommended,
+                observation_id, observation,
+            ))
+
+        for observation_id, (product_id, observation) in observations.items():
+            fee = observation.get("fee_estimate") or {}
+            data_ws.append([
+                observation_id, product_id, observation.get("asin"),
+                _excel_number(observation.get("bsr_beauty")),
+                _excel_number(observation.get("reference_price")),
+                _excel_number(observation.get("fba_sellers")),
+                _excel_number(observation.get("total_sellers")),
+                _excel_number(fee.get("fba_fee_net")),
+                _excel_number(fee.get("fba_fee_gross")),
+                _excel_number(fee.get("referral_fee")),
+                _excel_number(observation.get("referral_rate") or fee.get("referral_rate")),
+                observation.get("referral_source"), observation.get("price_source"),
+                observation.get("seller_count_source"), observation.get("observed_at"),
+                _excel_number(observation.get("min_fba_price")),
+                _excel_number(observation.get("min_fbm_price")),
+            ])
+
+        last_data_row = max(2, len(observations) + 1)
+        for row_number, record in enumerate(opportunity_records, start=2):
+            product, product_id, recommended_pair, recommended, observation_id, observation = record
+            margin, profit, targets, score, opportunity = _economic_formulas(
+                row_number, cost_col="G", margin_col="M", profit_col="N",
+                target_cols=("O", "P", "Q"), score_col="R", opportunity_col="S",
+                observation_id_col="Y", last_data_row=last_data_row,
+            )
+            opportunities.append([
+                _product_ean(product), observation.get("amazon_brand") or product.get("brand"),
+                observation.get("amazon_title") or product.get("title"),
+                str(recommended.get("supplier") or "").upper(),
+                recommended.get("scenario_label"), scenario_requirement_label(recommended),
+                _excel_number(recommended.get("cost_gross_unit_eur")),
+                recommended_pair.get("asin"), observation.get("bsr_beauty"),
+                _excel_number(observation.get("reference_price")),
+                observation.get("fba_sellers"), observation.get("total_sellers"),
+                margin, profit, targets["O"], targets["P"], targets["Q"], score, opportunity,
+                len(product.get("scenarios") or []),
+                len(product.get("amazon_listings") or [observation]),
+                product.get("amazon_offers_url"), product_id,
+                recommended.get("scenario_id"), observation_id,
+                recommended_pair.get("combination_id"),
+            ])
+            if progress and row_number % 100 == 0:
+                progress("export_operational_rows", row_number - 1, len(opportunity_records))
+
+        for label, value in _run_metadata(state, candidates, final_products):
+            run_ws.append([label, _value(value)])
+        run_ws.append(["Tipo export", "Operational workbook"])
+
+        _style_sheet(
+            opportunities, visible_columns=len(OPPORTUNITY_COLUMNS), cost_column="G",
+            hidden_columns=("W", "X", "Y", "Z"), data_ws=data_ws,
+        )
+        _style_audit_sheet(
+            data_ws, [28] * len(TECHNICAL_COLUMNS),
+            currency_columns=(5, 8, 9, 10, 16, 17), percent_columns=(11,),
+            integer_columns=(4, 6, 7), text_columns=(1, 2, 3),
+        )
+        _style_audit_sheet(run_ws, [28, 54])
+        run_ws.auto_filter.ref = None
+        run_ws.freeze_panes = "A2"
+        for row in range(2, opportunities.max_row + 1):
+            opportunities.cell(row, 1).number_format = "@"
+            opportunities.cell(row, 8).number_format = "@"
+            opportunities.cell(row, 13).number_format = "0.00%"
+            opportunities.cell(row, 18).number_format = "#,##0"
+            for column in (7, 10, 14, 15, 16, 17):
+                opportunities.cell(row, column).number_format = '€ #,##0.00'
+            link = opportunities.cell(row, 22)
+            if link.value:
+                link.hyperlink = str(link.value)
+                link.style = "Hyperlink"
+
+        workbook.calculation.calcMode = "auto"
+        workbook.calculation.fullCalcOnLoad = True
+        workbook.calculation.forceFullCalc = True
+        workbook.calculation.calcOnSave = True
+        workbook.save(temporary_path)
+        validate_excel_compatibility(temporary_path)
+        os.replace(temporary_path, output_path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+    return output_path
+
+
 def _stream_cell(ws, value, *, header=False, number_format=None, unlocked=False,
                  hyperlink=None):
     cell = WriteOnlyCell(ws, value=_value(value))

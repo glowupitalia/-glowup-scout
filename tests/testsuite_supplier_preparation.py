@@ -591,9 +591,32 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         self.assertIn("restano disponibili nell'Excel", rendered)
         self.assertTrue(any(row.label == "← Nuova ricerca" for row in app.button))
         self.assertTrue(any(
-            row.proto.label == "Scarica Discovery Excel"
+            row.proto.label == "SCARICA EXCEL"
             for row in app.get("download_button")
         ))
+
+    def test_completed_result_prefers_operational_and_offers_technical_download(self):
+        app = AppTest.from_file("app_glowup.py", default_timeout=10).run()
+        app.session_state["ui_state"] = "discovery_result"
+        app.session_state["discovery_status"] = "completed"
+        app.session_state["discovery_result"] = {
+            "output_bytes": b"operational",
+            "output_file_name": "job-ui.operational.xlsx",
+            "technical_output_bytes": b"technical",
+            "technical_output_file_name": "job-ui.xlsx",
+            "state": {
+                "job_id": "job-ui", "discovery_schema_version": "supplier_multi_listing_v1",
+                "checkpoint_compatibility": "compatible", "status": "completed",
+                "phase": "completed", "filters": default_filters(),
+                "selected_suppliers": ["qogita"], "supplier_snapshot_set": {},
+                "candidates": [], "results": [], "amazon_listings": [],
+                "amazon_observations": [], "opportunity_combinations": [], "funnel": {},
+            },
+        }
+        app.run()
+        downloads = {row.proto.label: row for row in app.get("download_button")}
+        self.assertIn("SCARICA EXCEL", downloads)
+        self.assertIn("Scarica export tecnico completo", downloads)
 
     def test_new_search_returns_to_configuration_without_running(self):
         app = AppTest.from_file("app_glowup.py", default_timeout=10).run()

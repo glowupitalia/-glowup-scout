@@ -421,7 +421,9 @@ def prepare_discovery_attachment(
 
     job_id = str(state.get("job_id") or "")
     runtime = dict(runtime or {})
-    export_state = dict(state.get("export_state") or {})
+    export_state = dict(
+        state.get("operational_export") or state.get("export_state") or {}
+    )
     if not job_id or str(runtime.get("job_id") or "") != job_id:
         return AttachmentDecision("invalid", error="Export non correlato al job")
     if str(runtime.get("status") or "") not in {
@@ -432,7 +434,7 @@ def prepare_discovery_attachment(
         return AttachmentDecision("invalid", error="Export state non coerente con job_id")
     if str(export_state.get("status") or "") not in {"completed", "valid", "generated"}:
         return AttachmentDecision("unavailable", error="Export finale non disponibile")
-    raw_path = runtime.get("export_path")
+    raw_path = export_state.get("path") or runtime.get("export_path")
     if not raw_path:
         return AttachmentDecision("unavailable", error="Export path assente")
 
@@ -442,7 +444,11 @@ def prepare_discovery_attachment(
         return AttachmentDecision("invalid", error="Symlink non consentito")
     if candidate.suffix.lower() != ".xlsx" or candidate.name.endswith(".part"):
         return AttachmentDecision("invalid", error="Formato export non valido")
-    if candidate.stem != job_id or (expected_name and candidate.name != expected_name):
+    valid_name = (
+        candidate.name == expected_name if expected_name
+        else candidate.name == f"{job_id}.xlsx"
+    )
+    if not valid_name or not candidate.name.startswith(job_id):
         return AttachmentDecision("invalid", error="Export non coerente con job_id")
     try:
         resolved = candidate.resolve(strict=True)
@@ -485,7 +491,7 @@ def _content_with_attachment_note(
         if decision.size is not None else None
     )
     notes = {
-        "attached": "Il file Excel completo della Discovery è allegato a questa email.",
+        "attached": "Il file Excel operativo della Discovery è allegato a questa email.",
         "skipped_too_large": (
             "Il file Excel della Discovery è stato generato correttamente. "
             + (f"Dimensione: {size_mb} MB. " if size_mb else "")
@@ -957,7 +963,7 @@ def send_notification(
                 f"Preparazione email fallita ({type(exc).__name__})",
             )
             return outbox.get(entity_id, content.event_type)
-        attached_note = "Il file Excel completo della Discovery è allegato a questa email."
+        attached_note = "Il file Excel operativo della Discovery è allegato a questa email."
         invalid_note = "File Excel non allegato perché non è stato possibile leggerlo."
         fallback_content = NotificationContent(
             content.event_type, content.subject,

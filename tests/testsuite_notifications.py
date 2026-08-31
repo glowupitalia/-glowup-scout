@@ -145,7 +145,32 @@ class NotificationTests(unittest.TestCase):
             attachments[0].get_filename(),
             "GlowUp-Scout-Discovery-2026-08-27-job-1.xlsx",
         )
-        self.assertIn("Excel completo", transport.messages[0].get_body(preferencelist=("plain",)).get_content())
+        self.assertIn("Excel operativo", transport.messages[0].get_body(preferencelist=("plain",)).get_content())
+
+    def test_operational_export_is_preferred_over_legacy_technical_path(self):
+        state = completed_state()
+        technical, runtime, root = self.export_for(state)
+        operational = root / f"{state['job_id']}.operational.xlsx"
+        workbook = Workbook()
+        workbook.active["A1"] = "Operational"
+        workbook.save(operational)
+        payload = operational.read_bytes()
+        state["operational_export"] = {
+            "status": "completed", "valid": True, "job_id": state["job_id"],
+            "file_name": operational.name, "path": str(operational),
+            "file_size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        state["technical_export"] = dict(state["export_state"])
+        transport = FakeTransport()
+        row = send_discovery_terminal_notification(
+            state, database_path=self.database, runtime=runtime,
+            config=configured_email(), transport=transport,
+            allowed_attachment_roots=[root],
+        )
+        attachment = list(transport.messages[0].iter_attachments())[0]
+        self.assertEqual(row["attachment_status"], "attached")
+        self.assertEqual(attachment.get_payload(decode=True), payload)
+        self.assertNotEqual(attachment.get_payload(decode=True), technical.read_bytes())
 
     def test_zero_results_with_valid_xlsx_is_attached(self):
         state = completed_state(False)

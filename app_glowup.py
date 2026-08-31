@@ -797,13 +797,34 @@ def _start_discovery_worker(state):
 def _load_discovery_result(job_id, runtime=None):
     state = DiscoveryCheckpointStore().load(job_id)
     runtime = runtime or DiscoveryJobRegistry().get(job_id) or {}
-    output_bytes = None
-    output_path = runtime.get("export_path")
-    if output_path and os.path.isfile(output_path):
-        with open(output_path, "rb") as output:
-            output_bytes = output.read()
+    operational = dict(state.get("operational_export") or {})
+    technical = dict(state.get("technical_export") or {})
+    output_path = operational.get("path") or runtime.get("export_path")
+    technical_path = technical.get("path")
+
+    def workbook_bytes(path):
+        if path and os.path.isfile(path):
+            with open(path, "rb") as output:
+                return output.read()
+        return None
+
+    output_bytes = workbook_bytes(output_path)
+    technical_output_bytes = (
+        workbook_bytes(technical_path)
+        if technical_path and os.path.realpath(technical_path) != os.path.realpath(output_path or "")
+        else None
+    )
     st.session_state["discovery_result"] = {
-        "state": state, "output_bytes": output_bytes,
+        "state": state,
+        "output_bytes": output_bytes,
+        "output_file_name": (
+            operational.get("file_name") or os.path.basename(output_path or "")
+            or f"{job_id}.xlsx"
+        ),
+        "technical_output_bytes": technical_output_bytes,
+        "technical_output_file_name": (
+            technical.get("file_name") or os.path.basename(technical_path or "")
+        ),
     }
     st.session_state["discovery_status"] = state.get("status") or runtime.get("status")
     st.session_state["ui_state"] = "discovery_result"
@@ -1785,16 +1806,26 @@ elif ui_state == "discovery_result":
             else "Nessuna opportunità con i filtri utilizzati.",
             "success" if result_count else "info",
         )
-        action_columns = st.columns(2)
+        action_columns = st.columns(3)
         if discovery_result.get("output_bytes") is not None:
             action_columns[0].download_button(
-                "Scarica Discovery Excel",
+                "SCARICA EXCEL",
                 data=discovery_result["output_bytes"],
-                file_name=f"glowup_scout_discovery_{state['job_id']}.xlsx",
+                file_name=discovery_result.get("output_file_name")
+                or f"glowup_scout_discovery_{state['job_id']}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary", use_container_width=True, on_click="ignore",
             )
-        if action_columns[1].button(
+        if discovery_result.get("technical_output_bytes") is not None:
+            action_columns[1].download_button(
+                "Scarica export tecnico completo",
+                data=discovery_result["technical_output_bytes"],
+                file_name=discovery_result.get("technical_output_file_name")
+                or f"glowup_scout_discovery_{state['job_id']}.technical.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="secondary", use_container_width=True, on_click="ignore",
+            )
+        if action_columns[2].button(
             "← Nuova ricerca", key="new_discovery_search",
             type="secondary", on_click=new_discovery_search,
             use_container_width=True,
