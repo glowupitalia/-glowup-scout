@@ -34,11 +34,8 @@ from discovery_amazon import (
     search_catalog_by_gtins_batch,
 )
 from direct_lookup import (
-    direct_scenario_rows,
     format_eur,
-    format_percent,
     run_direct_lookup,
-    scenario_stock_availability,
 )
 from purchase_scenarios import (
     recommended_combination,
@@ -1061,7 +1058,7 @@ if ui_state == "home":
                 st.session_state["ui_state"] = "discovery"
                 st.rerun()
     with st.container(border=True):
-        st.subheader("Ricerca singola")
+        st.subheader("Ricerca singolo EAN")
         st.markdown(
             '<div class="gu-field-label">EAN prodotto</div>',
             unsafe_allow_html=True,
@@ -1079,7 +1076,7 @@ if ui_state == "home":
                 label_visibility="collapsed",
                 width="stretch",
             )
-            analyze_ean = st.button("Analizza EAN", type="primary", width=168)
+            analyze_ean = st.button("Analizza", type="primary", width=168)
         if analyze_ean:
             if not ean:
                 ui_alert("Inserisci prima un EAN.", "warning")
@@ -1159,7 +1156,7 @@ elif ui_state == "single_result":
     )
     if st.session_state.get("single_status") == "pending":
         ean = st.session_state.get("single_ean", "")
-        with st.spinner("Confronto fornitori e analisi Amazon in corso…"):
+        with st.spinner("Analisi Amazon in corso…"):
             try:
                 token_provider = RefreshingTokenProvider(get_access_token)
 
@@ -1180,11 +1177,16 @@ elif ui_state == "single_result":
                 state = run_direct_lookup(
                     ean, catalog_batch=direct_catalog_batch,
                     pricing_batch=direct_pricing_batch,
-                    fees_batch=search_product_fees_batch,
-                    token_provider=token_provider,
                 )
-                st.session_state["single_product_result"] = {"state": state}
-                st.session_state["single_status"] = "found"
+                st.session_state["single_product_result"] = state
+                st.session_state["single_status"] = (
+                    "not_found" if state.get("catalog_status") == "not_found"
+                    else "found"
+                )
+                if state.get("catalog_status") == "not_found":
+                    st.session_state["single_message"] = (
+                        "Nessun prodotto Amazon trovato per questo EAN"
+                    )
             except Exception as error:
                 logger.exception(
                     "SINGLE PRODUCT ANALYSIS FAILED | "
@@ -1196,135 +1198,84 @@ elif ui_state == "single_result":
         st.rerun()
 
     single_status = st.session_state.get("single_status")
-    if single_status in ("not_found", "error"):
+    if single_status == "not_found":
+        st.info(st.session_state.get(
+            "single_message", "Nessun prodotto Amazon trovato per questo EAN"
+        ))
+    elif single_status == "error":
         ui_alert(
             st.session_state.get("single_message", "Prodotto non disponibile."),
             "error",
         )
     elif st.session_state.get("single_product_result"):
-        single_product_result = st.session_state["single_product_result"]
-        state = normalize_discovery_state(single_product_result["state"])
-        product = (state.get("candidates") or [{}])[0]
-        scenarios = product.get("scenarios") or []
-        listings = product.get("amazon_listings") or []
-        combination = product.get("recommended_combination") or {}
-        scenario_by_id = {
-            row.get("scenario_id"): row for row in scenarios
-        }
-        recommended = scenario_by_id.get(combination.get("scenario_id"))
-        recommended_listing = next((
-            row for row in listings
-            if row.get("asin") == combination.get("asin")
-        ), listings[0] if listings else {})
-        title = (
-            recommended_listing.get("title") or product.get("amazon_title")
-            or product.get("title") or "Prodotto supplier"
-        )
-        brand = (
-            recommended_listing.get("brand") or product.get("amazon_brand")
-            or product.get("brand") or "—"
-        )
-        asin = recommended_listing.get("asin") or product.get("asin")
-        ui_alert("Confronto completato.")
-        with st.container(border=True):
-            identity, summary = st.columns([1.05, 2.25], vertical_alignment="top")
-            with identity:
-                image_url = recommended_listing.get("main_image") or product.get("image_url")
-                if image_url:
-                    st.image(image_url, width="stretch")
-                st.markdown(
-                    '<div class="gu-product-brand">'
-                    f'{html.escape(str(display_value(brand)))}'
-                    '</div><div class="gu-product-title">'
-                    f'{html.escape(str(display_value(title)))}'
-                    '</div><div class="gu-meta">'
-                    f'EAN {html.escape(str(product.get("canonical_ean") or state.get("ean_requested") or "—"))}<br>'
-                    f'ASIN {html.escape(str(asin or "—"))}'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
-            with summary:
-                st.subheader("Migliore opzione di acquisto")
-                if recommended and combination:
-                    columns = st.columns(4)
-                    columns[0].metric("Fornitore", str(recommended.get("supplier") or "—").upper())
-                    columns[1].metric("Scenario", recommended.get("scenario_label") or "—")
-                    columns[2].metric("Costo", format_eur(recommended.get("cost_gross_unit_eur")))
-                    columns[3].metric("Requisito", scenario_requirement_label(recommended))
-                    columns = st.columns(4)
-                    columns[0].metric("Disponibilità", scenario_stock_availability(recommended))
-                    columns[1].metric("Prezzo Amazon", format_eur(combination.get("price_reference")))
-                    columns[2].metric("Utile", format_eur(combination.get("profit")))
-                    columns[3].metric("Margine", format_percent(combination.get("margin_percent")))
-                elif scenarios:
-                    ui_alert(
-                        "Le offerte supplier sono disponibili; l’economia Amazon non è disponibile.",
-                        "warning",
-                    )
-                else:
-                    ui_alert(
-                        "Nessuna offerta supplier-first disponibile nelle baseline attive.",
-                        "warning",
-                    )
-
-        status_labels = []
-        for supplier in ("abw", "umma", "qudo", "qogita"):
-            supplier_status = (state.get("supplier_snapshot_set") or {}).get(supplier, {})
-            status = supplier_status.get("availability_status") or "unavailable"
-            count = supplier_status.get("scenario_count", 0)
-            label = f"{supplier.upper()} ✓ · {count} scenari" if status == "available" else (
-                "QOGITA — prodotto a catalogo, scenari non ancora verificati"
-                if supplier == "qogita" and status == "catalog_present_scenarios_pending" else
-                "QOGITA — bootstrap scenari in corso" if supplier == "qogita"
-                else f"{supplier.upper()} — EAN assente"
-            )
-            status_labels.append(label)
-        st.caption(" · ".join(status_labels))
-
-        st.subheader("Confronto fornitori")
-        if scenarios:
-            st.dataframe(
-                direct_scenario_rows(state), hide_index=True,
-                use_container_width=True,
-            )
-        else:
-            st.info("Nessuno scenario di acquisto disponibile nelle baseline supplier-first.")
-
-        st.subheader("Amazon")
-        if listings:
+        result = st.session_state["single_product_result"]
+        listings = result.get("listings") or []
+        if result.get("catalog_status") == "ambiguous":
+            st.warning("Più risultati Amazon trovati")
             for listing in listings:
                 with st.container(border=True):
-                    metrics = st.columns(4)
-                    metrics[0].metric("ASIN", listing.get("asin") or "—")
-                    metrics[1].metric("BSR Beauty", display_value(listing.get("bsr_beauty")))
-                    metrics[2].metric("Prezzo riferimento", format_eur(listing.get("reference_price")))
-                    buy_box = (
-                        listing.get("reference_price")
-                        if listing.get("price_source") == "buy_box" else None
+                    image, details = st.columns([1, 3], vertical_alignment="top")
+                    if listing.get("main_image"):
+                        image.image(listing["main_image"], width="stretch")
+                    details.markdown(
+                        f"**{display_value(listing.get('brand'))}**  \n"
+                        f"{display_value(listing.get('title'))}  \n"
+                        f"ASIN {display_value(listing.get('asin'))}  \n"
+                        f"Categoria {display_value((listing.get('browse_classification') or {}).get('displayName') or listing.get('product_type'))}"
                     )
-                    metrics[3].metric("Buy Box", format_eur(buy_box))
-                    metrics = st.columns(4)
-                    metrics[0].metric("Venditori FBA", display_value(listing.get("fba_sellers")))
-                    metrics[1].metric("Venditori totali", display_value(listing.get("total_sellers")))
-                    metrics[2].metric("Prezzo minimo FBA", format_eur(listing.get("min_fba_price")))
-                    metrics[3].metric("Prezzo minimo FBM", format_eur(listing.get("min_fbm_price")))
-                    listing_asin = listing.get("asin")
-                    if listing_asin:
-                        with st.container(horizontal=True, gap="small"):
-                            st.link_button(
-                                "Vedi offerte Amazon",
-                                f"https://www.amazon.it/gp/offer-listing/{listing_asin}",
-                                type="primary", use_container_width=True,
-                            )
-                            st.link_button(
-                                "Apri scheda Amazon",
-                                f"https://www.amazon.it/dp/{listing_asin}",
-                                type="primary", use_container_width=True,
-                            )
+                    if listing.get("asin"):
+                        details.link_button(
+                            "Apri scheda Amazon",
+                            f"https://www.amazon.it/dp/{listing['asin']}",
+                        )
+        elif result.get("catalog_status") == "resolved":
+            ui_alert("Analisi Amazon completata.")
+            with st.container(border=True):
+                identity, summary = st.columns([1.05, 2.25], vertical_alignment="top")
+                with identity:
+                    if result.get("image_url"):
+                        st.image(result["image_url"], width="stretch")
+                    st.markdown(
+                        '<div class="gu-product-brand">'
+                        f'{html.escape(str(display_value(result.get("brand"))))}'
+                        '</div><div class="gu-product-title">'
+                        f'{html.escape(str(display_value(result.get("title"))))}'
+                        '</div><div class="gu-meta">'
+                        f'EAN {html.escape(str(display_value(result.get("canonical_ean"))))}<br>'
+                        f'ASIN {html.escape(str(display_value(result.get("asin"))))}<br>'
+                        f'Categoria {html.escape(str(display_value(result.get("category"))))}'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+                with summary:
+                    metrics = st.columns(3)
+                    metrics[0].metric("BSR Beauty", display_value(result.get("bsr_beauty")))
+                    metrics[1].metric("Prezzo riferimento", format_eur(result.get("reference_price")))
+                    metrics[2].metric("Buy Box", format_eur(result.get("buy_box_price")))
+                    metrics = st.columns(3)
+                    metrics[0].metric("Minimo FBA", format_eur(result.get("min_fba_price")))
+                    metrics[1].metric("Minimo FBM", format_eur(result.get("min_fbm_price")))
+                    metrics[2].metric("Venditori totali", display_value(result.get("total_sellers")))
+                    metrics = st.columns(3)
+                    metrics[0].metric("Venditori FBA", display_value(result.get("fba_sellers")))
+                    metrics[1].metric("Venditori FBM", display_value(result.get("fbm_sellers")))
+                    metrics[2].metric("Stato Amazon", "Disponibile")
+                    with st.container(horizontal=True, gap="small"):
+                        st.link_button(
+                            "Apri scheda Amazon", result["amazon_product_url"],
+                            type="primary", use_container_width=True,
+                        )
+                        st.link_button(
+                            "Vedi offerte Amazon", result["amazon_offers_url"],
+                            type="primary", use_container_width=True,
+                        )
+            if result.get("cache_status") == "full_cache_hit":
+                st.caption(
+                    "Dati recenti dalla cache"
+                    + (f" · {result['observed_at']}" if result.get("observed_at") else "")
+                )
         else:
-            st.info(
-                "Nessuna pagina Amazon trovata. Le offerte supplier restano disponibili sopra."
-            )
+            st.info("Nessun prodotto Amazon trovato per questo EAN")
 
 elif ui_state == "batch_running":
     with st.container(border=True):

@@ -1,373 +1,310 @@
-import json
-import sqlite3
-import tempfile
+import time
 import unittest
-from decimal import Decimal
-from pathlib import Path
-from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
 
-from discovery import DiscoveryCheckpointStore
-from direct_lookup import (
-    direct_scenario_rows,
-    format_eur,
-    load_direct_supplier_context,
-    run_direct_lookup,
-)
-from purchase_scenarios import product_key
-from product_fees import ProductFeeBatchResults
-from qogita_bootstrap import QogitaBootstrapStore
-from qogita_serving import QogitaServingStore
-from supplier_catalog import (
-    SupplierCatalogGeneration,
-    SupplierCatalogStore,
-    canonical_gtin14,
-    candidates_to_cache_records,
-)
+from direct_lookup import DirectAmazonLookup, format_eur, run_direct_lookup
+from discovery_freshness import AmazonFreshnessPolicy
 
 
 EAN = "8809562191179"
+NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
 
 
-def scenario(supplier, *, suffix="standard", cost="10", snapshot="2026-08-20T10:00:00Z"):
-    scenario_type = f"{supplier}_{suffix}"
-    scenario_id = f"scenario-{supplier}-{suffix}"
+def stamp(delta=timedelta()):
+    return (NOW - delta).isoformat().replace("+00:00", "Z")
+
+
+def listing(asin="B0DIRECT01", *, pricing_at=None):
+    value = {
+        "asin": asin,
+        "title": "Amazon Product",
+        "brand": "Amazon Brand",
+        "main_image": "https://example.invalid/image.jpg",
+        "product_type": "BEAUTY",
+        "browse_classification": {
+            "classificationId": "6306900031", "displayName": "Trucco",
+        },
+        "bsr_beauty": 1234,
+        "compatibility_status": "compatible",
+        "reference_price": 30.98,
+        "price_source": "buy_box",
+        "min_fba_price": 31.20,
+        "min_fbm_price": 30.98,
+        "fba_sellers": 2,
+        "total_sellers": 5,
+    }
+    if pricing_at:
+        value["pricing_observed_at"] = pricing_at
+    return value
+
+
+def cached(*, status="resolved", catalog_at=None, pricing_at=None, listings=None):
     return {
-        "scenario_id": scenario_id, "product_key": product_key(EAN),
-        "canonical_ean": EAN, "identifier_type": "EAN", "supplier": supplier,
-        "supplier_product_id": f"{supplier}-product",
-        "supplier_offer_id": f"{supplier}-offer", "variant_id": suffix,
-        "brand": "Arencia", "title": "Black Tea & Yuzu Rice Mochi Cleanser 120 g",
-        "scenario_type": scenario_type,
-        "scenario_label": suffix.replace("_", " ").title(), "scenario_order": 1,
-        "account_mov": Decimal("300"), "account_mov_currency": "EUR",
-        "minimum_product_quantity": 1, "selling_unit": 1,
-        "cost_net_unit_eur": Decimal(cost), "vat_rate": Decimal("0.22"),
-        "vat_amount_unit": Decimal(cost) * Decimal("0.22"),
-        "cost_gross_unit_eur": Decimal(cost) * Decimal("1.22"),
-        "stock_quantity": 12, "availability_status": "in_stock",
-        "snapshot_id": f"{supplier}-generation", "snapshot_at": snapshot,
-        "freshness_status": "fresh", "tier_is_active": True,
+        "catalog_status": status,
+        "catalog_observed_at": catalog_at or stamp(),
+        "pricing_observed_at": pricing_at,
+        "amazon_listings": (
+            [listing(pricing_at=pricing_at)] if listings is None else listings
+        ),
     }
 
 
-def candidate(supplier, scenarios=None):
+def catalog_found(identifiers, _context):
     return {
-        "product_key": product_key(EAN), "canonical_ean": EAN,
-        "identifier_type": "EAN", "brand": "Arencia",
-        "title": "Black Tea & Yuzu Rice Mochi Cleanser 120 g",
-        "scenarios": scenarios or [scenario(supplier)],
+        identifier: {
+            "status": "resolved", "asin": "B0DIRECT01",
+            "listings": [listing()],
+        }
+        for identifier in identifiers
     }
 
 
-def publish(store, supplier, scenarios=None):
-    products, scenario_rows = candidates_to_cache_records([
-        candidate(supplier, scenarios=scenarios)
-    ])
-    generation = SupplierCatalogGeneration(
-        supplier=supplier, coverage_type="full_relevant_catalog",
-        coverage_description="direct lookup fixture", coverage_complete=True,
-        products=products, scenarios=scenario_rows,
-        completeness_status="full_relevant_catalog",
-        product_catalog_coverage_type="full_relevant_catalog",
-        product_catalog_coverage_complete=True,
-        scenario_enrichment_status="full", scenario_enrichment_count=len(scenario_rows),
-        export_generated_at="2026-08-20T10:00:00Z",
-    )
-    run_id = store.start_run(
-        supplier, coverage_type="full_relevant_catalog",
-        coverage_description="direct lookup fixture", coverage_complete=True,
-        sampled=False,
-    )
-    store.publish(run_id, generation, elapsed_seconds=1)
-    return run_id
+def pricing_found(asins, _context):
+    return {
+        asin: {
+            "status": "success",
+            "Buy Box Amount": 30.98,
+            "Prezzo minimo FBA Amount": 31.20,
+            "Prezzo minimo FBM Amount": 30.98,
+            "Venditori FBA": 2,
+            "Venditori totali": 5,
+            "Seller count source": "summary_number_of_offers",
+            "reference_price": 30.98,
+            "price_source": "buy_box",
+        }
+        for asin in asins
+    }
 
 
-def publish_qogita_serving(store):
-    scenarios = [scenario("qogita", suffix="mov_500", cost="7")]
-    products, scenario_rows = candidates_to_cache_records([
-        candidate("qogita", scenarios=scenarios)
-    ])
-    generation = SupplierCatalogGeneration(
-        supplier="qogita", coverage_type="full_account_catalog",
-        coverage_description="full catalog fixture", coverage_complete=True,
-        products=products, scenarios=scenario_rows,
-        completeness_status="full_account_catalog",
-        product_catalog_coverage_type="full_account_catalog",
-        product_catalog_coverage_complete=True,
-        scenario_enrichment_status="partial", scenario_enrichment_count=1,
-    )
-    run_id = store.start_run(
-        "qogita", coverage_type="full_account_catalog",
-        coverage_description="fixture", coverage_complete=True, sampled=False,
-    )
-    store.publish(run_id, generation, elapsed_seconds=1, promote=False)
-    bootstrap_store = QogitaBootstrapStore(store.path)
-    bootstrap = bootstrap_store.create_production_bootstrap(run_id)
-    with sqlite3.connect(store.path) as connection:
-        connection.execute(
-            """UPDATE supplier_catalog_products SET variant_fid='FID-QOGITA',
-                      variant_fid_source='fixture',enrichment_status='enriched',
-                      offer_tier_observed_at='2026-08-27T10:00:00Z'
-                WHERE run_id=?""", (run_id,),
-        )
-        connection.execute(
-            """UPDATE qogita_bootstrap_products SET status='enriched',
-                      variant_fid='FID-QOGITA',scenario_count=1,
-                      completed_at='2026-08-27T10:00:00Z'
-                WHERE bootstrap_run_id=?""", (bootstrap["bootstrap_run_id"],),
-        )
-    return QogitaServingStore(store.path).build_snapshot(
-        bootstrap["bootstrap_run_id"], window_number=1, bootstrap_state="running",
-    )
+class FakeCache:
+    def __init__(self, value):
+        self.value = value
+        self.calls = []
+
+    def get(self, identifier):
+        self.calls.append(identifier)
+        return self.value
 
 
-def catalog_found(gtins, _job_id, _products=None):
-    return {gtin: {
-        "status": "resolved", "asin": "B0DVBR1VT9",
-        "amazon_title": "Arencia Black Tea & Yuzu Rice Mochi Cleanser 120 g",
-        "amazon_brand": "Arencia", "bsr_beauty": 9000,
-        "beauty_status": "display_group_beauty", "product_type": "BEAUTY",
-    } for gtin in gtins}
+class DirectAmazonLookupTests(unittest.TestCase):
+    def resolver(self, cache_value, calls=None):
+        calls = calls if calls is not None else {"catalog": 0, "pricing": 0}
 
-
-def catalog_missing(gtins, _job_id, _products=None):
-    return {gtin: {"status": "not_found", "listings": []} for gtin in gtins}
-
-
-def pricing_found(asins, _job_id):
-    return {asin: {
-        "status": "success", "Venditori FBA": 2, "Venditori totali": 4,
-        "Seller count source": "summary_number_of_offers",
-        "Buy Box Amount": 30.98, "Prezzo minimo FBA Amount": 31.20,
-        "Prezzo minimo FBM Amount": 30.979999999999997,
-        "reference_price": 30.98, "price_source": "buy_box",
-    } for asin in asins}
-
-
-def fee_batch(requests_, _token, *, fba="4", referral="4.65"):
-    rows = []
-    for request in requests_:
-        rows.append({"FeesEstimateResult": {
-            "Status": "Success",
-            "FeesEstimateIdentifier": {
-                "IdValue": request["asin"],
-                "SellerInputIdentifier": request["identifier"],
-                "PriceToEstimateFees": {"ListingPrice": {
-                    "Amount": request["price"], "CurrencyCode": "EUR",
-                }},
-            },
-            "FeesEstimate": {"FeeDetailList": [
-                {"FeeType": "ReferralFee", "FinalFee": {
-                    "Amount": referral, "CurrencyCode": "EUR",
-                }},
-                {"FeeType": "FBAFees", "FinalFee": {
-                    "Amount": fba, "CurrencyCode": "EUR",
-                }},
-            ]},
-        }})
-    return ProductFeeBatchResults(rows)
-
-
-class DirectLookupTests(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.store = SupplierCatalogStore(Path(self.temporary.name) / "catalog.sqlite3")
-        self.checkpoints = DiscoveryCheckpointStore(Path(self.temporary.name) / "jobs")
-        self.token = SimpleNamespace(get=lambda: "token")
-
-    def tearDown(self):
-        self.temporary.cleanup()
-
-    def test_direct_lookup_merges_cross_supplier_scenarios_without_qogita(self):
-        publish(self.store, "abw", [scenario("abw"), scenario("abw", suffix="bulk_box", cost="8")])
-        publish(self.store, "umma")
-        publish(self.store, "qudo")
-        context = load_direct_supplier_context(EAN, store=self.store)
-        self.assertEqual(context["supplier_memberships"], ["abw", "qudo", "umma"])
-        self.assertEqual(len(context["candidate"]["scenarios"]), 4)
-        self.assertEqual(context["supplier_snapshot_set"]["qogita"]["availability_status"], "unavailable")
-
-    def test_each_operational_supplier_can_be_loaded_alone(self):
-        for supplier in ("abw", "umma", "qudo"):
-            with self.subTest(supplier=supplier):
-                isolated = SupplierCatalogStore(
-                    Path(self.temporary.name) / f"{supplier}.sqlite3"
-                )
-                publish(isolated, supplier)
-                context = load_direct_supplier_context(EAN, store=isolated)
-                self.assertEqual(context["supplier_memberships"], [supplier])
-                self.assertEqual(len(context["candidate"]["scenarios"]), 1)
-
-    def test_direct_lookup_reads_enriched_qogita_from_serving_not_latest_success(self):
-        snapshot = publish_qogita_serving(self.store)
-        self.assertIsNone(self.store.active_generation_metadata("qogita"))
-        context = load_direct_supplier_context(EAN, store=self.store)
-        self.assertIn("qogita", context["supplier_memberships"])
-        self.assertEqual(
-            context["supplier_snapshot_set"]["qogita"]["snapshot_id"],
-            snapshot["serving_generation_id"],
-        )
-        self.assertEqual(context["supplier_snapshot_set"]["qogita"]["scenario_count"], 1)
-
-    def test_qogita_batch_lookup_is_bound_to_immutable_serving_snapshot(self):
-        snapshot = publish_qogita_serving(self.store)
-        metadata = self.store.active_candidate_generation_metadata("qogita")
-        rows = list(self.store.iter_active_candidates_for_identifiers(
-            "qogita", [EAN], generation_metadata=metadata,
-        ))
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["canonical_ean"], EAN)
-        self.assertEqual(
-            rows[0]["supplier_serving_generation_id"],
-            snapshot["serving_generation_id"],
-        )
-        self.assertEqual(
-            rows[0]["supplier_catalog_run_id"], snapshot["source_generation_id"],
-        )
-        self.assertIsNone(self.store.active_generation_metadata("qogita"))
-        with sqlite3.connect(self.store.path) as connection:
-            plan = " ".join(
-                str(value)
-                for row in connection.execute(
-                    "EXPLAIN QUERY PLAN SELECT product.* "
-                    "FROM supplier_catalog_products AS product "
-                    "INDEXED BY idx_supplier_catalog_products_run_gtin "
-                    "JOIN qogita_serving_memberships membership "
-                    "ON membership.serving_generation_id=? "
-                    "AND membership.canonical_product_key=product.canonical_product_key "
-                    "WHERE product.run_id=? AND product.canonical_gtin IN (?)",
-                    (
-                        snapshot["serving_generation_id"], snapshot["source_generation_id"],
-                        canonical_gtin14(EAN),
-                    ),
-                )
-                for value in row
-            )
-        self.assertIn("idx_supplier_catalog_products_run_gtin", plan)
-
-    def test_active_identifier_lookup_handles_zero_padded_gtin(self):
-        publish(self.store, "qudo")
-        result = self.store.active_candidates_for_identifier("qudo", "0" + EAN)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["canonical_ean"], EAN)
-
-    def test_direct_pipeline_deduplicates_amazon_and_fans_out_all_scenarios(self):
-        publish(self.store, "abw", [scenario("abw"), scenario("abw", suffix="bulk_box", cost="8")])
-        publish(self.store, "umma")
-        calls = {"catalog": 0, "pricing": 0, "fees": 0}
         def catalog(*args):
             calls["catalog"] += 1
             return catalog_found(*args)
+
         def pricing(*args):
             calls["pricing"] += 1
             return pricing_found(*args)
-        def fees(*args, **kwargs):
-            calls["fees"] += 1
-            return fee_batch(*args, **kwargs)
-        state = run_direct_lookup(
-            EAN, store=self.store, checkpoint_store=self.checkpoints,
-            catalog_batch=catalog, pricing_batch=pricing, fees_batch=fees,
-            token_provider=self.token,
-        )
-        product = state["candidates"][0]
-        self.assertEqual(calls, {"catalog": 1, "pricing": 1, "fees": 1})
-        self.assertEqual(len(state["amazon_observations"]), 1)
-        self.assertEqual(len(product["opportunity_combinations"]), 3)
-        self.assertIsNotNone(product["recommended_combination"])
-        self.assertIsNone(state.get("rotation_scope"))
-        self.assertEqual(state["sampling_strategy"], "explicit_direct_identifier_v1")
 
-    def test_multiple_scenarios_below_or_negative_margin_remain_visible(self):
-        publish(self.store, "abw", [scenario("abw", cost="20"), scenario("abw", suffix="bulk_box", cost="18")])
-        state = run_direct_lookup(
-            EAN, store=self.store, checkpoint_store=self.checkpoints,
-            catalog_batch=catalog_found, pricing_batch=pricing_found,
-            fees_batch=lambda requests, token: fee_batch(requests, token, fba="12", referral="9"),
-            token_provider=self.token,
-        )
-        rows = direct_scenario_rows(state)
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(any(row["Stato"] == "margin_below_threshold" for row in rows))
-        self.assertTrue(any(str(row["Margine"]).startswith("-") for row in rows))
+        return DirectAmazonLookup(
+            cache=FakeCache(cache_value),
+            catalog_lookup=catalog,
+            pricing_lookup=pricing,
+            freshness_policy=AmazonFreshnessPolicy(),
+            now=lambda: NOW,
+        ), calls
 
-    def test_supplier_scenarios_survive_amazon_not_found(self):
-        publish(self.store, "qudo")
-        calls = {"pricing": 0, "fees": 0}
-        state = run_direct_lookup(
-            EAN, store=self.store, checkpoint_store=self.checkpoints,
-            catalog_batch=catalog_missing,
-            pricing_batch=lambda *_: calls.__setitem__("pricing", calls["pricing"] + 1),
-            fees_batch=lambda *_: calls.__setitem__("fees", calls["fees"] + 1),
-            token_provider=self.token,
-        )
-        self.assertEqual(len(state["candidates"][0]["scenarios"]), 1)
-        self.assertEqual(direct_scenario_rows(state)[0]["Stato"], "economics_unavailable")
-        self.assertEqual(calls, {"pricing": 0, "fees": 0})
+    def test_full_cache_hit_uses_zero_amazon_calls(self):
+        resolver, calls = self.resolver(cached(pricing_at=stamp()))
+        started = time.perf_counter()
+        result = resolver.lookup(EAN)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(calls, {"catalog": 0, "pricing": 0})
+        self.assertEqual(result["cache_status"], "full_cache_hit")
+        self.assertLess(elapsed, 0.05)
 
-    def test_amazon_lookup_still_runs_without_supplier_and_no_manager_fallback(self):
-        state = run_direct_lookup(
-            EAN, store=self.store, checkpoint_store=self.checkpoints,
-            catalog_batch=catalog_found, pricing_batch=pricing_found,
-            fees_batch=fee_batch, token_provider=self.token,
+    def test_stale_pricing_calls_pricing_only(self):
+        resolver, calls = self.resolver(
+            cached(pricing_at=stamp(timedelta(days=1)))
         )
-        self.assertEqual(state["candidates"][0]["scenarios"], [])
-        self.assertEqual(len(state["candidates"][0]["amazon_listings"]), 1)
-        self.assertEqual(state["supplier_memberships"], [])
+        result = resolver.lookup(EAN)
+        self.assertEqual(calls, {"catalog": 0, "pricing": 1})
+        self.assertEqual(
+            result["cache_status"], "catalog_cache_hit_pricing_refreshed"
+        )
+        self.assertEqual(result["fbm_sellers"], 3)
 
-    def test_freshness_and_carried_forward_timestamp_are_preserved(self):
-        value = scenario("qudo", snapshot="2026-07-01T10:00:00Z")
-        value["freshness_status"] = "carried_forward"
-        publish(self.store, "qudo", [value])
-        context = load_direct_supplier_context(EAN, store=self.store)
-        row = context["candidate"]["scenarios"][0]
-        self.assertEqual(row["snapshot_at"], "2026-07-01T10:00:00Z")
-        self.assertEqual(row["freshness_status"], "carried_forward")
+    def test_missing_or_stale_catalog_calls_catalog_then_pricing(self):
+        for cache_value in (
+            None,
+            cached(
+                catalog_at=stamp(timedelta(days=31)),
+                pricing_at=stamp(timedelta(days=31)),
+            ),
+        ):
+            with self.subTest(cache=cache_value is not None):
+                resolver, calls = self.resolver(cache_value)
+                result = resolver.lookup(EAN)
+                self.assertEqual(calls, {"catalog": 1, "pricing": 1})
+                self.assertEqual(result["catalog_status"], "resolved")
+
+    def test_fresh_negative_catalog_returns_not_found_without_live_calls(self):
+        resolver, calls = self.resolver(
+            cached(status="not_found", listings=[], pricing_at=None)
+        )
+        result = resolver.lookup(EAN)
+        self.assertEqual(calls, {"catalog": 0, "pricing": 0})
+        self.assertEqual(result["catalog_status"], "not_found")
+        self.assertEqual(result["cache_status"], "negative_cache_hit")
+
+    def test_ambiguous_never_selects_first_listing_or_calls_pricing(self):
+        rows = [listing("B0FIRST"), listing("B0SECOND")]
+        resolver, calls = self.resolver(
+            cached(status="ambiguous", listings=rows)
+        )
+        result = resolver.lookup(EAN)
+        self.assertEqual(result["catalog_status"], "ambiguous")
+        self.assertIsNone(result["asin"])
+        self.assertEqual([row["asin"] for row in result["listings"]], [
+            "B0FIRST", "B0SECOND",
+        ])
+        self.assertEqual(calls, {"catalog": 0, "pricing": 0})
+
+    def test_resolved_contract_contains_only_amazon_fields(self):
+        resolver, _ = self.resolver(cached(pricing_at=stamp()))
+        result = resolver.lookup(EAN)
+        expected = {
+            "requested_ean", "canonical_ean", "catalog_status", "asin", "title",
+            "brand", "image_url", "category", "bsr_beauty", "buy_box_price",
+            "reference_price", "min_fba_price", "min_fbm_price", "total_sellers",
+            "fba_sellers", "fbm_sellers", "amazon_product_url",
+            "amazon_offers_url", "observed_at", "cache_status",
+        }
+        self.assertTrue(expected.issubset(result))
+        self.assertFalse({
+            "scenarios", "fees", "economics", "score", "recommended_supplier",
+            "opportunity_combinations",
+        } & set(result))
+        self.assertEqual(result["fbm_sellers"], 3)
+
+    def test_invalid_identifier_stops_before_cache(self):
+        cache = FakeCache(cached(pricing_at=stamp()))
+        resolver = DirectAmazonLookup(
+            cache=cache, catalog_lookup=catalog_found,
+            pricing_lookup=pricing_found, now=lambda: NOW,
+        )
+        with self.assertRaisesRegex(ValueError, "non valido"):
+            resolver.lookup("123")
+        self.assertEqual(cache.calls, [])
+
+    def test_no_supplier_qogita_fees_jobs_rotation_or_planner_access(self):
+        probes = {
+            "supplier": "supplier_catalog.SupplierCatalogStore.__init__",
+            "qogita": "qogita_serving.QogitaServingStore.__init__",
+            "fees": "product_fees.search_product_fees_batch",
+            "job": "discovery.DiscoveryCheckpointStore.save",
+            "incremental_job": "discovery_incremental.DiscoveryIncrementalStore.create_job",
+            "registry": "discovery_jobs.DiscoveryJobRegistry.register_checkpoint",
+            "rotation": "discovery_rotation.DiscoveryRotationStore.commit_catalog_results",
+            "planner": "discovery_freshness.plan_cached_product",
+        }
+        patches = {
+            key: patch(target, side_effect=AssertionError(key))
+            for key, target in probes.items()
+        }
+        started = []
+        try:
+            for key, value in patches.items():
+                value.start()
+                started.append(value)
+            result = run_direct_lookup(
+                EAN,
+                cache=FakeCache(cached(pricing_at=stamp())),
+                catalog_batch=lambda *_: self.fail("Catalog must be cached"),
+                pricing_batch=lambda *_: self.fail("Pricing must be cached"),
+                now=lambda: NOW,
+            )
+        finally:
+            for value in reversed(started):
+                value.stop()
+        self.assertEqual(result["catalog_status"], "resolved")
 
     def test_money_formatting_is_decimal_and_italian(self):
         self.assertEqual(format_eur(30.979999999999997), "€30,98")
         self.assertEqual(format_eur(1234.5), "€1.234,50")
 
-    def test_checkpoint_contains_direct_audit_fields(self):
-        publish(self.store, "qudo")
-        state = run_direct_lookup(
-            EAN, store=self.store, checkpoint_store=self.checkpoints,
-            catalog_batch=catalog_missing, pricing_batch=pricing_found,
-            fees_batch=fee_batch, token_provider=self.token,
-        )
-        saved = self.checkpoints.load(state["job_id"])
-        self.assertEqual(saved["lookup_type"], "direct_ean")
-        self.assertEqual(saved["ean_requested"], EAN)
-        self.assertEqual(saved["supplier_memberships"], ["qudo"])
-        self.assertIsNone(saved["rotation_scope"])
 
-    def test_streamlit_direct_result_prioritizes_supplier_comparison(self):
-        publish(self.store, "abw", [scenario("abw"), scenario("abw", suffix="bulk_box", cost="8")])
-        publish(self.store, "umma")
-        state = run_direct_lookup(
-            EAN, store=self.store, checkpoint_store=self.checkpoints,
-            catalog_batch=catalog_found, pricing_batch=pricing_found,
-            fees_batch=fee_batch, token_provider=self.token,
+class DirectLookupUiTests(unittest.TestCase):
+    @staticmethod
+    def resolved_result():
+        resolver = DirectAmazonLookup(
+            cache=FakeCache(cached(pricing_at=stamp())),
+            catalog_lookup=catalog_found, pricing_lookup=pricing_found,
+            now=lambda: NOW,
         )
+        return resolver.lookup(EAN)
+
+    @staticmethod
+    def app_with_result(result, status="found"):
         app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
         app.session_state["ui_state"] = "single_result"
-        app.session_state["single_status"] = "found"
-        app.session_state["single_product_result"] = {
-            "state": json.loads(json.dumps(state, default=str)),
+        app.session_state["single_status"] = status
+        app.session_state["single_product_result"] = result
+        return app.run()
+
+    def test_home_has_simple_input_and_analyze_button(self):
+        app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any(row.label == "EAN prodotto" for row in app.text_input))
+        self.assertTrue(any(row.label == "Analizza" for row in app.button))
+
+    def test_resolved_ui_is_amazon_only(self):
+        app = self.app_with_result(self.resolved_result())
+        self.assertFalse(app.exception)
+        metrics = {row.label for row in app.metric}
+        self.assertTrue({
+            "BSR Beauty", "Prezzo riferimento", "Buy Box", "Minimo FBA",
+            "Minimo FBM", "Venditori FBA", "Venditori FBM", "Venditori totali",
+        }.issubset(metrics))
+        links = {row.proto.label for row in app.get("link_button")}
+        self.assertIn("Apri scheda Amazon", links)
+        self.assertIn("Vedi offerte Amazon", links)
+        visible = " ".join(
+            str(row.value) for collection in (
+                app.markdown, app.subheader, app.caption, app.info, app.warning,
+            ) for row in collection
+        ).casefold()
+        for forbidden in (
+            "migliore opzione", "confronto fornitori", "qogita", "umma", "abw",
+            "qudo", "score", "profitto", "margine", "mov", "fornitore",
+        ):
+            self.assertNotIn(forbidden, visible)
+        self.assertEqual(len(app.dataframe), 0)
+
+    def test_not_found_ui_is_simple(self):
+        result = {
+            "catalog_status": "not_found", "listings": [],
+            "requested_ean": EAN, "canonical_ean": EAN,
         }
-        app.run()
+        app = self.app_with_result(result, status="not_found")
         self.assertFalse(app.exception)
         self.assertTrue(any(
-            element.value == "Migliore opzione di acquisto"
-            for element in app.subheader
+            "Nessun prodotto Amazon trovato" in str(row.value)
+            for row in app.info
         ))
+
+    def test_ambiguous_ui_lists_compatible_amazon_results(self):
+        result = {
+            "catalog_status": "ambiguous", "requested_ean": EAN,
+            "canonical_ean": EAN,
+            "listings": [listing("B0FIRST"), listing("B0SECOND")],
+        }
+        app = self.app_with_result(result)
+        self.assertFalse(app.exception)
         self.assertTrue(any(
-            element.value == "Confronto fornitori" for element in app.subheader
+            row.value == "Più risultati Amazon trovati" for row in app.warning
         ))
-        self.assertEqual(len(app.dataframe), 1)
-        self.assertEqual(len(app.dataframe[0].value), 3)
-        self.assertIn("€30,98", app.dataframe[0].value["Prezzo Amazon"].tolist())
+        self.assertEqual(
+            sum(
+                row.proto.label == "Apri scheda Amazon"
+                for row in app.get("link_button")
+            ), 2
+        )
 
 
 if __name__ == "__main__":

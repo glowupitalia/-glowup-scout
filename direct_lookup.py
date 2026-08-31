@@ -1,18 +1,22 @@
-"""Supplier-first direct EAN lookup built on the Discovery economic core."""
+"""Fast, Amazon-only lookup for one commercial identifier.
+
+The direct lookup intentionally stops after Catalog and Pricing. Discovery,
+supplier scenarios, Fees, rotation and job persistence belong to the separate
+full-catalog workflow and must never be pulled into this module.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any
+from typing import Any, Callable
 
-from discovery import DiscoveryCheckpointStore, run_discovery
-from purchase_scenarios import merge_product_candidates, scenario_requirement_label, target_price
-from supplier_catalog import SupplierCatalogStore, canonical_gtin14
+from discovery_amazon import normalize_commercial_identifier
+from discovery_freshness import AmazonFreshnessPolicy
 
 
-DIRECT_LOOKUP_SCHEMA_VERSION = 1
-DIRECT_SUPPLIERS = ("abw", "umma", "qudo", "qogita")
+DIRECT_LOOKUP_SCHEMA_VERSION = 2
+NEGATIVE_CATALOG_STATUSES = {"not_found"}
 
 
 def format_eur(value: Any, fallback: str = "—") -> str:
@@ -26,224 +30,252 @@ def format_eur(value: Any, fallback: str = "—") -> str:
     return f"€{rendered}"
 
 
-def format_percent(value: Any, fallback: str = "—") -> str:
-    if value in (None, "", "None"):
-        return fallback
+def _parse_time(value: Any) -> datetime | None:
+    if not value:
+        return None
     try:
-        amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    except (InvalidOperation, TypeError, ValueError):
-        return fallback
-    return f"{str(amount).replace('.', ',')}%"
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def scenario_stock_availability(scenario: dict[str, Any]) -> str:
-    stock = scenario.get("stock_quantity")
-    if stock is None:
-        stock = scenario.get("stock")
-    availability_values = []
-    for value in (scenario.get("availability_status"), scenario.get("availability_text")):
-        if value not in (None, "") and str(value) not in availability_values:
-            availability_values.append(str(value))
-    availability = " · ".join(availability_values)
-    if stock is not None:
-        return f"{stock} pz" + (f" · {availability}" if availability else "")
-    return str(availability or "—")
+def _fresh(value: Any, ttl, now: datetime) -> bool:
+    observed = _parse_time(value)
+    return bool(observed and now - observed <= ttl)
 
 
-def load_direct_supplier_context(
-    identifier: str, *, store: SupplierCatalogStore | None = None,
-    suppliers=DIRECT_SUPPLIERS, now: datetime | None = None,
-) -> dict[str, Any]:
-    """Read one EAN from active Scout generations without Manager fallback."""
-    store = store or SupplierCatalogStore()
+def _canonical_identifier(identifier: str) -> tuple[str, str]:
     requested = str(identifier or "").strip()
-    comparison = canonical_gtin14(requested)
-    if comparison is None:
+    normalized = normalize_commercial_identifier(requested)
+    if not normalized.get("canonical_gtin14"):
         raise ValueError("EAN/GTIN non valido")
-    now = now or datetime.now(timezone.utc)
-    candidates = []
-    statuses = {}
-    for supplier in suppliers:
-        generation = (
-            store.serving_generation_metadata(supplier) if supplier == "qogita"
-            else store.active_generation_metadata(supplier)
-        )
-        if not generation:
-            statuses[supplier] = {
-                "availability_status": "unavailable", "snapshot_id": None,
-                "snapshot_at": None, "freshness": "unavailable",
-                "reason": (
-                    "scenario_bootstrap_in_progress" if supplier == "qogita"
-                    else "baseline_missing"
-                ),
-            }
-            continue
-        matches = store.active_candidates_for_identifier(supplier, requested)
-        completed = generation.get("completed_at")
-        completed_at = None
-        try:
-            completed_at = datetime.fromisoformat(str(completed).replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            pass
-        age_hours = (
-            (now - completed_at.astimezone(timezone.utc)).total_seconds() / 3600
-            if completed_at else None
-        )
-        catalog_present_pending = bool(
-            supplier == "qogita" and not matches
-            and store.serving_catalog_contains_identifier(supplier, requested)
-        )
-        statuses[supplier] = {
-            "availability_status": (
-                "available" if matches else
-                "catalog_present_scenarios_pending" if catalog_present_pending else
-                "ean_absent"
-            ),
-            "snapshot_id": generation.get("run_id"), "snapshot_at": completed,
-            "freshness": "fresh" if age_hours is not None and age_hours <= 168 else "stale",
-            "age_hours": age_hours,
-            "scenario_count": sum(len(row.get("scenarios") or []) for row in matches),
-            "coverage_type": generation.get("product_catalog_coverage_type")
-            or generation.get("coverage_type"),
-            "coverage_percent": generation.get("coverage_percent"),
-            "bootstrap_state": generation.get("bootstrap_state"),
-        }
-        candidates.extend(matches)
-    merged = merge_product_candidates(*([row] for row in candidates)) if candidates else []
-    if merged:
-        candidate = merged[0]
-    else:
-        canonical_ean = requested[-13:] if len(requested) == 14 and requested.startswith("0") else requested
-        candidate = {
-            "product_key": f"direct:{comparison}", "canonical_ean": canonical_ean,
-            "gtin": canonical_ean, "identifier_type": "EAN" if len(canonical_ean) == 13 else "GTIN",
-            "brand": None, "title": None, "scenarios": [], "suppliers": [],
-        }
-    candidate["gtin"] = candidate.get("canonical_ean") or requested
-    candidate["direct_lookup"] = True
-    for scenario in candidate.get("scenarios") or []:
-        scenario.setdefault("supplier_snapshot_at", statuses.get(
-            str(scenario.get("supplier") or "").casefold(), {}
-        ).get("snapshot_at"))
+    canonical = requested[1:] if len(requested) == 14 and requested.startswith("0") else requested
+    return requested, canonical
+
+
+def _pricing_fields(value: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the robust Pricing parser contract onto an Amazon listing."""
+    total = value.get("Venditori totali", value.get("total_sellers"))
+    fba = value.get("Venditori FBA", value.get("fba_sellers"))
+    try:
+        fbm = int(total) - int(fba) if total is not None and fba is not None else None
+    except (TypeError, ValueError):
+        fbm = None
+    buy_box = value.get("Buy Box Amount", value.get("buy_box_price"))
+    reference = value.get("reference_price")
+    source = value.get("price_source")
+    if buy_box is None and source == "buy_box":
+        buy_box = reference
     return {
-        "requested_identifier": requested,
-        "canonical_identifier": comparison,
-        "candidate": candidate,
-        "supplier_snapshot_set": statuses,
-        "supplier_memberships": sorted({
-            str(row.get("supplier") or "").casefold()
-            for row in candidate.get("scenarios") or []
-        }),
+        "pricing_status": value.get("status", value.get("pricing_status")),
+        "buy_box_price": buy_box,
+        "reference_price": reference,
+        "price_source": source,
+        "min_fba_price": value.get(
+            "Prezzo minimo FBA Amount", value.get("min_fba_price")
+        ),
+        "min_fbm_price": value.get(
+            "Prezzo minimo FBM Amount", value.get("min_fbm_price")
+        ),
+        "fba_sellers": fba,
+        "fbm_sellers": fbm,
+        "total_sellers": total,
+        "seller_count_source": value.get(
+            "Seller count source", value.get("seller_count_source")
+        ),
     }
 
 
-def direct_supplier_preparer(context):
-    def prepare(selected_suppliers, filters, **kwargs):
-        candidate = context["candidate"]
-        statuses = context["supplier_snapshot_set"]
-        selected = list(selected_suppliers)
-        scenario_counts = {
-            supplier: sum(
-                str(row.get("supplier") or "").casefold() == supplier
-                for row in candidate.get("scenarios") or []
-            ) for supplier in selected
-        }
-        product_counts = {supplier: int(count > 0) for supplier, count in scenario_counts.items()}
-        return {
-            "selected_suppliers": selected,
-            "supplier_snapshot_set": {supplier: statuses[supplier] for supplier in selected},
-            "supplier_diagnostics": {}, "supplier_warnings": [],
-            "candidates": [candidate], "usable_suppliers": selected,
-            "coverage": {
-                "unique_eans": 1, "shared_eans": int(sum(product_counts.values()) > 1),
-                "products_by_supplier": product_counts,
-                "scenarios_by_supplier": scenario_counts,
-            },
-            "total_supplier_ean_universe": 1, "eligible_identifier_count": 1,
-            "run_budget": "direct", "sampled_identifier_count": 1,
-            "sampling_strategy": "explicit_direct_identifier_v1",
-        }
-    return prepare
+def _compatible_listings(listings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compatible = [
+        row for row in listings
+        if row.get("compatibility_status") in (None, "", "compatible")
+    ]
+    return compatible or listings
+
+
+def _display_result(
+    *, requested: str, canonical: str, catalog_status: str,
+    listings: list[dict[str, Any]], catalog_observed_at: Any,
+    cache_status: str, pricing_observed_at: Any = None,
+) -> dict[str, Any]:
+    compatible = _compatible_listings(listings)
+    effective_status = catalog_status
+    selected: dict[str, Any] = {}
+    if catalog_status == "resolved":
+        if len(compatible) == 1:
+            selected = compatible[0]
+        elif len(compatible) > 1:
+            effective_status = "ambiguous"
+    browse = selected.get("browse_classification") or {}
+    asin = selected.get("asin")
+    observed_at = (
+        selected.get("pricing_observed_at") or pricing_observed_at
+        or selected.get("catalog_observed_at") or catalog_observed_at
+    )
+    return {
+        "schema_version": DIRECT_LOOKUP_SCHEMA_VERSION,
+        "lookup_type": "direct_amazon_ean",
+        "requested_ean": requested,
+        "canonical_ean": canonical,
+        "catalog_status": effective_status,
+        "amazon_present": effective_status in {"resolved", "ambiguous"},
+        "asin": asin,
+        "title": selected.get("title"),
+        "brand": selected.get("brand"),
+        "image_url": selected.get("main_image"),
+        "product_type": selected.get("product_type"),
+        "browse_classification": browse,
+        "category": browse.get("displayName") or selected.get("product_type"),
+        "category_id": browse.get("classificationId"),
+        "bsr_beauty": selected.get("bsr_beauty"),
+        "bsr_category": selected.get("bsr_category"),
+        "bsr_category_label": selected.get("bsr_category_label"),
+        "buy_box_price": selected.get("buy_box_price") or (
+            selected.get("reference_price")
+            if selected.get("price_source") == "buy_box" else None
+        ),
+        "reference_price": selected.get("reference_price"),
+        "min_fba_price": selected.get("min_fba_price"),
+        "min_fbm_price": selected.get("min_fbm_price"),
+        "total_sellers": selected.get("total_sellers"),
+        "fba_sellers": selected.get("fba_sellers"),
+        "fbm_sellers": selected.get("fbm_sellers"),
+        "amazon_product_url": f"https://www.amazon.it/dp/{asin}" if asin else None,
+        "amazon_offers_url": (
+            f"https://www.amazon.it/gp/offer-listing/{asin}" if asin else None
+        ),
+        "observed_at": observed_at,
+        "catalog_observed_at": catalog_observed_at,
+        "pricing_observed_at": selected.get("pricing_observed_at") or pricing_observed_at,
+        "cache_status": cache_status,
+        "listings": listings,
+    }
+
+
+class DirectAmazonLookup:
+    """Resolve one identifier through point cache reads and Catalog/Pricing only."""
+
+    def __init__(
+        self, *, cache: Any,
+        catalog_lookup: Callable[[list[str], str], dict[str, Any]],
+        pricing_lookup: Callable[[list[str], str], dict[str, Any]],
+        freshness_policy: AmazonFreshnessPolicy | None = None,
+        now: Callable[[], datetime] | None = None,
+    ):
+        self.cache = cache
+        self.catalog_lookup = catalog_lookup
+        self.pricing_lookup = pricing_lookup
+        self.policy = freshness_policy or AmazonFreshnessPolicy.from_environment()
+        self.now = now or (lambda: datetime.now(timezone.utc))
+
+    def lookup(self, identifier: str) -> dict[str, Any]:
+        requested, canonical = _canonical_identifier(identifier)
+        now = self.now()
+        cached = self.cache.get(canonical) if self.cache is not None else None
+        status = str((cached or {}).get("catalog_status") or "")
+        catalog_ttl = (
+            self.policy.catalog_negative
+            if status in NEGATIVE_CATALOG_STATUSES else self.policy.catalog_resolved
+        )
+        catalog_fresh = bool(
+            cached and status != "catalog_incomplete"
+            and _fresh(cached.get("catalog_observed_at"), catalog_ttl, now)
+        )
+        context_id = f"direct:{canonical}"
+
+        if catalog_fresh:
+            listings = [dict(row) for row in cached.get("amazon_listings") or []]
+            for listing in listings:
+                listing.update(_pricing_fields(listing))
+            if status in NEGATIVE_CATALOG_STATUSES:
+                return _display_result(
+                    requested=requested, canonical=canonical, catalog_status=status,
+                    listings=[], catalog_observed_at=cached.get("catalog_observed_at"),
+                    cache_status="negative_cache_hit",
+                )
+            if status == "ambiguous" or len(_compatible_listings(listings)) != 1:
+                return _display_result(
+                    requested=requested, canonical=canonical,
+                    catalog_status="ambiguous", listings=listings,
+                    catalog_observed_at=cached.get("catalog_observed_at"),
+                    pricing_observed_at=cached.get("pricing_observed_at"),
+                    cache_status="catalog_cache_hit",
+                )
+            listing = _compatible_listings(listings)[0]
+            pricing_stamp = listing.get("pricing_observed_at") or cached.get(
+                "pricing_observed_at"
+            )
+            if _fresh(pricing_stamp, self.policy.pricing, now):
+                return _display_result(
+                    requested=requested, canonical=canonical,
+                    catalog_status="resolved", listings=listings,
+                    catalog_observed_at=cached.get("catalog_observed_at"),
+                    pricing_observed_at=pricing_stamp, cache_status="full_cache_hit",
+                )
+            self._refresh_pricing(listing, context_id, now)
+            return _display_result(
+                requested=requested, canonical=canonical,
+                catalog_status="resolved", listings=listings,
+                catalog_observed_at=cached.get("catalog_observed_at"),
+                pricing_observed_at=listing.get("pricing_observed_at"),
+                cache_status="catalog_cache_hit_pricing_refreshed",
+            )
+
+        catalog_mapping = self.catalog_lookup([canonical], context_id)
+        catalog = dict(catalog_mapping.get(canonical) or {
+            "status": "not_found", "listings": [],
+        })
+        status = str(catalog.get("status") or "not_found")
+        listings = [dict(row) for row in catalog.get("listings") or []]
+        catalog_stamp = now.isoformat().replace("+00:00", "Z")
+        for listing in listings:
+            listing["catalog_observed_at"] = catalog_stamp
+        if status == "resolved" and len(_compatible_listings(listings)) == 1:
+            self._refresh_pricing(_compatible_listings(listings)[0], context_id, now)
+        elif status == "resolved" and len(_compatible_listings(listings)) != 1:
+            status = "ambiguous"
+        return _display_result(
+            requested=requested, canonical=canonical, catalog_status=status,
+            listings=listings, catalog_observed_at=catalog_stamp,
+            pricing_observed_at=max(
+                (row.get("pricing_observed_at") for row in listings
+                 if row.get("pricing_observed_at")), default=None,
+            ),
+            cache_status="cache_miss" if cached is None else "catalog_refreshed",
+        )
+
+    def _refresh_pricing(
+        self, listing: dict[str, Any], context_id: str, now: datetime,
+    ) -> None:
+        asin = str(listing.get("asin") or "").strip()
+        if not asin:
+            return
+        mapping = self.pricing_lookup([asin], context_id)
+        pricing = dict(mapping.get(asin) or {"status": "missing"})
+        listing.update(_pricing_fields(pricing))
+        listing["pricing_observed_at"] = now.isoformat().replace("+00:00", "Z")
 
 
 def run_direct_lookup(
-    identifier: str, *, catalog_batch, pricing_batch, fees_batch, token_provider,
-    store: SupplierCatalogStore | None = None,
-    checkpoint_store: DiscoveryCheckpointStore | None = None,
-    job_id: str | None = None, sleep_func=lambda _: None,
+    identifier: str, *, catalog_batch, pricing_batch, cache=None,
+    freshness_policy: AmazonFreshnessPolicy | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> dict[str, Any]:
-    context = load_direct_supplier_context(identifier, store=store)
-    checkpoint_store = checkpoint_store or DiscoveryCheckpointStore("data/direct_lookup_jobs")
-    filters = {
-        "bsr_min": 0, "bsr_max": 2_147_483_647,
-        "max_fba_sellers": 2_147_483_647,
-        "max_total_sellers": 2_147_483_647,
-        "minimum_margin": 0, "minimum_qogita_stock": 0,
-    }
-    state = run_discovery(
-        filters, checkpoint_store=checkpoint_store,
-        catalog_batch=catalog_batch, pricing_batch=pricing_batch,
-        fees_batch=fees_batch, token_provider=token_provider,
-        selected_suppliers=list(DIRECT_SUPPLIERS), run_budget=None,
-        supplier_preparer=direct_supplier_preparer(context), rotation_store=None,
-        job_id=job_id, sleep_func=sleep_func,
-        catalog_batch_interval=0, pricing_batch_interval=0, fee_batch_interval=0,
-    )
-    state.update({
-        "schema_version": max(int(state.get("schema_version") or 0), 2),
-        "direct_lookup_schema_version": DIRECT_LOOKUP_SCHEMA_VERSION,
-        "lookup_type": "direct_ean", "ean_requested": context["requested_identifier"],
-        "canonical_identifier": context["canonical_identifier"],
-        "supplier_memberships": context["supplier_memberships"],
-        "supplier_snapshot_set": context["supplier_snapshot_set"],
-        "rotation_scope": None, "sampling_strategy": "explicit_direct_identifier_v1",
-    })
-    checkpoint_store.save(state)
-    return state
+    """Compatibility entry point for the Streamlit page; no jobs are created."""
+    if cache is None:
+        from discovery_freshness import DiscoveryAmazonCache
+        from discovery_incremental import DiscoveryIncrementalStore
+
+        cache = DiscoveryAmazonCache(DiscoveryIncrementalStore())
+    return DirectAmazonLookup(
+        cache=cache, catalog_lookup=catalog_batch, pricing_lookup=pricing_batch,
+        freshness_policy=freshness_policy, now=now,
+    ).lookup(identifier)
 
 
-def direct_scenario_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
-    candidates = state.get("candidates") or []
-    if not candidates:
-        return []
-    product = candidates[0]
-    recommended = (product.get("recommended_combination") or {}).get("scenario_id")
-    rows = []
-    for scenario in product.get("scenarios") or []:
-        economics = scenario.get("economics") or {}
-        best_combination = next((
-            row for row in product.get("opportunity_combinations") or []
-            if row.get("scenario_id") == scenario.get("scenario_id")
-            and row.get("asin") == scenario.get("best_asin")
-        ), {})
-        margin = best_combination.get("margin_percent", scenario.get("margin_percent"))
-        rows.append({
-            "Raccomandato": "✓" if scenario.get("scenario_id") == recommended else "",
-            "Fornitore": str(scenario.get("supplier") or "").upper(),
-            "Scenario": scenario.get("scenario_label") or scenario.get("scenario_type"),
-            "Requisito": scenario_requirement_label(scenario),
-            "Costo": format_eur(scenario.get("cost_gross_unit_eur")),
-            "Stock / disponibilità": scenario_stock_availability(scenario),
-            "Freshness": " · ".join(filter(None, (
-                str(scenario.get("freshness_status") or ""),
-                str(scenario.get("snapshot_at") or scenario.get("supplier_snapshot_at") or ""),
-            ))) or "—",
-            "Prezzo Amazon": format_eur(best_combination.get("price_reference")),
-            "Utile": format_eur(economics.get("profit")),
-            "Margine": format_percent(economics.get("margin_percent")),
-            "P15": format_eur(target_price(economics, 15)),
-            "P20": format_eur(target_price(economics, 20)),
-            "P25": format_eur(target_price(economics, 25)),
-            "Score": scenario.get("score") if scenario.get("score") is not None else "—",
-            "Stato": scenario.get("evaluation_status") or "economics_unavailable",
-            "_margin": Decimal(str(margin)) if margin is not None else Decimal("-Infinity"),
-            "_cost": Decimal(str(scenario.get("cost_gross_unit_eur") or "Infinity")),
-        })
-    rows.sort(key=lambda row: (
-        row["Raccomandato"] != "✓", -row["_margin"], row["_cost"],
-        row["Fornitore"], str(row["Scenario"]),
-    ))
-    for row in rows:
-        row.pop("_margin", None)
-        row.pop("_cost", None)
-    return rows
+__all__ = [
+    "DIRECT_LOOKUP_SCHEMA_VERSION", "DirectAmazonLookup", "format_eur",
+    "run_direct_lookup",
+]
