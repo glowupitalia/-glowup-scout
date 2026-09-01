@@ -582,6 +582,105 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
                 row.label == "Trova opportunità" for row in app.button
             ))
 
+    def test_beauty_child_widget_state_has_one_owner_and_survives_reruns(self):
+        with patch.object(
+            SupplierCatalogStore, "serving_generation_metadata",
+            return_value={"serving_snapshot": True, "product_count": 89_680},
+        ), patch.object(
+            SupplierCatalogStore, "active_identifier_universe",
+            return_value={"total": 89_680, "eligible": 89_680},
+        ):
+            app = self.discovery_app()
+            app = next(
+                row for row in app.checkbox if row.label == "Tutte le categorie"
+            ).set_value(False).run()
+            app = next(
+                row for row in app.checkbox if row.label == "Solo Beauty"
+            ).set_value(True).run()
+            beauty = next(
+                row for row in app.multiselect if row.label == "Categorie Beauty"
+            )
+            app = beauty.set_value(["6306897031", "6306900031"]).run()
+            skincare_detail = next(
+                row for row in app.checkbox
+                if row.label == "Dettaglia sottocategorie — Cura della pelle"
+            )
+            app = skincare_detail.set_value(True).run()
+            self.assertFalse(any(
+                "created with a default value" in row.value
+                and "Session State API" in row.value
+                for row in app.warning
+            ))
+            child = next(
+                row for row in app.multiselect
+                if row.label == "Escludi sottocategorie o tipologie"
+            )
+            app = child.set_value(["6307116031"]).run()
+            child = next(
+                row for row in app.multiselect
+                if row.label == "Escludi sottocategorie o tipologie"
+            )
+            self.assertEqual(child.value, ["6307116031"])
+            app = app.run()
+            child = next(
+                row for row in app.multiselect
+                if row.label == "Escludi sottocategorie o tipologie"
+            )
+            self.assertEqual(child.value, ["6307116031"])
+            app = child.set_value([]).run()
+            self.assertEqual(next(
+                row for row in app.multiselect
+                if row.label == "Escludi sottocategorie o tipologie"
+            ).value, [])
+
+    def test_beauty_child_state_survives_parent_remove_and_readd(self):
+        with patch.object(
+            SupplierCatalogStore, "serving_generation_metadata",
+            return_value={"serving_snapshot": True, "product_count": 89_680},
+        ):
+            app = self.discovery_app()
+            app = next(
+                row for row in app.checkbox if row.label == "Tutte le categorie"
+            ).set_value(False).run()
+            app = next(
+                row for row in app.checkbox if row.label == "Solo Beauty"
+            ).set_value(True).run()
+            beauty = next(
+                row for row in app.multiselect if row.label == "Categorie Beauty"
+            )
+            app = beauty.set_value(["6306897031", "6306900031"]).run()
+            app = next(
+                row for row in app.checkbox
+                if row.label == "Dettaglia sottocategorie — Trucco"
+            ).set_value(True).run()
+            child = next(
+                row for row in app.multiselect
+                if row.label == "Escludi sottocategorie o tipologie"
+            )
+            app = child.set_value(["6307022031"]).run()
+            beauty = next(
+                row for row in app.multiselect if row.label == "Categorie Beauty"
+            )
+            app = beauty.set_value(["6306897031"]).run()
+            beauty = next(
+                row for row in app.multiselect if row.label == "Categorie Beauty"
+            )
+            app = beauty.set_value(["6306897031", "6306900031"]).run()
+            app = next(
+                row for row in app.checkbox
+                if row.label == "Dettaglia sottocategorie — Trucco"
+            ).set_value(True).run()
+            child = next(
+                row for row in app.multiselect
+                if row.label == "Escludi sottocategorie o tipologie"
+            )
+            self.assertEqual(child.value, ["6307022031"])
+            self.assertFalse(any(
+                "created with a default value" in row.value
+                and "Session State API" in row.value
+                for row in app.warning
+            ))
+
     def test_manual_and_only_beauty_widget_state_are_isolated(self):
         with patch.object(
             SupplierCatalogStore, "serving_generation_metadata",
@@ -608,12 +707,41 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             self.assertNotIn("1571289031", beauty.value)
             app = beauty.set_value(["6306897031"]).run()
             app = next(
+                row for row in app.checkbox
+                if row.label == "Dettaglia sottocategorie — Cura della pelle"
+            ).set_value(True).run()
+            app = next(
+                row for row in app.multiselect
+                if row.label == "Escludi sottocategorie o tipologie"
+            ).set_value(["6307116031"]).run()
+            app = next(
                 row for row in app.checkbox if row.label == "Solo Beauty"
             ).set_value(False).run()
             manual = next(
                 row for row in app.multiselect if row.label == "Categorie principali"
             )
             self.assertEqual(set(manual.value), set(manual_selection))
+            app = next(
+                row for row in app.checkbox if row.label == "Solo Beauty"
+            ).set_value(True).run()
+            beauty = next(
+                row for row in app.multiselect if row.label == "Categorie Beauty"
+            )
+            self.assertEqual(beauty.value, ["6306897031"])
+            app = next(
+                row for row in app.checkbox
+                if row.label == "Dettaglia sottocategorie — Cura della pelle"
+            ).set_value(True).run()
+            child = next(
+                row for row in app.multiselect
+                if row.label == "Escludi sottocategorie o tipologie"
+            )
+            self.assertEqual(child.value, ["6307116031"])
+            self.assertFalse(any(
+                "created with a default value" in row.value
+                and "Session State API" in row.value
+                for row in app.warning
+            ))
 
     def test_full_catalog_start_requires_simple_second_confirmation(self):
         registry = DiscoveryJobRegistry()

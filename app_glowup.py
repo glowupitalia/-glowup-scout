@@ -1640,12 +1640,16 @@ elif ui_state == "discovery":
                         st.session_state[parent_key] = list(
                             st.session_state.get(parent_saved_key) or []
                         )
+                    parent_default = (
+                        {} if parent_key in st.session_state
+                        else {"default": parent_options}
+                    )
                     selected_parent_ids = st.multiselect(
                         "Categorie Beauty",
                         options=parent_options,
-                        default=parent_options,
                         format_func=lambda value: QOGITA_CATEGORY_TREE[value]["label"],
                         key=parent_key,
+                        **parent_default,
                     )
                 else:
                     parent_options = list(QOGITA_CATEGORY_TREE)
@@ -1658,12 +1662,16 @@ elif ui_state == "discovery":
                         st.session_state[parent_key] = list(
                             st.session_state.get(parent_saved_key) or []
                         )
+                    parent_default = (
+                        {} if parent_key in st.session_state
+                        else {"default": parent_options}
+                    )
                     selected_parent_ids = st.multiselect(
                         "Categorie principali",
                         options=parent_options,
-                        default=parent_options,
                         format_func=lambda value: QOGITA_CATEGORY_TREE[value]["label"],
                         key=parent_key,
+                        **parent_default,
                     )
                 st.session_state[parent_saved_key] = list(selected_parent_ids)
                 include_unknown = st.checkbox(
@@ -1699,7 +1707,7 @@ elif ui_state == "discovery":
                             )
                         excluded_ids = st.multiselect(
                             "Escludi sottocategorie o tipologie",
-                            options=list(children), default=[],
+                            options=list(children),
                             format_func=lambda value, values=children: values[value],
                             key=selection_key,
                         )
