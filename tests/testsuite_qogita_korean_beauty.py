@@ -235,6 +235,21 @@ class KoreanBeautyPersistenceTests(unittest.TestCase):
             self.store.activate("membership-bad")
         self.assertEqual(self.store.active()["membership_version_id"], "membership-1")
 
+        self.store.create_version(
+            source_generation_id="global-1", membership_version_id="membership-anomaly",
+        )
+        anomalous = self.store.finalize_version(
+            "membership-anomaly", entries=[{
+                "canonical_gtin": CANONICAL_A,
+                "canonical_product_key": "product-a",
+                "variant_fid": "FID-A",
+            }], acquisition_status="complete_with_anomalies",
+            metrics={"fid_missing_count": 1},
+        )
+        self.assertEqual(anomalous["status"], "invalid")
+        with self.assertRaises(ValueError):
+            self.store.activate("membership-anomaly")
+
     def test_catalog_bootstrap_and_serving_reconciliation(self):
         connection = sqlite3.connect(self.database)
         connection.executescript("""
@@ -272,6 +287,8 @@ class KoreanBeautyPersistenceTests(unittest.TestCase):
         metrics = result["metrics"]
         self.assertEqual(metrics["catalog_present_count"], 1)
         self.assertEqual(metrics["catalog_absent_count"], 1)
+        self.assertEqual(len(result["entries"]), 2)
+        self.assertIsNone(result["entries"][1]["canonical_product_key"])
         self.assertEqual(metrics["catalog_fid_equal_count"], 1)
         self.assertEqual(metrics["bootstrap_status_counts"], {"enriched": 1})
         self.assertEqual(metrics["serving_present_count"], 1)

@@ -741,36 +741,43 @@ def discovery_supplier_catalog_status():
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def discovery_supplier_universe(selected_suppliers):
+def discovery_supplier_universe(selected_suppliers, qogita_universe="full"):
     if not selected_suppliers:
         return {"total": 0, "eligible": 0}
-    return SupplierCatalogStore().active_identifier_universe(selected_suppliers)
+    return SupplierCatalogStore().active_identifier_universe(
+        selected_suppliers, qogita_universe=qogita_universe,
+    )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def discovery_rotation_diagnostics(selected_suppliers):
+def discovery_rotation_diagnostics(selected_suppliers, qogita_universe="full"):
     """Load rotation diagnostics only after the user opens advanced controls."""
     if not selected_suppliers:
         return {"total": 0, "eligible": 0}
-    identifiers = SupplierCatalogStore().active_identifiers(selected_suppliers)
+    identifiers = SupplierCatalogStore().active_identifiers(
+        selected_suppliers, qogita_universe=qogita_universe,
+    )
     eligible_identifiers = {
         value for value in identifiers if canonical_gtin14(value) is not None
     }
     result = {"total": len(identifiers), "eligible": len(eligible_identifiers)}
     rotation = DiscoveryRotationStore().status(
         selected_suppliers, active_identifiers=eligible_identifiers,
+        qogita_universe=qogita_universe,
     )
     return {**result, **rotation}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def discovery_amazon_plan_preview(selected_suppliers):
+def discovery_amazon_plan_preview(selected_suppliers, qogita_universe="full"):
     if not selected_suppliers:
         return {
             "requested_universe_count": 0, "cache_reuse_count": 0,
             "refresh_count": 0, "new_lookup_count": 0,
         }
-    identifiers = SupplierCatalogStore().active_identifiers(selected_suppliers)
+    identifiers = SupplierCatalogStore().active_identifiers(
+        selected_suppliers, qogita_universe=qogita_universe,
+    )
     eligible = [value for value in identifiers if canonical_gtin14(value) is not None]
     return DiscoveryAmazonCache(DiscoveryIncrementalStore()).preview_counts(
         eligible, AmazonFreshnessPolicy.from_environment(),
@@ -1613,7 +1620,21 @@ elif ui_state == "discovery":
             "minimum_qogita_stock": defaults["minimum_qogita_stock"],
         }
         category_filter = default_qogita_category_filter()
+        qogita_universe = "full"
         if "qogita" in selected_suppliers:
+            qogita_universe = st.radio(
+                "Universo Qogita",
+                options=("full", "korean_beauty"),
+                format_func=lambda value: (
+                    "Catalogo completo" if value == "full" else "Korean Beauty"
+                ),
+                horizontal=True,
+                key="discovery_qogita_universe",
+                help=(
+                    "Korean Beauty usa la membership ufficiale Qogita intersecata "
+                    "con lo snapshot serving globale disponibile."
+                ),
+            )
             st.markdown("**Categorie Qogita**")
             all_categories = st.checkbox(
                 "Tutte le categorie", value=True,
@@ -1752,7 +1773,9 @@ elif ui_state == "discovery":
                     + (" · non classificati inclusi" if include_unknown else "")
                 )
         try:
-            universe = discovery_supplier_universe(tuple(selected_suppliers))
+            universe = discovery_supplier_universe(
+                tuple(selected_suppliers), qogita_universe,
+            )
         except Exception:
             universe = {"total": 0, "eligible": 0}
         eligible = int(universe.get("eligible") or 0)
@@ -1777,6 +1800,7 @@ elif ui_state == "discovery":
         confirmation_signature = (
             tuple(selected_suppliers), tuple(sorted(filters.items())), eligible,
             json.dumps(category_filter, sort_keys=True, separators=(",", ":")),
+            qogita_universe,
         )
         pending_confirmation = st.session_state.get("discovery_full_confirmation")
         if pending_confirmation != confirmation_signature:
@@ -1810,6 +1834,7 @@ elif ui_state == "discovery":
                 store = DiscoveryCheckpointStore()
                 state = store.create(filters)
                 state["selected_suppliers"] = selected_suppliers
+                state["qogita_universe"] = qogita_universe
                 state["run_budget"] = "all"
                 state["discovery_planner_version"] = "automatic_amazon_freshness_v1"
                 state["freshness_policy_version"] = (
@@ -1831,7 +1856,7 @@ elif ui_state == "discovery":
             st.caption("  \n".join(coverage_lines).replace(",", "."))
             try:
                 rotation_details = discovery_rotation_diagnostics(
-                    tuple(selected_suppliers)
+                    tuple(selected_suppliers), qogita_universe,
                 )
             except Exception:
                 logger.exception("DISCOVERY ROTATION DIAGNOSTICS FAILED")
@@ -1895,7 +1920,8 @@ elif ui_state == "discovery":
                         type="primary",
                     ):
                         DiscoveryRotationStore().start_new_cycle(
-                            selected_suppliers, confirmed=True
+                            selected_suppliers, confirmed=True,
+                            qogita_universe=qogita_universe,
                         )
                         discovery_rotation_diagnostics.clear()
                         st.session_state.pop(

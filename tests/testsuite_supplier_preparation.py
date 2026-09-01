@@ -452,6 +452,13 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             app = self.discovery_app()
             qogita = next(row for row in app.checkbox if row.label == "Qogita")
             self.assertFalse(qogita.disabled)
+            qogita_universe = next(
+                row for row in app.radio if row.label == "Universo Qogita"
+            )
+            self.assertEqual(qogita_universe.value, "full")
+            self.assertEqual(
+                qogita_universe.options, ["Catalogo completo", "Korean Beauty"],
+            )
             all_categories = next(
                 row for row in app.checkbox if row.label == "Tutte le categorie"
             )
@@ -482,6 +489,9 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             app = qogita.set_value(False).run()
             self.assertFalse(any(
                 row.label == "Tutte le categorie" for row in app.checkbox
+            ))
+            self.assertFalse(any(
+                row.label == "Universo Qogita" for row in app.radio
             ))
 
     def test_qogita_manual_selection_persists_and_uses_qogita_universe_label(self):

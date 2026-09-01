@@ -23,6 +23,11 @@ from typing import Any, Callable, Iterable
 from uuid import uuid4
 
 from purchase_scenarios import normalize_purchase_scenario
+from qogita_universe import (
+    QOGITA_UNIVERSE_FULL,
+    QOGITA_UNIVERSE_KOREAN_BEAUTY,
+    normalize_qogita_universe,
+)
 
 
 SUPPORTED_SUPPLIERS = ("qogita", "umma", "abw", "qudo")
@@ -992,9 +997,12 @@ class SupplierCatalogStore:
                 scenarios.append(scenario)
         return {**metadata, "products": products, "scenarios": scenarios}
 
-    def active_identifiers(self, suppliers) -> set[str]:
+    def active_identifiers(
+        self, suppliers, *, qogita_universe: str = QOGITA_UNIVERSE_FULL,
+    ) -> set[str]:
         """Return the active supplier-first identifier union without payloads."""
         selected = [_validate_supplier(value) for value in suppliers]
+        qogita_universe = normalize_qogita_universe(qogita_universe)
         if not selected:
             return set()
         self.initialize()
@@ -1018,28 +1026,55 @@ class SupplierCatalogStore:
             if "qogita" in selected:
                 from qogita_serving import QogitaServingStore
                 QogitaServingStore(self.path).initialize()
+                if qogita_universe == QOGITA_UNIVERSE_KOREAN_BEAUTY:
+                    qogita_query = """SELECT DISTINCT scenario.canonical_ean
+                         FROM qogita_membership_active curated_active
+                         JOIN qogita_membership_versions curated_version
+                           ON curated_version.membership_version_id=curated_active.membership_version_id
+                          AND curated_version.status='valid'
+                         JOIN qogita_membership_entries curated
+                           ON curated.membership_version_id=curated_version.membership_version_id
+                         JOIN qogita_serving_active active
+                           ON active.supplier='qogita'
+                         JOIN qogita_serving_snapshots snapshot
+                           ON snapshot.serving_generation_id=active.serving_generation_id
+                          AND snapshot.source_generation_id=curated_version.source_generation_id
+                          AND snapshot.status='valid'
+                         CROSS JOIN qogita_serving_memberships membership
+                                      INDEXED BY idx_qogita_serving_membership_product
+                           ON membership.canonical_product_key=curated.canonical_product_key
+                          AND membership.serving_generation_id=snapshot.serving_generation_id
+                         CROSS JOIN supplier_catalog_scenarios scenario
+                                      INDEXED BY idx_supplier_catalog_scenarios_product
+                           ON scenario.run_id=snapshot.source_generation_id
+                          AND scenario.canonical_product_key=membership.canonical_product_key
+                        WHERE curated_active.membership_type='korean_beauty'
+                          AND scenario.canonical_ean IS NOT NULL"""
+                else:
+                    qogita_query = """SELECT DISTINCT scenario.canonical_ean
+                         FROM qogita_serving_active active
+                         JOIN qogita_serving_snapshots snapshot
+                           ON snapshot.serving_generation_id=active.serving_generation_id
+                         JOIN qogita_serving_memberships membership
+                           ON membership.serving_generation_id=snapshot.serving_generation_id
+                         JOIN supplier_catalog_scenarios scenario
+                           ON scenario.run_id=snapshot.source_generation_id
+                          AND scenario.canonical_product_key=membership.canonical_product_key
+                        WHERE active.supplier='qogita'
+                          AND snapshot.status='valid'
+                          AND scenario.canonical_ean IS NOT NULL"""
                 identifiers.update(
                     row["canonical_ean"]
-                    for row in connection.execute(
-                        """SELECT DISTINCT scenario.canonical_ean
-                             FROM qogita_serving_active active
-                             JOIN qogita_serving_snapshots snapshot
-                               ON snapshot.serving_generation_id=active.serving_generation_id
-                             JOIN qogita_serving_memberships membership
-                               ON membership.serving_generation_id=snapshot.serving_generation_id
-                             JOIN supplier_catalog_scenarios scenario
-                               ON scenario.run_id=snapshot.source_generation_id
-                              AND scenario.canonical_product_key=membership.canonical_product_key
-                            WHERE active.supplier='qogita'
-                              AND snapshot.status='valid'
-                              AND scenario.canonical_ean IS NOT NULL"""
-                    )
+                    for row in connection.execute(qogita_query)
                 )
             return identifiers
 
-    def active_identifier_universe(self, suppliers) -> dict[str, int]:
+    def active_identifier_universe(
+        self, suppliers, *, qogita_universe: str = QOGITA_UNIVERSE_FULL,
+    ) -> dict[str, int]:
         """Count the union eligible for Discovery without loading scenario payloads."""
         selected = [_validate_supplier(value) for value in suppliers]
+        qogita_universe = normalize_qogita_universe(qogita_universe)
         if not selected:
             return {"total": 0, "eligible": 0}
         self.initialize()
@@ -1061,20 +1096,47 @@ class SupplierCatalogStore:
         if "qogita" in selected:
             from qogita_serving import QogitaServingStore
             QogitaServingStore(self.path).initialize()
-            queries.append(
-                """SELECT selected.gtin AS identifier
+            if qogita_universe == QOGITA_UNIVERSE_KOREAN_BEAUTY:
+                queries.append(
+                    """SELECT scenario.canonical_ean AS identifier
+                     FROM qogita_membership_active curated_active
+                     JOIN qogita_membership_versions curated_version
+                       ON curated_version.membership_version_id=curated_active.membership_version_id
+                      AND curated_version.status='valid'
+                     JOIN qogita_membership_entries curated
+                       ON curated.membership_version_id=curated_version.membership_version_id
+                     JOIN qogita_serving_active active ON active.supplier='qogita'
+                     JOIN qogita_serving_snapshots snapshot
+                       ON snapshot.serving_generation_id=active.serving_generation_id
+                      AND snapshot.source_generation_id=curated_version.source_generation_id
+                      AND snapshot.status='valid'
+                     CROSS JOIN qogita_serving_memberships membership
+                                  INDEXED BY idx_qogita_serving_membership_product
+                       ON membership.canonical_product_key=curated.canonical_product_key
+                      AND membership.serving_generation_id=snapshot.serving_generation_id
+                     CROSS JOIN supplier_catalog_scenarios scenario
+                                  INDEXED BY idx_supplier_catalog_scenarios_product
+                       ON scenario.run_id=snapshot.source_generation_id
+                      AND scenario.canonical_product_key=membership.canonical_product_key
+                    WHERE curated_active.membership_type='korean_beauty'
+                      AND scenario.canonical_ean IS NOT NULL
+                    GROUP BY scenario.canonical_ean"""
+                )
+            else:
+                queries.append(
+                    """SELECT selected.gtin AS identifier
                      FROM qogita_serving_active active
                      JOIN qogita_serving_snapshots snapshot
                        ON snapshot.serving_generation_id=active.serving_generation_id
                      JOIN qogita_serving_memberships membership
                        ON membership.serving_generation_id=snapshot.serving_generation_id
                      JOIN qogita_bootstrap_products selected
-                       ON selected.bootstrap_run_id=snapshot.bootstrap_run_id
+                      ON selected.bootstrap_run_id=snapshot.bootstrap_run_id
                       AND selected.canonical_product_key=membership.canonical_product_key
                     WHERE active.supplier='qogita' AND snapshot.status='valid'
                       AND membership.scenario_count>0
                     GROUP BY selected.gtin"""
-            )
+                )
         with _connect(self.path) as connection:
             identifiers = [
                 row["identifier"]
@@ -1085,9 +1147,14 @@ class SupplierCatalogStore:
             "eligible": sum(canonical_gtin14(value) is not None for value in identifiers),
         }
 
-    def active_identifier_memberships(self, suppliers) -> dict[str, tuple[str, ...]]:
+    def active_identifier_memberships(
+        self, suppliers, *, qogita_universe: str = QOGITA_UNIVERSE_FULL,
+        qogita_membership_version_id: str | None = None,
+        qogita_serving_generation_id: str | None = None,
+    ) -> dict[str, tuple[str, ...]]:
         """Return identifier membership without materializing product payloads."""
         selected = [_validate_supplier(value) for value in suppliers]
+        qogita_universe = normalize_qogita_universe(qogita_universe)
         memberships: dict[str, set[str]] = {}
         self.initialize()
         promoted = [supplier for supplier in selected if supplier != "qogita"]
@@ -1108,20 +1175,67 @@ class SupplierCatalogStore:
             if "qogita" in selected:
                 from qogita_serving import QogitaServingStore
                 QogitaServingStore(self.path).initialize()
-                for row in connection.execute(
-                    """SELECT scenario.canonical_ean
-                         FROM qogita_serving_active active
-                         JOIN qogita_serving_snapshots snapshot
-                           ON snapshot.serving_generation_id=active.serving_generation_id
+                if qogita_universe == QOGITA_UNIVERSE_KOREAN_BEAUTY:
+                    if not qogita_membership_version_id:
+                        active_membership = connection.execute(
+                            """SELECT membership_version_id
+                                 FROM qogita_membership_active
+                                WHERE membership_type='korean_beauty'"""
+                        ).fetchone()
+                        if not active_membership:
+                            raise RuntimeError("No active Korean Beauty membership")
+                        qogita_membership_version_id = str(
+                            active_membership["membership_version_id"]
+                        )
+                    if not qogita_serving_generation_id:
+                        active_serving = connection.execute(
+                            """SELECT serving_generation_id
+                                 FROM qogita_serving_active WHERE supplier='qogita'"""
+                        ).fetchone()
+                        if not active_serving:
+                            raise RuntimeError("No active Qogita serving snapshot")
+                        qogita_serving_generation_id = str(
+                            active_serving["serving_generation_id"]
+                        )
+                    qogita_query = """SELECT scenario.canonical_ean
+                         FROM qogita_serving_snapshots snapshot
+                         JOIN qogita_membership_entries curated
+                           ON curated.membership_version_id=?
+                         CROSS JOIN qogita_serving_memberships membership
+                                      INDEXED BY idx_qogita_serving_membership_product
+                           ON membership.canonical_product_key=curated.canonical_product_key
+                          AND membership.serving_generation_id=snapshot.serving_generation_id
+                         CROSS JOIN supplier_catalog_scenarios scenario
+                                      INDEXED BY idx_supplier_catalog_scenarios_product
+                           ON scenario.run_id=snapshot.source_generation_id
+                          AND scenario.canonical_product_key=membership.canonical_product_key
+                        WHERE snapshot.serving_generation_id=?
+                          AND snapshot.status='valid'
+                          AND scenario.canonical_ean IS NOT NULL
+                        GROUP BY scenario.canonical_ean"""
+                    parameters = (
+                        str(qogita_membership_version_id),
+                        str(qogita_serving_generation_id),
+                    )
+                else:
+                    serving_filter = "active.supplier='qogita'"
+                    parameters = ()
+                    if qogita_serving_generation_id:
+                        serving_filter = "snapshot.serving_generation_id=?"
+                        parameters = (str(qogita_serving_generation_id),)
+                    qogita_query = f"""SELECT scenario.canonical_ean
+                         FROM qogita_serving_snapshots snapshot
+                         LEFT JOIN qogita_serving_active active
+                           ON active.serving_generation_id=snapshot.serving_generation_id
                          JOIN qogita_serving_memberships membership
                            ON membership.serving_generation_id=snapshot.serving_generation_id
                          JOIN supplier_catalog_scenarios scenario
                            ON scenario.run_id=snapshot.source_generation_id
                           AND scenario.canonical_product_key=membership.canonical_product_key
-                        WHERE active.supplier='qogita' AND snapshot.status='valid'
+                        WHERE {serving_filter} AND snapshot.status='valid'
                           AND scenario.canonical_ean IS NOT NULL
                         GROUP BY scenario.canonical_ean"""
-                ):
+                for row in connection.execute(qogita_query, parameters):
                     memberships.setdefault(row["canonical_ean"], set()).add("qogita")
         return {
             identifier: tuple(sorted(values))
@@ -1205,12 +1319,36 @@ class SupplierCatalogStore:
             return candidates
 
     def active_candidate_generation_metadata(
-        self, supplier: str,
+        self, supplier: str, *, qogita_universe: str = QOGITA_UNIVERSE_FULL,
     ) -> dict[str, Any] | None:
         """Load immutable candidate-source metadata once for a preparation run."""
         supplier = _validate_supplier(supplier)
         if supplier == "qogita":
-            return self.serving_generation_metadata("qogita")
+            metadata = self.serving_generation_metadata("qogita")
+            universe = normalize_qogita_universe(qogita_universe)
+            if not metadata or universe == QOGITA_UNIVERSE_FULL:
+                return metadata
+            with _connect(self.path) as connection:
+                membership = connection.execute(
+                    """SELECT version.* FROM qogita_membership_active active
+                         JOIN qogita_membership_versions version
+                           ON version.membership_version_id=active.membership_version_id
+                        WHERE active.membership_type='korean_beauty'
+                          AND version.status='valid'"""
+                ).fetchone()
+            if not membership:
+                raise RuntimeError("No active Korean Beauty membership")
+            if str(membership["source_generation_id"]) != str(
+                metadata["source_generation_id"]
+            ):
+                raise RuntimeError("Korean Beauty membership source generation mismatch")
+            return {
+                **metadata,
+                "qogita_universe": universe,
+                "qogita_membership_version_id": membership["membership_version_id"],
+                "qogita_membership_observed_at": membership["observed_at"],
+                "qogita_membership_entry_count": int(membership["entry_count"]),
+            }
         self.initialize()
         with _connect(self.path) as connection:
             row = connection.execute(
@@ -1259,17 +1397,27 @@ class SupplierCatalogStore:
                 if supplier == "qogita":
                     run_id = str(metadata["source_generation_id"])
                     serving_id = str(metadata["serving_generation_id"])
+                    curated_join = ""
+                    query_parameters = [serving_id]
+                    if metadata.get("qogita_universe") == QOGITA_UNIVERSE_KOREAN_BEAUTY:
+                        curated_join = """JOIN qogita_membership_entries curated
+                                  ON curated.membership_version_id=?
+                                 AND curated.canonical_product_key=product.canonical_product_key"""
+                        query_parameters.append(str(
+                            metadata["qogita_membership_version_id"]
+                        ))
                     product_rows = connection.execute(
                         f"""SELECT product.*
                               FROM supplier_catalog_products AS product
                                    INDEXED BY idx_supplier_catalog_products_run_gtin
                               JOIN qogita_serving_memberships membership
-                                ON membership.serving_generation_id=?
+                               ON membership.serving_generation_id=?
                                AND membership.canonical_product_key=product.canonical_product_key
+                              {curated_join}
                              WHERE product.run_id=?
                                AND product.canonical_gtin IN ({placeholders})
                              ORDER BY product.canonical_product_key""",
-                        (serving_id, run_id, *comparisons),
+                        (*query_parameters, run_id, *comparisons),
                     ).fetchall()
                 else:
                     run_id = str(metadata["run_id"])

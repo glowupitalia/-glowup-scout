@@ -52,7 +52,7 @@ ON qogita_membership_versions(membership_type,status,observed_at DESC);
 CREATE TABLE IF NOT EXISTS qogita_membership_entries (
     membership_version_id TEXT NOT NULL,
     canonical_gtin TEXT NOT NULL,
-    canonical_product_key TEXT NOT NULL,
+    canonical_product_key TEXT,
     variant_fid TEXT,
     PRIMARY KEY (membership_version_id, canonical_gtin),
     UNIQUE (membership_version_id, canonical_product_key),
@@ -396,7 +396,7 @@ class QogitaMembershipReconciler:
         bootstrap_run_id: str, serving_generation_id: str, batch_size: int = 500,
     ) -> dict[str, Any]:
         materialized = [dict(row) for row in entries]
-        matched: list[dict[str, Any]] = []
+        reconciled: list[dict[str, Any]] = []
         catalog_missing = []
         status_counts: dict[str, int] = {}
         catalog_fid_equal = catalog_fid_different = catalog_fid_missing = 0
@@ -442,6 +442,11 @@ class QogitaMembershipReconciler:
                     product = products_by_gtin.get(gtin)
                     if not product:
                         catalog_missing.append(gtin)
+                        reconciled.append({
+                            "canonical_gtin": gtin,
+                            "canonical_product_key": None,
+                            "variant_fid": curated.get("variant_fid"),
+                        })
                         continue
                     curated_fid = curated.get("variant_fid")
                     catalog_fid = str(product["variant_fid"] or "") or None
@@ -458,17 +463,17 @@ class QogitaMembershipReconciler:
                     if scenario_count is not None:
                         serving_count += 1
                         serving_scenarios += scenario_count
-                    matched.append({
+                    reconciled.append({
                         "canonical_gtin": gtin,
                         "canonical_product_key": key,
                         "variant_fid": curated_fid,
                     })
         total = len(materialized)
         return {
-            "entries": matched,
+            "entries": reconciled,
             "metrics": {
                 "membership_gtin_unique": total,
-                "catalog_present_count": len(matched),
+                "catalog_present_count": total - len(catalog_missing),
                 "catalog_absent_count": len(catalog_missing),
                 "catalog_fid_equal_count": catalog_fid_equal,
                 "catalog_fid_different_count": catalog_fid_different,
@@ -515,12 +520,14 @@ class QogitaMembershipStore:
         acquisition_status: str, metrics: dict[str, Any], error_message: str | None = None,
     ) -> dict[str, Any]:
         materialized = [dict(row) for row in entries]
-        conflicts = int(metrics.get("gtin_fid_conflict_count") or 0) + int(
+        blocking_anomalies = int(metrics.get("gtin_fid_conflict_count") or 0) + int(
             metrics.get("fid_gtin_conflict_count") or 0
-        ) + int(metrics.get("catalog_fid_different_count") or 0)
+        ) + int(metrics.get("catalog_fid_different_count") or 0) + int(
+            metrics.get("invalid_gtin_count") or 0
+        ) + int(metrics.get("fid_missing_count") or 0)
         valid = (
             acquisition_status in {"complete", "complete_with_anomalies"}
-            and bool(materialized) and not conflicts and not error_message
+            and bool(materialized) and not blocking_anomalies and not error_message
         )
         status = "valid" if valid else "invalid"
         now = utc_now()

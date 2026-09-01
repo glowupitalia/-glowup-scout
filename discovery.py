@@ -893,6 +893,10 @@ def _migrate_observation_sources(observation):
 
 def normalize_discovery_state(state):
     """Normalize compatible checkpoints and explicitly reject legacy results."""
+    from qogita_universe import normalize_qogita_universe
+    state["qogita_universe"] = normalize_qogita_universe(
+        state.get("qogita_universe")
+    )
     for listing in state.get("amazon_listings") or []:
         listing.setdefault("min_fba_price", None)
         listing.setdefault("min_fbm_price", None)

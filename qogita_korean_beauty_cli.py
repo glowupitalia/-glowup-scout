@@ -11,6 +11,7 @@ from pathlib import Path
 from qogita_korean_beauty import (
     QogitaKoreanBeautyCollector,
     QogitaMembershipReconciler,
+    QogitaMembershipStore,
 )
 from supplier_catalog import DEFAULT_DATABASE_PATH
 
@@ -43,14 +44,24 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-attempts", type=int, default=5)
     result.add_argument("--max-pages", type=int)
     result.add_argument(
+        "--persist", action="store_true",
+        help="Persist a validated version in the supplier DB after acquisition",
+    )
+    result.add_argument(
+        "--activate", action="store_true",
+        help="Atomically activate the newly persisted valid membership",
+    )
+    result.add_argument(
         "--execute", action="store_true",
-        help="Perform public curated-search GETs; never writes or activates membership",
+        help="Perform public curated-search GETs (persistence requires --persist)",
     )
     return result
 
 
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
+    if args.activate and not args.persist:
+        raise SystemExit("--activate requires --persist")
     database = Path(args.database).expanduser().resolve()
     context = _production_context(database)
     if not args.execute:
@@ -74,10 +85,29 @@ def main(argv=None) -> int:
         bootstrap_run_id=context["bootstrap_run_id"],
         serving_generation_id=context["serving_generation_id"],
     )
+    membership_version = None
+    active_membership = None
+    if args.persist:
+        store = QogitaMembershipStore(database)
+        membership_version = store.create_version(
+            source_generation_id=context["source_generation_id"],
+        )
+        membership_version = store.finalize_version(
+            membership_version["membership_version_id"],
+            entries=reconciliation["entries"],
+            acquisition_status=acquisition["acquisition_status"],
+            metrics={**acquisition["metrics"], **reconciliation["metrics"]},
+        )
+        if args.activate:
+            active_membership = store.activate(
+                membership_version["membership_version_id"],
+            )
     report = {
-        "status": "dry_run_complete",
-        "production_writes": False,
-        "membership_activation": False,
+        "status": "membership_activated" if active_membership else (
+            "membership_persisted" if membership_version else "dry_run_complete"
+        ),
+        "production_writes": bool(args.persist),
+        "membership_activation": bool(active_membership),
         **context,
         "acquisition_status": acquisition["acquisition_status"],
         "curated": acquisition["metrics"],
@@ -85,6 +115,8 @@ def main(argv=None) -> int:
         "catalog_absent_gtins": reconciliation["catalog_absent_gtins"],
         "gtin_fid_conflicts": acquisition["gtin_fid_conflicts"],
         "fid_gtin_conflicts": acquisition["fid_gtin_conflicts"],
+        "membership_version": membership_version,
+        "active_membership": active_membership,
     }
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0

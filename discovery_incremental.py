@@ -259,6 +259,8 @@ def read_legacy_metadata(path: str | Path) -> dict[str, Any]:
         "qogita_category_include_unknown", "qogita_category_only_beauty",
         "qogita_category_beauty_selection_customized",
         "qogita_taxonomy_schema_version", "qogita_category_marketplace_id",
+        "qogita_universe", "qogita_membership_version_id",
+        "qogita_membership_observed_at", "qogita_membership_entry_count",
     )
     decoder = json.JSONDecoder()
     result: dict[str, Any] = {}
@@ -1615,13 +1617,24 @@ def prepare_incremental_job(
     """
     from purchase_scenarios import merge_product_candidates
     from supplier_preparation import normalize_selected_suppliers
+    from qogita_universe import normalize_qogita_universe
 
     selected = normalize_selected_suppliers(state.get("selected_suppliers") or [])
+    qogita_universe = normalize_qogita_universe(state.get("qogita_universe"))
     snapshots: dict[str, Any] = {}
     source_metadata: dict[str, dict[str, Any]] = {}
     usable: list[str] = []
     for supplier in selected:
-        metadata = supplier_store.serving_generation_metadata(supplier)
+        if hasattr(supplier_store, "active_candidate_generation_metadata"):
+            metadata = (
+                supplier_store.active_candidate_generation_metadata(
+                    supplier, qogita_universe=qogita_universe,
+                )
+                if qogita_universe != "full"
+                else supplier_store.active_candidate_generation_metadata(supplier)
+            )
+        else:
+            metadata = supplier_store.serving_generation_metadata(supplier)
         if metadata:
             usable.append(supplier)
             source_metadata[supplier] = dict(metadata)
@@ -1640,6 +1653,19 @@ def prepare_incremental_job(
                 ),
                 "availability_status": "available",
             }
+            if supplier == "qogita":
+                snapshots[supplier].update({
+                    "qogita_universe": qogita_universe,
+                    "membership_version_id": metadata.get(
+                        "qogita_membership_version_id"
+                    ),
+                    "membership_observed_at": metadata.get(
+                        "qogita_membership_observed_at"
+                    ),
+                    "membership_entry_count": metadata.get(
+                        "qogita_membership_entry_count"
+                    ),
+                })
         else:
             snapshots[supplier] = {
                 "supplier": supplier, "snapshot_id": None,
@@ -1649,10 +1675,15 @@ def prepare_incremental_job(
             }
     if not usable:
         raise RuntimeError("No supplier-first baseline is available")
-    frozen_selection = (
-        rotation_store.frozen_selection(state["job_id"], usable)
-        if hasattr(rotation_store, "frozen_selection") else None
-    )
+    frozen_selection = None
+    if hasattr(rotation_store, "frozen_selection"):
+        frozen_selection = (
+            rotation_store.frozen_selection(
+                state["job_id"], usable, qogita_universe=qogita_universe,
+            )
+            if qogita_universe != "full"
+            else rotation_store.frozen_selection(state["job_id"], usable)
+        )
     if frozen_selection:
         frozen_stubs, frozen_rotation = frozen_selection
         memberships = {
@@ -1661,7 +1692,20 @@ def prepare_incremental_job(
         }
     else:
         frozen_stubs = frozen_rotation = None
-        memberships = supplier_store.active_identifier_memberships(usable)
+        qogita_metadata = source_metadata.get("qogita") or {}
+        memberships = (
+            supplier_store.active_identifier_memberships(
+                usable, qogita_universe=qogita_universe,
+                qogita_membership_version_id=qogita_metadata.get(
+                    "qogita_membership_version_id"
+                ),
+                qogita_serving_generation_id=qogita_metadata.get(
+                    "serving_generation_id"
+                ),
+            )
+            if qogita_universe != "full"
+            else supplier_store.active_identifier_memberships(usable)
+        )
     if progress is not None:
         progress("preparing_memberships", max(0, int(start_sequence)), len(memberships))
     if resource_governor is not None:
@@ -1708,22 +1752,28 @@ def prepare_incremental_job(
         if frozen_stubs is not None:
             selected_stubs, rotation = frozen_stubs, frozen_rotation
         else:
-            selected_stubs, rotation = rotation_store.select_current_universe(
-                state["job_id"], stubs, usable, budget,
-                supplier_snapshot_set=snapshots,
-                action_priority={
+            selection_kwargs = {
+                "supplier_snapshot_set": snapshots,
+                "action_priority": {
                     identifier: action_order[value["primary_action"]]
                     for identifier, value in planned.items()
                 },
+            }
+            if qogita_universe != "full":
+                selection_kwargs["qogita_universe"] = qogita_universe
+            selected_stubs, rotation = rotation_store.select_current_universe(
+                state["job_id"], stubs, usable, budget, **selection_kwargs,
             )
     else:
         policy = None
         if frozen_stubs is not None:
             selected_stubs, rotation = frozen_stubs, frozen_rotation
         else:
+            selection_kwargs = {"supplier_snapshot_set": snapshots}
+            if qogita_universe != "full":
+                selection_kwargs["qogita_universe"] = qogita_universe
             selected_stubs, rotation = rotation_store.select(
-                state["job_id"], stubs, usable, budget,
-                supplier_snapshot_set=snapshots,
+                state["job_id"], stubs, usable, budget, **selection_kwargs,
             )
     selected_identifiers = [row["canonical_ean"] for row in selected_stubs]
     if progress is not None:
@@ -1799,6 +1849,16 @@ def prepare_incremental_job(
         "selected_suppliers": selected,
         "usable_suppliers": usable,
         "supplier_snapshot_set": snapshots,
+        "qogita_universe": qogita_universe,
+        "qogita_membership_version_id": (
+            source_metadata.get("qogita") or {}
+        ).get("qogita_membership_version_id"),
+        "qogita_membership_observed_at": (
+            source_metadata.get("qogita") or {}
+        ).get("qogita_membership_observed_at"),
+        "qogita_membership_entry_count": (
+            source_metadata.get("qogita") or {}
+        ).get("qogita_membership_entry_count"),
         "supplier_warnings": [
             f"{supplier.upper()}: baseline non disponibile"
             for supplier in selected if supplier not in usable

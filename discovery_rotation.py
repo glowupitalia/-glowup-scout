@@ -82,11 +82,17 @@ def normalize_rotation_suppliers(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted({str(value or "").strip().casefold() for value in values if value}))
 
 
-def rotation_scope_key(values: Iterable[str]) -> str:
+def rotation_scope_key(values: Iterable[str], *, qogita_universe: str = "full") -> str:
     suppliers = normalize_rotation_suppliers(values)
     if not suppliers:
         raise ValueError("Rotation scope requires at least one supplier")
-    digest = hashlib.sha256("|".join(suppliers).encode("utf-8")).hexdigest()[:20]
+    from qogita_universe import normalize_qogita_universe
+    universe = normalize_qogita_universe(qogita_universe)
+    semantic = tuple(
+        f"qogita/{universe}" if supplier == "qogita" and universe != "full" else supplier
+        for supplier in suppliers
+    )
+    digest = hashlib.sha256("|".join(semantic).encode("utf-8")).hexdigest()[:20]
     return f"supplier-scope-{digest}"
 
 
@@ -142,13 +148,14 @@ class DiscoveryRotationStore:
 
     def sync_universe(
         self, candidates: Iterable[dict[str, Any]], selected_suppliers: Iterable[str],
-        *, supplier_snapshot_set: dict[str, Any] | None = None, now: str | None = None,
+        *, supplier_snapshot_set: dict[str, Any] | None = None,
+        qogita_universe: str = "full", now: str | None = None,
     ) -> dict[str, Any]:
         """Upsert one active union without consuming any identifier."""
         self.initialize()
         observed = now or _now()
         selected = normalize_rotation_suppliers(selected_suppliers)
-        scope = rotation_scope_key(selected)
+        scope = rotation_scope_key(selected, qogita_universe=qogita_universe)
         snapshots = supplier_snapshot_set or {}
         rows: dict[str, dict[str, Any]] = {}
         for candidate in candidates:
@@ -219,7 +226,7 @@ class DiscoveryRotationStore:
                     ),
                 )
             connection.commit()
-        return self.status(selected)
+        return self.status(selected, qogita_universe=qogita_universe)
 
     def _scope_row(self, connection, scope: str):
         return connection.execute(
@@ -243,10 +250,11 @@ class DiscoveryRotationStore:
     def status(
         self, selected_suppliers: Iterable[str], *,
         active_identifiers: Iterable[str] | None = None,
+        qogita_universe: str = "full",
     ) -> dict[str, Any]:
         self.initialize()
         selected = normalize_rotation_suppliers(selected_suppliers)
-        scope = rotation_scope_key(selected)
+        scope = rotation_scope_key(selected, qogita_universe=qogita_universe)
         supplied_identifiers = None
         if active_identifiers is not None:
             supplied_identifiers = {
@@ -353,15 +361,17 @@ class DiscoveryRotationStore:
     def select(
         self, job_id: str, candidates: list[dict[str, Any]],
         selected_suppliers: Iterable[str], budget: int | None, *,
-        supplier_snapshot_set: dict[str, Any] | None = None, now: str | None = None,
+        supplier_snapshot_set: dict[str, Any] | None = None,
+        qogita_universe: str = "full", now: str | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if not job_id:
             raise ValueError("Rotation selection requires a job_id")
         observed = now or _now()
         selected = normalize_rotation_suppliers(selected_suppliers)
-        scope = rotation_scope_key(selected)
+        scope = rotation_scope_key(selected, qogita_universe=qogita_universe)
         self.sync_universe(
-            candidates, selected, supplier_snapshot_set=supplier_snapshot_set, now=observed,
+            candidates, selected, supplier_snapshot_set=supplier_snapshot_set,
+            qogita_universe=qogita_universe, now=observed,
         )
         by_identifier = {
             str(row.get("canonical_ean")): row for row in candidates
@@ -415,7 +425,7 @@ class DiscoveryRotationStore:
             ).fetchone()[0]
             connection.commit()
         selected_rows = [by_identifier[value] for value in identifiers if value in by_identifier]
-        scope_status = self.status(selected)
+        scope_status = self.status(selected, qogita_universe=qogita_universe)
         metadata = {
             **{
                 key: value for key, value in scope_status.items()
@@ -439,6 +449,7 @@ class DiscoveryRotationStore:
         selected_suppliers: Iterable[str], budget: int | None, *,
         supplier_snapshot_set: dict[str, Any] | None = None,
         action_priority: dict[str, int] | None = None,
+        qogita_universe: str = "full",
         now: str | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Select from the whole active universe without resetting a cycle.
@@ -451,9 +462,10 @@ class DiscoveryRotationStore:
             raise ValueError("Rotation selection requires a job_id")
         observed = now or _now()
         selected = normalize_rotation_suppliers(selected_suppliers)
-        scope = rotation_scope_key(selected)
+        scope = rotation_scope_key(selected, qogita_universe=qogita_universe)
         self.sync_universe(
-            candidates, selected, supplier_snapshot_set=supplier_snapshot_set, now=observed,
+            candidates, selected, supplier_snapshot_set=supplier_snapshot_set,
+            qogita_universe=qogita_universe, now=observed,
         )
         by_identifier = {
             str(row.get("canonical_ean")): row for row in candidates
@@ -508,7 +520,7 @@ class DiscoveryRotationStore:
             ).fetchone()[0]
             connection.commit()
         selected_rows = [by_identifier[value] for value in identifiers if value in by_identifier]
-        scope_status = self.status(selected)
+        scope_status = self.status(selected, qogita_universe=qogita_universe)
         metadata = {
             **{key: value for key, value in scope_status.items() if key.startswith("rotation_")},
             "rotation_scope": scope,
@@ -526,12 +538,13 @@ class DiscoveryRotationStore:
         return selected_rows, metadata
 
     def frozen_selection(
-        self, job_id: str, selected_suppliers: Iterable[str],
+        self, job_id: str, selected_suppliers: Iterable[str], *,
+        qogita_universe: str = "full",
     ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
         """Load an existing job selection without resyncing the live universe."""
         self.initialize()
         selected = normalize_rotation_suppliers(selected_suppliers)
-        scope = rotation_scope_key(selected)
+        scope = rotation_scope_key(selected, qogita_universe=qogita_universe)
         with self._connect() as connection:
             rows = connection.execute(
                 """SELECT selection.canonical_identifier,selection.cycle_id,
@@ -659,12 +672,15 @@ class DiscoveryRotationStore:
         }
 
     def start_new_cycle(
-        self, selected_suppliers: Iterable[str], *, confirmed: bool, now: str | None = None,
+        self, selected_suppliers: Iterable[str], *, confirmed: bool,
+        qogita_universe: str = "full", now: str | None = None,
     ) -> dict[str, Any]:
         if not confirmed:
             raise ValueError("Explicit confirmation is required")
         self.initialize()
-        scope = rotation_scope_key(selected_suppliers)
+        scope = rotation_scope_key(
+            selected_suppliers, qogita_universe=qogita_universe,
+        )
         observed = now or _now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -677,4 +693,6 @@ class DiscoveryRotationStore:
                 (cycle, observed, scope),
             )
             connection.commit()
-        return self.status(selected_suppliers)
+        return self.status(
+            selected_suppliers, qogita_universe=qogita_universe,
+        )
