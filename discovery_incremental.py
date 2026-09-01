@@ -253,6 +253,7 @@ def read_legacy_metadata(path: str | Path) -> dict[str, Any]:
         "progress_phase", "progress_current", "progress_total", "errors",
         "export_state",
         "qogita_category_filter_enabled",
+        "qogita_category_filter_mode",
         "qogita_category_selected_parent_ids",
         "qogita_category_child_overrides",
         "qogita_category_include_unknown", "qogita_category_only_beauty",

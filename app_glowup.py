@@ -59,7 +59,8 @@ from discovery_freshness import AmazonFreshnessPolicy, POLICY_VERSION
 from discovery_freshness import DiscoveryAmazonCache
 from discovery_incremental import DiscoveryIncrementalStore
 from discovery_taxonomy import (
-    BEAUTY_PARENT_IDS,
+    MODE_MANUAL,
+    MODE_ONLY_BEAUTY,
     QOGITA_CATEGORY_TREE,
     default_qogita_category_filter,
 )
@@ -1625,17 +1626,17 @@ elif ui_state == "discovery":
                     key="discovery_qogita_only_beauty",
                     help="Si applica esclusivamente agli scenari Qogita.",
                 )
-                parent_options = [
-                    node_id for node_id in QOGITA_CATEGORY_TREE
-                    if not only_beauty or node_id in BEAUTY_PARENT_IDS
-                ]
-                selected_parent_ids = st.multiselect(
-                    "Categorie principali",
-                    options=parent_options,
-                    default=parent_options,
-                    format_func=lambda value: QOGITA_CATEGORY_TREE[value]["label"],
-                    key=f"discovery_qogita_category_parents_{int(only_beauty)}",
-                )
+                if only_beauty:
+                    selected_parent_ids = []
+                else:
+                    parent_options = list(QOGITA_CATEGORY_TREE)
+                    selected_parent_ids = st.multiselect(
+                        "Categorie principali",
+                        options=parent_options,
+                        default=parent_options,
+                        format_func=lambda value: QOGITA_CATEGORY_TREE[value]["label"],
+                        key="discovery_qogita_category_parents_0",
+                    )
                 include_unknown = st.checkbox(
                     "Includi prodotti non classificati", value=True,
                     key="discovery_qogita_include_unknown",
@@ -1645,34 +1646,51 @@ elif ui_state == "discovery":
                     children = QOGITA_CATEGORY_TREE[parent_id]["children"]
                     if not children:
                         continue
-                    with st.expander(
-                        f"Dettaglio · {QOGITA_CATEGORY_TREE[parent_id]['label']}",
-                        expanded=False,
-                    ):
+                    selection_key = f"discovery_qogita_excluded_{parent_id}"
+                    saved_key = f"{selection_key}_saved"
+                    if selection_key in st.session_state:
+                        st.session_state[saved_key] = list(
+                            st.session_state.get(selection_key) or []
+                        )
+                    show_children = st.checkbox(
+                        "Dettaglia sottocategorie — "
+                        f"{QOGITA_CATEGORY_TREE[parent_id]['label']}",
+                        value=False,
+                        key=f"discovery_qogita_detail_{parent_id}",
+                    )
+                    if show_children:
+                        if selection_key not in st.session_state:
+                            st.session_state[selection_key] = list(
+                                st.session_state.get(saved_key) or []
+                            )
                         excluded_ids = st.multiselect(
                             "Escludi sottocategorie o tipologie",
                             options=list(children), default=[],
                             format_func=lambda value, values=children: values[value],
-                            key=f"discovery_qogita_excluded_{parent_id}",
+                            key=selection_key,
                         )
+                        st.session_state[saved_key] = list(excluded_ids)
+                    else:
+                        excluded_ids = list(st.session_state.get(saved_key) or [])
                     if excluded_ids:
                         child_overrides[parent_id] = {"excluded_ids": excluded_ids}
                 category_filter.update({
                     "qogita_category_filter_enabled": True,
+                    "qogita_category_filter_mode": (
+                        MODE_ONLY_BEAUTY if only_beauty else MODE_MANUAL
+                    ),
                     "qogita_category_selected_parent_ids": selected_parent_ids,
                     "qogita_category_child_overrides": child_overrides,
                     "qogita_category_include_unknown": include_unknown,
                     "qogita_category_only_beauty": only_beauty,
                 })
-                selected_labels = [
-                    QOGITA_CATEGORY_TREE[value]["label"]
-                    for value in selected_parent_ids
-                ]
-                selection_summary = (
+                selected_labels = [QOGITA_CATEGORY_TREE[value]["label"]
+                                   for value in selected_parent_ids]
+                selection_summary = "solo Beauty" if only_beauty else (
                     ", ".join(selected_labels)
                     if 0 < len(selected_labels) <= 4
                     else f"{len(selected_labels)} categorie selezionate"
-                    if selected_labels else "nessuna categoria nota"
+                    if selected_labels else "nessuna categoria selezionata"
                 )
                 st.caption(
                     "Qogita: " + selection_summary
@@ -1683,7 +1701,15 @@ elif ui_state == "discovery":
         except Exception:
             universe = {"total": 0, "eligible": 0}
         eligible = int(universe.get("eligible") or 0)
-        st.metric("Prodotti da valutare", f"{eligible:,}".replace(",", "."))
+        universe_label = (
+            "Universo Qogita"
+            if set(selected_suppliers) == {"qogita"}
+            else "Universo supplier"
+        )
+        st.metric(
+            universe_label,
+            f"{eligible:,} prodotti".replace(",", "."),
+        )
         st.caption(
             "Scout riutilizzerà automaticamente i dati Amazon recenti e "
             "aggiornerà solo quelli necessari."

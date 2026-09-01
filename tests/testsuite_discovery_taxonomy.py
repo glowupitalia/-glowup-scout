@@ -10,16 +10,25 @@ from discovery import _evaluate_product_combinations
 from discovery_taxonomy import (
     BEAUTY_DEPARTMENT_ID,
     MARKETPLACE_IT,
+    MODE_ALL,
+    MODE_MANUAL,
+    MODE_ONLY_BEAUTY,
     classification_paths_allowed,
     apply_qogita_listing_filter,
     extract_listing_classification_paths,
     filter_qogita_scenarios,
+    normalize_qogita_category_filter,
 )
 
 
 FRAGRANCE = "6306898031"
 MAKEUP = "6306900031"
 LIPSTICK = "6307022031"
+SKINCARE = "6306897031"
+BATH_BODY = "4327880031"
+HEALTH = "1571289031"
+HAIR = "4327902031"
+NAIL = "6306899031"
 
 
 def taxonomy_listing(asin="ASIN1", leaf=LIPSTICK, parent=MAKEUP):
@@ -97,22 +106,72 @@ class QogitaTaxonomyTests(unittest.TestCase):
             fragrance_path, config(parents=(MAKEUP,)),
         ))
 
-    def test_unknown_and_future_categories_are_conservative(self):
+    def test_unknown_and_future_categories_follow_explicit_modes(self):
         self.assertTrue(classification_paths_allowed([], config(unknown=True)))
         self.assertFalse(classification_paths_allowed([], config(unknown=False)))
-        self.assertTrue(classification_paths_allowed(
+        self.assertFalse(classification_paths_allowed(
             [["future-department", "future-category"]], config(),
         ))
+        self.assertTrue(classification_paths_allowed(
+            [["future-department", "future-category"]], {},
+        ))
+
+    def test_filter_mode_is_explicit_and_backward_compatible(self):
+        self.assertEqual(
+            normalize_qogita_category_filter({})["qogita_category_filter_mode"],
+            MODE_ALL,
+        )
+        self.assertEqual(
+            normalize_qogita_category_filter(config(only_beauty=True))[
+                "qogita_category_filter_mode"
+            ],
+            MODE_ONLY_BEAUTY,
+        )
+        self.assertEqual(
+            normalize_qogita_category_filter(config())["qogita_category_filter_mode"],
+            MODE_MANUAL,
+        )
+        explicit = config(only_beauty=True)
+        explicit["qogita_category_filter_mode"] = MODE_MANUAL
+        self.assertEqual(
+            normalize_qogita_category_filter(explicit)[
+                "qogita_category_filter_mode"
+            ],
+            MODE_MANUAL,
+        )
 
     def test_only_beauty_uses_structured_department(self):
         self.assertTrue(classification_paths_allowed(
             [[BEAUTY_DEPARTMENT_ID, MAKEUP]],
             config(parents=(MAKEUP,), only_beauty=True),
         ))
+        self.assertTrue(classification_paths_allowed(
+            [[BEAUTY_DEPARTMENT_ID, FRAGRANCE]],
+            config(parents=(MAKEUP,), only_beauty=True),
+        ))
         self.assertFalse(classification_paths_allowed(
             [["1571289031"]],
             config(parents=(MAKEUP,), only_beauty=True),
         ))
+        self.assertTrue(classification_paths_allowed(
+            [], config(parents=(MAKEUP,), only_beauty=True, unknown=True),
+        ))
+        self.assertFalse(classification_paths_allowed(
+            [], config(parents=(MAKEUP,), only_beauty=True, unknown=False),
+        ))
+
+    def test_nicola_manual_selection_is_an_exact_structured_whitelist(self):
+        selected = (SKINCARE, MAKEUP, BATH_BODY, HEALTH)
+        manual = config(parents=selected, unknown=False)
+        for classification_id in selected:
+            self.assertTrue(classification_paths_allowed(
+                [[classification_id, f"{classification_id}-leaf"]], manual,
+            ))
+        for classification_id in (FRAGRANCE, HAIR, NAIL, "future-category"):
+            self.assertFalse(classification_paths_allowed(
+                [[classification_id, f"{classification_id}-leaf"]], manual,
+            ))
+        self.assertFalse(classification_paths_allowed([], manual))
 
     def test_ambiguous_product_is_included_when_any_path_is_allowed(self):
         paths = [
@@ -336,6 +395,116 @@ class QogitaTaxonomyTests(unittest.TestCase):
             for row in hydrated["amazon_listings"]
         }
         self.assertEqual(statuses["FRAGRANCE"], "qogita_category_filtered")
+
+    def test_manual_health_bypasses_only_the_legacy_beauty_gate(self):
+        health = taxonomy_listing("HEALTH", leaf="health-leaf", parent=HEALTH)
+        health["beauty_status"] = "other_display_group"
+        health["diagnostics"]["classification_records"][0]["classifications"][0][
+            "parent"
+        ].pop("parent")
+        row = {
+            "product_key": "p", "canonical_ean": "0000000000001",
+            "gtin": "0000000000001", "catalog_status": "resolved",
+            "scenarios": [{
+                "scenario_id": "q", "supplier": "qogita",
+                "scenario_label": "Qogita", "cost_gross_unit_eur": "10",
+            }], "amazon_listings": [health],
+        }
+        self.store.create_job({
+            "job_id": "health", "phase": "catalog_complete",
+            "filters": {
+                "bsr_min": 1, "bsr_max": 20_000, "max_fba_sellers": 10,
+                "max_total_sellers": 10, "minimum_margin": 25,
+            }, **config(parents=(HEALTH,), unknown=False),
+        }, [row])
+        pricing_calls = []
+
+        def pricing(asins, *_):
+            pricing_calls.extend(asins)
+            return {asin: {"status": "missing"} for asin in asins}
+
+        run_incremental_discovery(
+            "health", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=lambda *_: self.fail("Fresh Catalog must not be called"),
+            pricing_batch=pricing,
+            fees_batch=lambda *_: self.fail("Missing Pricing must skip Fees"),
+            token_provider=object(), sleep_func=lambda *_: None,
+            catalog_batch_interval=0, pricing_batch_interval=0, fee_batch_interval=0,
+        )
+        self.assertEqual(pricing_calls, ["HEALTH"])
+        listing = next(self.store.iter_candidates("health"))["amazon_listings"][0]
+        self.assertNotEqual(listing.get("evaluation_status"), "beauty_filtered")
+
+    def test_manual_health_still_requires_existing_bsr_beauty_policy(self):
+        health = taxonomy_listing("HEALTH", leaf="health-leaf", parent=HEALTH)
+        health["beauty_status"] = "other_display_group"
+        health["bsr_beauty"] = None
+        health["diagnostics"]["classification_records"][0]["classifications"][0][
+            "parent"
+        ].pop("parent")
+        row = {
+            "product_key": "p", "canonical_ean": "0000000000001",
+            "gtin": "0000000000001", "catalog_status": "resolved",
+            "scenarios": [{"scenario_id": "q", "supplier": "qogita"}],
+            "amazon_listings": [health],
+        }
+        self.store.create_job({
+            "job_id": "health-no-bsr", "phase": "catalog_complete",
+            "filters": {
+                "bsr_min": 1, "bsr_max": 20_000, "max_fba_sellers": 10,
+                "max_total_sellers": 10, "minimum_margin": 25,
+            },
+            **config(parents=(HEALTH,), unknown=False),
+        }, [row])
+        run_incremental_discovery(
+            "health-no-bsr", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=lambda *_: self.fail("Fresh Catalog must not be called"),
+            pricing_batch=lambda *_: self.fail("Missing BSR must skip Pricing"),
+            fees_batch=lambda *_: self.fail("Missing BSR must skip Fees"),
+            token_provider=object(), sleep_func=lambda *_: None,
+            catalog_batch_interval=0, pricing_batch_interval=0, fee_batch_interval=0,
+        )
+        listing = next(self.store.iter_candidates("health-no-bsr"))[
+            "amazon_listings"
+        ][0]
+        self.assertEqual(listing["evaluation_status"], "bsr_filtered")
+
+    def test_manual_health_preserves_other_supplier_legacy_beauty_gate(self):
+        health = taxonomy_listing("HEALTH", leaf="health-leaf", parent=HEALTH)
+        health["beauty_status"] = "other_display_group"
+        health["diagnostics"]["classification_records"][0]["classifications"][0][
+            "parent"
+        ].pop("parent")
+        row = {
+            "product_key": "p", "canonical_ean": "0000000000001",
+            "gtin": "0000000000001", "catalog_status": "resolved",
+            "scenarios": [
+                {"scenario_id": "q", "supplier": "qogita"},
+                {"scenario_id": "a", "supplier": "abw"},
+            ], "amazon_listings": [health],
+        }
+        self.store.create_job({
+            "job_id": "shared-health", "phase": "catalog_complete",
+            "filters": {
+                "bsr_min": 1, "bsr_max": 20_000, "max_fba_sellers": 10,
+                "max_total_sellers": 10, "minimum_margin": 25,
+            },
+            **config(parents=(HEALTH,), unknown=False),
+        }, [row])
+        run_incremental_discovery(
+            "shared-health", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=lambda *_: self.fail("Fresh Catalog must not be called"),
+            pricing_batch=lambda asins, *_: {
+                asin: {"status": "missing"} for asin in asins
+            },
+            fees_batch=lambda *_: self.fail("Missing Pricing must skip Fees"),
+            token_provider=object(), sleep_func=lambda *_: None,
+            catalog_batch_interval=0, pricing_batch_interval=0, fee_batch_interval=0,
+        )
+        listing = next(self.store.iter_candidates("shared-health"))[
+            "amazon_listings"
+        ][0]
+        self.assertEqual(listing["excluded_suppliers"], ["abw"])
 
     def test_completed_job_fragrance_acceptance_fixture(self):
         # Read-only production snapshot distilled from b4b88690...: the test

@@ -14,6 +14,9 @@ from typing import Any, Iterable
 MARKETPLACE_IT = "APJ6JRA9NG5V4"
 TAXONOMY_SCHEMA_VERSION = "amazon_it_qogita_v1"
 BEAUTY_DEPARTMENT_ID = "6198082031"
+MODE_ALL = "all_categories"
+MODE_ONLY_BEAUTY = "only_beauty"
+MODE_MANUAL = "manual_selection"
 
 # Stable Amazon browse-node IDs.  This is intentionally presentation metadata;
 # persisted selections contain only marketplace + node IDs.
@@ -86,6 +89,7 @@ KNOWN_PARENT_IDS = frozenset(QOGITA_CATEGORY_TREE)
 def default_qogita_category_filter() -> dict[str, Any]:
     return {
         "qogita_category_filter_enabled": False,
+        "qogita_category_filter_mode": MODE_ALL,
         "qogita_category_selected_parent_ids": [],
         "qogita_category_child_overrides": {},
         "qogita_category_include_unknown": True,
@@ -118,7 +122,21 @@ def normalize_qogita_category_filter(state: dict[str, Any] | None) -> dict[str, 
         })}
         for parent, value in overrides.items() if str(parent) in KNOWN_PARENT_IDS
     }
+    result["qogita_category_filter_mode"] = qogita_category_filter_mode(state)
     return result
+
+
+def qogita_category_filter_mode(config: dict[str, Any] | None) -> str:
+    """Derive one unambiguous mode while remaining compatible with legacy jobs."""
+    raw = config or {}
+    explicit = str(raw.get("qogita_category_filter_mode") or "").strip()
+    if explicit in {MODE_ALL, MODE_ONLY_BEAUTY, MODE_MANUAL}:
+        return explicit
+    if not bool(raw.get("qogita_category_filter_enabled", False)):
+        return MODE_ALL
+    if bool(raw.get("qogita_category_only_beauty", False)):
+        return MODE_ONLY_BEAUTY
+    return MODE_MANUAL
 
 
 def _classification_chain(leaf: dict[str, Any]) -> list[dict[str, str]]:
@@ -191,9 +209,10 @@ def projection_rows(
 def classification_paths_allowed(
     paths: Iterable[Iterable[str]], config: dict[str, Any] | None,
 ) -> bool:
-    """Conservative allow decision: any allowed path preserves Qogita."""
+    """Apply the explicit Qogita taxonomy mode to structured Amazon paths."""
     normalized = normalize_qogita_category_filter(config)
-    if not normalized["qogita_category_filter_enabled"]:
+    mode = normalized["qogita_category_filter_mode"]
+    if mode == MODE_ALL:
         return True
     materialized = [tuple(str(node) for node in path if node) for path in paths]
     if not materialized:
@@ -202,13 +221,16 @@ def classification_paths_allowed(
     overrides = normalized["qogita_category_child_overrides"]
     for path in materialized:
         path_ids = set(path)
-        if normalized["qogita_category_only_beauty"] and BEAUTY_DEPARTMENT_ID not in path_ids:
+        if mode == MODE_ONLY_BEAUTY:
+            if BEAUTY_DEPARTMENT_ID in path_ids:
+                return True
             continue
         known_on_path = path_ids & KNOWN_PARENT_IDS
-        # Future categories remain included unless Solo Beauty is explicit.
-        if known_on_path and not (known_on_path & selected):
-            continue
+        # Manual selection is an exact whitelist. Structured future categories
+        # remain conservative only in the unrestricted, backward-compatible mode.
         selected_on_path = known_on_path & selected
+        if not selected_on_path:
+            continue
         if any(
             path_ids & set((overrides.get(parent) or {}).get("excluded_ids") or [])
             for parent in selected_on_path

@@ -414,7 +414,7 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         ))
         self.assertFalse(any(row.label == "Nuovo ciclo Discovery" for row in app.button))
         metrics = {row.label: row.value for row in app.metric}
-        self.assertEqual(metrics["Prodotti da valutare"], "3")
+        self.assertEqual(metrics["Universo supplier"], "3 prodotti")
         self.assertNotIn("Dalla cache", metrics)
         self.assertNotIn("Da aggiornare", metrics)
         self.assertNotIn("Nuovi", metrics)
@@ -445,6 +445,9 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
         with patch.object(
             SupplierCatalogStore, "serving_generation_metadata",
             return_value={"serving_snapshot": True, "product_count": 1},
+        ), patch.object(
+            SupplierCatalogStore, "active_identifier_universe",
+            return_value={"total": 89_680, "eligible": 89_680},
         ):
             app = self.discovery_app()
             qogita = next(row for row in app.checkbox if row.label == "Qogita")
@@ -461,10 +464,97 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             )
             self.assertIn("Fragranze e profumi", parents.options)
             self.assertIn("Trucco", parents.options)
+            self.assertIn("Salute e cura della persona", parents.options)
+            self.assertEqual(len(app.expander), 0)
+            detail_labels = {
+                row.label for row in app.checkbox
+                if row.label.startswith("Dettaglia sottocategorie —")
+            }
+            self.assertIn("Dettaglia sottocategorie — Trucco", detail_labels)
+            self.assertIn("Dettaglia sottocategorie — Cura della pelle", detail_labels)
+            rendered = " ".join(
+                [row.value for row in app.markdown]
+                + [row.value for row in app.caption]
+                + [row.label for row in app.checkbox]
+            )
+            self.assertNotIn("keyboard_arrow_right", rendered)
             qogita = next(row for row in app.checkbox if row.label == "Qogita")
             app = qogita.set_value(False).run()
             self.assertFalse(any(
                 row.label == "Tutte le categorie" for row in app.checkbox
+            ))
+
+    def test_qogita_manual_selection_persists_and_uses_qogita_universe_label(self):
+        with patch.object(
+            SupplierCatalogStore, "serving_generation_metadata",
+            return_value={"serving_snapshot": True, "product_count": 89_680},
+        ), patch.object(
+            SupplierCatalogStore, "active_identifier_universe",
+            return_value={"total": 89_680, "eligible": 89_680},
+        ):
+            app = self.discovery_app()
+            app = next(
+                row for row in app.checkbox if row.label == "Tutti"
+            ).set_value(False).run()
+            app = next(
+                row for row in app.checkbox if row.label == "Qogita"
+            ).set_value(True).run()
+            app = next(
+                row for row in app.checkbox if row.label == "Tutte le categorie"
+            ).set_value(False).run()
+            parents = next(
+                row for row in app.multiselect if row.label == "Categorie principali"
+            )
+            selected = {
+                "6306897031": "Cura della pelle",
+                "6306900031": "Trucco",
+                "4327880031": "Bagno e corpo",
+                "1571289031": "Salute e cura della persona",
+            }
+            app = parents.set_value(list(selected)).run()
+            app = next(
+                row for row in app.checkbox
+                if row.label == "Includi prodotti non classificati"
+            ).set_value(False).run()
+            metrics = {row.label: row.value for row in app.metric}
+            self.assertEqual(metrics, {"Universo Qogita": "89.680 prodotti"})
+            parents = next(
+                row for row in app.multiselect if row.label == "Categorie principali"
+            )
+            self.assertEqual(set(parents.value), set(selected))
+            self.assertFalse(next(
+                row for row in app.checkbox
+                if row.label == "Includi prodotti non classificati"
+            ).value)
+            rendered = " ".join(row.value for row in app.caption)
+            for label in selected.values():
+                self.assertIn(label, rendered)
+            self.assertFalse(any("Prodotti da valutare" == row.label for row in app.metric))
+            self.assertTrue(any(
+                row.label == "Trova opportunità" for row in app.button
+            ))
+
+    def test_only_beauty_is_a_distinct_mode_without_manual_parent_selector(self):
+        with patch.object(
+            SupplierCatalogStore, "serving_generation_metadata",
+            return_value={"serving_snapshot": True, "product_count": 1},
+        ):
+            app = self.discovery_app()
+            app = next(
+                row for row in app.checkbox if row.label == "Tutte le categorie"
+            ).set_value(False).run()
+            app = next(
+                row for row in app.checkbox if row.label == "Solo Beauty"
+            ).set_value(True).run()
+            self.assertFalse(any(
+                row.label == "Categorie principali" for row in app.multiselect
+            ))
+            self.assertFalse(any(
+                row.label.startswith("Dettaglia sottocategorie —")
+                for row in app.checkbox
+            ))
+            self.assertTrue(any(
+                "Qogita: solo Beauty" in row.value for row in app.caption
             ))
 
     def test_full_catalog_start_requires_simple_second_confirmation(self):
@@ -517,7 +607,7 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             elapsed = time.monotonic() - started
             self.assertEqual(len(app.exception), 0)
             metrics = {row.label: row.value for row in app.metric}
-            self.assertEqual(metrics, {"Prodotti da valutare": "120.000"})
+            self.assertEqual(metrics, {"Universo supplier": "120.000 prodotti"})
             start = next(
                 row for row in app.button if row.label == "Trova opportunità"
             )

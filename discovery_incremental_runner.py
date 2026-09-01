@@ -23,6 +23,7 @@ from discovery_incremental import (
 )
 from discovery_resources import DiscoveryResourceGovernor, ResourcePause
 from discovery_taxonomy import (
+    MODE_MANUAL,
     apply_qogita_listing_filter,
     normalize_qogita_category_filter,
 )
@@ -133,6 +134,7 @@ def run_incremental_discovery(
     if store.summary(job_id)["phase"] == "catalog_complete":
         processed = 0
         category_filter = normalize_qogita_category_filter(state)
+        category_mode = category_filter["qogita_category_filter_mode"]
         for transformed in store.iter_candidate_batches(job_id, batch_size=250):
             identifiers = [
                 str(candidate.get("canonical_ean") or candidate.get("gtin") or "")
@@ -156,11 +158,13 @@ def run_incremental_discovery(
                         str(value).strip().lower()
                         for value in listing.get("excluded_suppliers") or []
                     }
-                    listing_has_scenario = any(
+                    active_listing_suppliers = {
                         str(scenario.get("supplier") or "").strip().lower()
-                        not in excluded_suppliers
                         for scenario in scenarios
-                    )
+                        if str(scenario.get("supplier") or "").strip().lower()
+                        not in excluded_suppliers
+                    }
+                    listing_has_scenario = bool(active_listing_suppliers)
                     if no_supplier_scenario or not listing_has_scenario:
                         listing["evaluation_status"] = "qogita_category_filtered"
                         listing["exclusion_reason"] = "qogita_category_excluded"
@@ -170,9 +174,25 @@ def run_incremental_discovery(
                         continue
                     bsr = listing.get("bsr_beauty")
                     if listing.get("beauty_status") != "display_group_beauty":
-                        listing["evaluation_status"] = "beauty_filtered"
-                        listing["exclusion_reason"] = "not_beauty_display_group"
-                    elif not isinstance(bsr, int) or isinstance(bsr, bool) or bsr <= 0:
+                        manual_qogita_allowed = (
+                            category_mode == MODE_MANUAL
+                            and "qogita" in active_listing_suppliers
+                        )
+                        if not manual_qogita_allowed:
+                            listing["evaluation_status"] = "beauty_filtered"
+                            listing["exclusion_reason"] = "not_beauty_display_group"
+                            continue
+                        # Manual Qogita selections may intentionally include a
+                        # non-Beauty Amazon department. Preserve the legacy
+                        # display-group gate for every other supplier sharing
+                        # this listing.
+                        excluded_suppliers.update(
+                            supplier for supplier in active_listing_suppliers
+                            if supplier != "qogita"
+                        )
+                        if excluded_suppliers:
+                            listing["excluded_suppliers"] = sorted(excluded_suppliers)
+                    if not isinstance(bsr, int) or isinstance(bsr, bool) or bsr <= 0:
                         listing["evaluation_status"] = "bsr_filtered"
                         listing["exclusion_reason"] = "invalid_bsr"
                     elif not filters["bsr_min"] <= bsr <= filters["bsr_max"]:

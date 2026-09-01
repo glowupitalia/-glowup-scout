@@ -345,12 +345,16 @@ class IncrementalStoreTests(unittest.TestCase):
             "supplier_snapshot_set": {"abw": {"snapshot_id": "snapshot"}},
             "sampled_identifier_count": 3,
             "rotation_scope": "scope", "rotation_cycle_id": 1,
+            "qogita_category_filter_mode": "manual_selection",
             "candidates": [
                 candidate(1, "resolved", 1), candidate(2, "not_found"), candidate(3),
             ],
         }
         legacy.write_text(json.dumps(payload), encoding="utf-8")
         metadata = read_legacy_metadata(legacy)
+        self.assertEqual(
+            metadata["qogita_category_filter_mode"], "manual_selection"
+        )
         summary = self.store.migrate_legacy_checkpoint(legacy, metadata)
         self.assertTrue(legacy.exists())
         self.assertEqual(summary["selected_count"], 3)
