@@ -10,13 +10,17 @@ import hashlib
 import json
 from typing import Any, Iterable
 
+from discovery_category_modes import (
+    MODE_ALL,
+    MODE_MANUAL,
+    MODE_ONLY_BEAUTY,
+    resolve_qogita_category_mode,
+)
+
 
 MARKETPLACE_IT = "APJ6JRA9NG5V4"
 TAXONOMY_SCHEMA_VERSION = "amazon_it_qogita_v1"
 BEAUTY_DEPARTMENT_ID = "6198082031"
-MODE_ALL = "all_categories"
-MODE_ONLY_BEAUTY = "only_beauty"
-MODE_MANUAL = "manual_selection"
 
 # Stable Amazon browse-node IDs.  This is intentionally presentation metadata;
 # persisted selections contain only marketplace + node IDs.
@@ -128,15 +132,7 @@ def normalize_qogita_category_filter(state: dict[str, Any] | None) -> dict[str, 
 
 def qogita_category_filter_mode(config: dict[str, Any] | None) -> str:
     """Derive one unambiguous mode while remaining compatible with legacy jobs."""
-    raw = config or {}
-    explicit = str(raw.get("qogita_category_filter_mode") or "").strip()
-    if explicit in {MODE_ALL, MODE_ONLY_BEAUTY, MODE_MANUAL}:
-        return explicit
-    if not bool(raw.get("qogita_category_filter_enabled", False)):
-        return MODE_ALL
-    if bool(raw.get("qogita_category_only_beauty", False)):
-        return MODE_ONLY_BEAUTY
-    return MODE_MANUAL
+    return resolve_qogita_category_mode(config)
 
 
 def _classification_chain(leaf: dict[str, Any]) -> list[dict[str, str]]:

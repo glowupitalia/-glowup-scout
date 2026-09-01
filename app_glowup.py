@@ -58,9 +58,8 @@ from notifications import EmailConfig, NotificationOutbox
 from discovery_freshness import AmazonFreshnessPolicy, POLICY_VERSION
 from discovery_freshness import DiscoveryAmazonCache
 from discovery_incremental import DiscoveryIncrementalStore
+from discovery_category_modes import MODE_MANUAL, MODE_ONLY_BEAUTY
 from discovery_taxonomy import (
-    MODE_MANUAL,
-    MODE_ONLY_BEAUTY,
     QOGITA_CATEGORY_TREE,
     default_qogita_category_filter,
 )

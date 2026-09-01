@@ -22,8 +22,8 @@ from discovery_incremental import (
     LightweightCheckpointStore,
 )
 from discovery_resources import DiscoveryResourceGovernor, ResourcePause
+from discovery_category_modes import MODE_MANUAL
 from discovery_taxonomy import (
-    MODE_MANUAL,
     apply_qogita_listing_filter,
     normalize_qogita_category_filter,
 )
