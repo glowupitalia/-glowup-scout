@@ -60,6 +60,7 @@ from discovery_freshness import DiscoveryAmazonCache
 from discovery_incremental import DiscoveryIncrementalStore
 from discovery_category_modes import MODE_MANUAL, MODE_ONLY_BEAUTY
 from discovery_taxonomy import (
+    BEAUTY_PARENT_IDS,
     QOGITA_CATEGORY_TREE,
     default_qogita_category_filter,
 )
@@ -1626,16 +1627,45 @@ elif ui_state == "discovery":
                     help="Si applica esclusivamente agli scenari Qogita.",
                 )
                 if only_beauty:
-                    selected_parent_ids = []
+                    parent_options = [
+                        value for value in QOGITA_CATEGORY_TREE
+                        if value in BEAUTY_PARENT_IDS
+                    ]
+                    parent_key = "discovery_qogita_beauty_category_parents"
+                    parent_saved_key = f"{parent_key}_saved"
+                    if (
+                        parent_key not in st.session_state
+                        and parent_saved_key in st.session_state
+                    ):
+                        st.session_state[parent_key] = list(
+                            st.session_state.get(parent_saved_key) or []
+                        )
+                    selected_parent_ids = st.multiselect(
+                        "Categorie Beauty",
+                        options=parent_options,
+                        default=parent_options,
+                        format_func=lambda value: QOGITA_CATEGORY_TREE[value]["label"],
+                        key=parent_key,
+                    )
                 else:
                     parent_options = list(QOGITA_CATEGORY_TREE)
+                    parent_key = "discovery_qogita_category_parents_0"
+                    parent_saved_key = "discovery_qogita_manual_category_parents_saved"
+                    if (
+                        parent_key not in st.session_state
+                        and parent_saved_key in st.session_state
+                    ):
+                        st.session_state[parent_key] = list(
+                            st.session_state.get(parent_saved_key) or []
+                        )
                     selected_parent_ids = st.multiselect(
                         "Categorie principali",
                         options=parent_options,
                         default=parent_options,
                         format_func=lambda value: QOGITA_CATEGORY_TREE[value]["label"],
-                        key="discovery_qogita_category_parents_0",
+                        key=parent_key,
                     )
+                st.session_state[parent_saved_key] = list(selected_parent_ids)
                 include_unknown = st.checkbox(
                     "Includi prodotti non classificati", value=True,
                     key="discovery_qogita_include_unknown",
@@ -1645,7 +1675,10 @@ elif ui_state == "discovery":
                     children = QOGITA_CATEGORY_TREE[parent_id]["children"]
                     if not children:
                         continue
-                    selection_key = f"discovery_qogita_excluded_{parent_id}"
+                    mode_namespace = "beauty" if only_beauty else "manual"
+                    selection_key = (
+                        f"discovery_qogita_{mode_namespace}_excluded_{parent_id}"
+                    )
                     saved_key = f"{selection_key}_saved"
                     if selection_key in st.session_state:
                         st.session_state[saved_key] = list(
@@ -1655,7 +1688,9 @@ elif ui_state == "discovery":
                         "Dettaglia sottocategorie — "
                         f"{QOGITA_CATEGORY_TREE[parent_id]['label']}",
                         value=False,
-                        key=f"discovery_qogita_detail_{parent_id}",
+                        key=(
+                            f"discovery_qogita_{mode_namespace}_detail_{parent_id}"
+                        ),
                     )
                     if show_children:
                         if selection_key not in st.session_state:
@@ -1682,15 +1717,28 @@ elif ui_state == "discovery":
                     "qogita_category_child_overrides": child_overrides,
                     "qogita_category_include_unknown": include_unknown,
                     "qogita_category_only_beauty": only_beauty,
+                    "qogita_category_beauty_selection_customized": (
+                        only_beauty
+                        and set(selected_parent_ids) != set(BEAUTY_PARENT_IDS)
+                    ),
                 })
                 selected_labels = [QOGITA_CATEGORY_TREE[value]["label"]
                                    for value in selected_parent_ids]
-                selection_summary = "solo Beauty" if only_beauty else (
-                    ", ".join(selected_labels)
-                    if 0 < len(selected_labels) <= 4
-                    else f"{len(selected_labels)} categorie selezionate"
-                    if selected_labels else "nessuna categoria selezionata"
-                )
+                if only_beauty and set(selected_parent_ids) == set(BEAUTY_PARENT_IDS):
+                    selection_summary = "solo Beauty"
+                elif 0 < len(selected_labels) <= 4:
+                    selection_summary = ", ".join(selected_labels)
+                elif selected_labels:
+                    selection_summary = (
+                        f"{len(selected_labels)} categorie Beauty selezionate"
+                        if only_beauty
+                        else f"{len(selected_labels)} categorie selezionate"
+                    )
+                else:
+                    selection_summary = (
+                        "nessuna categoria Beauty selezionata"
+                        if only_beauty else "nessuna categoria selezionata"
+                    )
                 st.caption(
                     "Qogita: " + selection_summary
                     + (" · non classificati inclusi" if include_unknown else "")

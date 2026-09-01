@@ -98,6 +98,7 @@ def default_qogita_category_filter() -> dict[str, Any]:
         "qogita_category_child_overrides": {},
         "qogita_category_include_unknown": True,
         "qogita_category_only_beauty": False,
+        "qogita_category_beauty_selection_customized": False,
         "qogita_taxonomy_schema_version": TAXONOMY_SCHEMA_VERSION,
         "qogita_category_marketplace_id": MARKETPLACE_IT,
     }
@@ -114,6 +115,9 @@ def normalize_qogita_category_filter(state: dict[str, Any] | None) -> dict[str, 
     )
     result["qogita_category_include_unknown"] = bool(
         raw.get("qogita_category_include_unknown", True)
+    )
+    result["qogita_category_beauty_selection_customized"] = bool(
+        raw.get("qogita_category_beauty_selection_customized", False)
     )
     result["qogita_category_selected_parent_ids"] = sorted({
         str(value) for value in raw.get("qogita_category_selected_parent_ids") or []
@@ -218,9 +222,22 @@ def classification_paths_allowed(
     for path in materialized:
         path_ids = set(path)
         if mode == MODE_ONLY_BEAUTY:
-            if BEAUTY_DEPARTMENT_ID in path_ids:
+            if BEAUTY_DEPARTMENT_ID not in path_ids:
+                continue
+            # Legacy Only Beauty jobs did not persist parent selections. They
+            # remain permissive within the Beauty department until the user
+            # explicitly customizes the dedicated Beauty selection.
+            if not normalized["qogita_category_beauty_selection_customized"]:
                 return True
-            continue
+            selected_on_path = path_ids & selected & BEAUTY_PARENT_IDS
+            if not selected_on_path:
+                continue
+            if any(
+                path_ids & set((overrides.get(parent) or {}).get("excluded_ids") or [])
+                for parent in selected_on_path
+            ):
+                continue
+            return True
         known_on_path = path_ids & KNOWN_PARENT_IDS
         # Manual selection is an exact whitelist. Structured future categories
         # remain conservative only in the unrestricted, backward-compatible mode.

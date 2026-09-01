@@ -56,7 +56,10 @@ def taxonomy_listing(asin="ASIN1", leaf=LIPSTICK, parent=MAKEUP):
     }
 
 
-def config(*, parents=(MAKEUP,), excluded=(), only_beauty=False, unknown=True):
+def config(
+    *, parents=(MAKEUP,), excluded=(), only_beauty=False, unknown=True,
+    beauty_customized=False,
+):
     return {
         "qogita_category_filter_enabled": True,
         "qogita_category_selected_parent_ids": list(parents),
@@ -65,6 +68,7 @@ def config(*, parents=(MAKEUP,), excluded=(), only_beauty=False, unknown=True):
         } if excluded else {},
         "qogita_category_include_unknown": unknown,
         "qogita_category_only_beauty": only_beauty,
+        "qogita_category_beauty_selection_customized": beauty_customized,
     }
 
 
@@ -159,6 +163,42 @@ class QogitaTaxonomyTests(unittest.TestCase):
         self.assertFalse(classification_paths_allowed(
             [], config(parents=(MAKEUP,), only_beauty=True, unknown=False),
         ))
+
+    def test_only_beauty_customized_selection_is_an_exact_beauty_whitelist(self):
+        selected = (SKINCARE, MAKEUP, BATH_BODY)
+        subset = config(
+            parents=selected, only_beauty=True, beauty_customized=True,
+        )
+        for classification_id in selected:
+            self.assertTrue(classification_paths_allowed(
+                [[BEAUTY_DEPARTMENT_ID, classification_id]], subset,
+            ))
+        for classification_id in (FRAGRANCE, HAIR, NAIL):
+            self.assertFalse(classification_paths_allowed(
+                [[BEAUTY_DEPARTMENT_ID, classification_id]], subset,
+            ))
+        self.assertFalse(classification_paths_allowed(
+            [[HEALTH]], subset,
+        ))
+
+    def test_only_beauty_customized_selection_honors_child_overrides(self):
+        subset = config(
+            parents=(MAKEUP,), excluded=(LIPSTICK,), only_beauty=True,
+            beauty_customized=True,
+        )
+        self.assertFalse(classification_paths_allowed(
+            [[BEAUTY_DEPARTMENT_ID, MAKEUP, LIPSTICK]], subset,
+        ))
+        self.assertTrue(classification_paths_allowed(
+            [[BEAUTY_DEPARTMENT_ID, MAKEUP, "6307028031"]], subset,
+        ))
+
+    def test_only_beauty_legacy_empty_selection_defaults_to_all_beauty(self):
+        legacy = config(parents=(), only_beauty=True)
+        for classification_id in (SKINCARE, MAKEUP, FRAGRANCE, HAIR, NAIL):
+            self.assertTrue(classification_paths_allowed(
+                [[BEAUTY_DEPARTMENT_ID, classification_id]], legacy,
+            ))
 
     def test_nicola_manual_selection_is_an_exact_structured_whitelist(self):
         selected = (SKINCARE, MAKEUP, BATH_BODY, HEALTH)

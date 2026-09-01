@@ -534,7 +534,7 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
                 row.label == "Trova opportunità" for row in app.button
             ))
 
-    def test_only_beauty_is_a_distinct_mode_without_manual_parent_selector(self):
+    def test_only_beauty_shows_all_beauty_categories_and_allows_a_subset(self):
         with patch.object(
             SupplierCatalogStore, "serving_generation_metadata",
             return_value={"serving_snapshot": True, "product_count": 1},
@@ -546,16 +546,74 @@ class DiscoveryUiConfigurationTests(unittest.TestCase):
             app = next(
                 row for row in app.checkbox if row.label == "Solo Beauty"
             ).set_value(True).run()
-            self.assertFalse(any(
-                row.label == "Categorie principali" for row in app.multiselect
-            ))
-            self.assertFalse(any(
-                row.label.startswith("Dettaglia sottocategorie —")
-                for row in app.checkbox
-            ))
+            beauty = next(
+                row for row in app.multiselect if row.label == "Categorie Beauty"
+            )
+            beauty_ids = {
+                "4327902031", "6306897031", "6306900031", "6306898031",
+                "4327880031", "6306899031", "6306896031", "27088076031",
+            }
+            self.assertEqual(set(beauty.value), beauty_ids)
+            self.assertNotIn("Salute e cura della persona", beauty.options)
             self.assertTrue(any(
                 "Qogita: solo Beauty" in row.value for row in app.caption
             ))
+            subset = ["6306897031", "6306900031", "4327880031"]
+            app = beauty.set_value(subset).run()
+            beauty = next(
+                row for row in app.multiselect if row.label == "Categorie Beauty"
+            )
+            self.assertEqual(set(beauty.value), set(subset))
+            detail_labels = {
+                row.label for row in app.checkbox
+                if row.label.startswith("Dettaglia sottocategorie —")
+            }
+            self.assertIn("Dettaglia sottocategorie — Trucco", detail_labels)
+            self.assertIn("Dettaglia sottocategorie — Cura della pelle", detail_labels)
+            self.assertFalse(any(
+                row.label == "Categorie principali" for row in app.multiselect
+            ))
+            rendered = " ".join(
+                [row.value for row in app.caption]
+                + [row.label for row in app.checkbox]
+            )
+            self.assertNotIn("keyboard_arrow_right", rendered)
+            self.assertTrue(any(
+                row.label == "Trova opportunità" for row in app.button
+            ))
+
+    def test_manual_and_only_beauty_widget_state_are_isolated(self):
+        with patch.object(
+            SupplierCatalogStore, "serving_generation_metadata",
+            return_value={"serving_snapshot": True, "product_count": 89_680},
+        ), patch.object(
+            SupplierCatalogStore, "active_identifier_universe",
+            return_value={"total": 89_680, "eligible": 89_680},
+        ):
+            app = self.discovery_app()
+            app = next(
+                row for row in app.checkbox if row.label == "Tutte le categorie"
+            ).set_value(False).run()
+            manual = next(
+                row for row in app.multiselect if row.label == "Categorie principali"
+            )
+            manual_selection = ["1571289031", "6306897031"]
+            app = manual.set_value(manual_selection).run()
+            app = next(
+                row for row in app.checkbox if row.label == "Solo Beauty"
+            ).set_value(True).run()
+            beauty = next(
+                row for row in app.multiselect if row.label == "Categorie Beauty"
+            )
+            self.assertNotIn("1571289031", beauty.value)
+            app = beauty.set_value(["6306897031"]).run()
+            app = next(
+                row for row in app.checkbox if row.label == "Solo Beauty"
+            ).set_value(False).run()
+            manual = next(
+                row for row in app.multiselect if row.label == "Categorie principali"
+            )
+            self.assertEqual(set(manual.value), set(manual_selection))
 
     def test_full_catalog_start_requires_simple_second_confirmation(self):
         registry = DiscoveryJobRegistry()

@@ -257,6 +257,7 @@ def read_legacy_metadata(path: str | Path) -> dict[str, Any]:
         "qogita_category_selected_parent_ids",
         "qogita_category_child_overrides",
         "qogita_category_include_unknown", "qogita_category_only_beauty",
+        "qogita_category_beauty_selection_customized",
         "qogita_taxonomy_schema_version", "qogita_category_marketplace_id",
     )
     decoder = json.JSONDecoder()
