@@ -67,7 +67,10 @@ class DiscoveryJobRegistryTests(unittest.TestCase):
         state = self.state()
         self.registry.register_checkpoint(state)
         self.assertTrue(self.registry.claim(state["job_id"], pid=os.getpid()))
-        phases = ("preparing", "catalog", "pricing", "competition", "fees", "economics")
+        phases = (
+            "preparing", "preparing_cache", "catalog", "pricing",
+            "competition", "fees", "economics",
+        )
         for index, phase in enumerate(phases, start=1):
             self.registry.heartbeat(
                 state["job_id"], pid=os.getpid(), phase=phase,

@@ -211,7 +211,11 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
                 run_budget=state.get("run_budget"), progress=progress,
             )
         if incremental and result.get("status") == "completed":
-            amazon_cache.index_completed_jobs()
+            amazon_cache.index_completed_jobs(
+                progress=lambda _phase, _current, _total: registry.heartbeat(
+                    job_id, pid=pid,
+                )
+            )
             # Persist a small hand-off and let a clean interpreter perform the
             # export.  The computation process can then exit and the OS releases
             # every Catalog/economics object before workbook generation starts.

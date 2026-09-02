@@ -37,6 +37,15 @@ class DiscoveryUiStateTests(unittest.TestCase):
         self.assertFalse(progress["numeric"])
         self.assertIsNone(progress["fraction"])
 
+    def test_preparing_cache_uses_existing_progress_model(self):
+        progress = discovery_phase_progress({
+            "status": "running", "phase": "preparing_cache",
+            "progress_current": 500, "progress_total": 1_000,
+        })
+        self.assertEqual(progress["phase_key"], "preparing")
+        self.assertEqual(progress["progress_label"], "Preparazione cache Amazon")
+        self.assertEqual(progress["fraction"], 0.5)
+
     def test_phase_progress_and_step_indicator(self):
         runtime = {
             "status": "running", "phase": "fees",

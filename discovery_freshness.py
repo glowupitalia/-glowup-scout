@@ -7,6 +7,7 @@ per-job rows and can be rebuilt idempotently without changing historical jobs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -208,23 +209,105 @@ class DiscoveryAmazonCache:
                     "ALTER TABLE discovery_amazon_cache ADD COLUMN freshness_json TEXT NOT NULL DEFAULT '{}'"
                 )
 
-    def index_completed_jobs(self) -> int:
+    @staticmethod
+    def _source_revision(connection, job_id: str) -> tuple[str, str, int, list]:
+        """Return a stable revision of only the rows used to build the cache."""
+        sources = {}
+        for name, table, predicate in (
+            ("items", "discovery_job_items", " AND catalog_status IS NOT NULL"),
+            ("catalog", "discovery_catalog_results", ""),
+            ("listings", "discovery_listings", ""),
+        ):
+            row = connection.execute(
+                f"SELECT COUNT(*),COALESCE(MAX(updated_at),'') FROM {table} "
+                f"WHERE job_id=?{predicate}",
+                (job_id,),
+            ).fetchone()
+            sources[name] = {"count": int(row[0]), "updated_at": str(row[1])}
+        observation_rows = connection.execute(
+            """SELECT observation_id,observation_json,updated_at
+               FROM discovery_observations WHERE job_id=?""",
+            (job_id,),
+        ).fetchall()
+        sources["observations"] = {
+            "count": len(observation_rows),
+            "updated_at": max(
+                (str(row["updated_at"]) for row in observation_rows), default="",
+            ),
+        }
+        payload = json.dumps(sources, sort_keys=True, separators=(",", ":"))
+        token = "cache-v2:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        latest = max(value["updated_at"] for value in sources.values())
+        return token, latest, sources["items"]["count"], observation_rows
+
+    @staticmethod
+    def _legacy_marker_covers_source(marker, latest_source_update: str) -> bool:
+        """Allow an indexed legacy marker to upgrade after metadata-only updates."""
+        if not marker or str(marker["source_updated_at"]).startswith("cache-v2:"):
+            return False
+        return bool(
+            latest_source_update
+            and marker["indexed_at"]
+            and latest_source_update <= str(marker["indexed_at"])
+        )
+
+    def index_completed_jobs(self, *, progress=None, batch_size: int = 500) -> int:
         """Index completed jobs idempotently; historical payload rows stay untouched."""
         self.initialize()
         indexed = 0
         observed = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         with self.store._connect() as connection:
             jobs = connection.execute(
-                """SELECT job_id,updated_at FROM discovery_incremental_jobs job
-                   WHERE status='completed' AND NOT EXISTS (
-                     SELECT 1 FROM discovery_amazon_cache_indexed_jobs cache_job
-                     WHERE cache_job.source_job_id=job.job_id
-                       AND cache_job.source_updated_at=job.updated_at
-                   ) ORDER BY updated_at"""
+                """SELECT job_id,updated_at FROM discovery_incremental_jobs
+                   WHERE status='completed' ORDER BY updated_at"""
             ).fetchall()
-        for job in jobs:
+            markers = {
+                str(row["source_job_id"]): row for row in connection.execute(
+                    "SELECT * FROM discovery_amazon_cache_indexed_jobs"
+                )
+            }
+            pending_jobs = []
+            marker_upgrades = []
+            total = 0
+            for job in jobs:
+                job_id = str(job["job_id"])
+                revision, latest_source_update, item_count, observation_rows = (
+                    self._source_revision(connection, job_id)
+                )
+                marker = markers.get(job_id)
+                if marker and str(marker["source_updated_at"]) == revision:
+                    continue
+                if self._legacy_marker_covers_source(marker, latest_source_update):
+                    marker_upgrades.append((revision, observed, job_id))
+                    continue
+                pending_jobs.append((job, revision, item_count, observation_rows))
+                total += item_count
+            if marker_upgrades:
+                connection.executemany(
+                    """UPDATE discovery_amazon_cache_indexed_jobs
+                       SET source_updated_at=?,indexed_at=? WHERE source_job_id=?""",
+                    marker_upgrades,
+                )
+                connection.commit()
+        completed = 0
+        if progress is not None and pending_jobs:
+            progress("preparing_cache", completed, total)
+        for job, revision, _item_count, observation_rows in pending_jobs:
             job_id = str(job["job_id"])
             with self.store._connect() as connection:
+                observations = []
+                observations_by_id = {}
+                observations_by_pair = {}
+                for observation_row in observation_rows:
+                    observation = json.loads(observation_row["observation_json"])
+                    observations.append((observation_row, observation))
+                    observation_id = str(observation_row["observation_id"] or "")
+                    if observation_id:
+                        observations_by_id[observation_id] = observation
+                    identifier = str(observation.get("canonical_ean") or "")
+                    asin = str(observation.get("asin") or "")
+                    if identifier and asin:
+                        observations_by_pair[(identifier, asin)] = observation
                 rows = connection.execute(
                     """SELECT i.canonical_identifier,i.catalog_status,c.updated_at
                        FROM discovery_job_items i JOIN discovery_catalog_results c
@@ -241,20 +324,13 @@ class DiscoveryAmazonCache:
                             (job_id, identifier),
                         )
                     ]
-                    observation_rows = connection.execute(
-                        """SELECT observation_json FROM discovery_observations
-                           WHERE job_id=? AND json_extract(observation_json,'$.canonical_ean')=?""",
-                        (job_id, identifier),
-                    ).fetchall()
-                    observed_by_asin = {}
-                    for observation_row in observation_rows:
-                        observation = json.loads(observation_row["observation_json"])
-                        asin = str(observation.get("asin") or "")
-                        if asin:
-                            observed_by_asin[asin] = observation
                     for listing in listings:
                         listing.setdefault("catalog_observed_at", row["updated_at"])
-                        observation = observed_by_asin.get(str(listing.get("asin") or ""))
+                        asin = str(listing.get("asin") or "")
+                        observation_id = str(listing.get("amazon_observation_id") or "")
+                        observation = observations_by_id.get(observation_id)
+                        if observation is None:
+                            observation = observations_by_pair.get((identifier, asin))
                         if observation:
                             stamp = observation.get("observed_at")
                             listing.setdefault("pricing_observed_at", stamp)
@@ -314,12 +390,12 @@ class DiscoveryAmazonCache:
                          json.dumps(freshness, sort_keys=True, separators=(",", ":")), observed),
                     )
                     indexed += 1
-                observations = connection.execute(
-                    "SELECT observation_id,observation_json,updated_at FROM discovery_observations WHERE job_id=?",
-                    (job_id,),
-                ).fetchall()
-                for row in observations:
-                    value = json.loads(row["observation_json"])
+                    completed += 1
+                    if progress is not None and (
+                        completed % max(1, int(batch_size)) == 0 or completed == total
+                    ):
+                        progress("preparing_cache", completed, total)
+                for observation_index, (row, value) in enumerate(observations, start=1):
                     key = fee_cache_key(
                         value.get("asin"), value.get("reference_price"), value.get("currency") or "EUR",
                     )
@@ -341,15 +417,19 @@ class DiscoveryAmazonCache:
                         (key, job_id, row["observation_id"], value["fee_status"], fee_at,
                          observed),
                     )
+                    if progress is not None and observation_index % max(1, int(batch_size)) == 0:
+                        progress("preparing_cache", completed, total)
                 connection.execute(
                     """INSERT INTO discovery_amazon_cache_indexed_jobs
                        (source_job_id,source_updated_at,indexed_at) VALUES (?,?,?)
                        ON CONFLICT(source_job_id) DO UPDATE SET
                          source_updated_at=excluded.source_updated_at,
                          indexed_at=excluded.indexed_at""",
-                    (job_id, job["updated_at"], observed),
+                    (job_id, revision, observed),
                 )
                 connection.commit()
+        if progress is not None and pending_jobs:
+            progress("preparing_cache", total, total)
         return indexed
 
     def get(self, identifier: str) -> dict[str, Any] | None:

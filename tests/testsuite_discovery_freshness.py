@@ -78,8 +78,11 @@ class FakeCache:
         self.values = values
         self.index_calls = 0
 
-    def index_completed_jobs(self):
+    def index_completed_jobs(self, *, progress=None):
         self.index_calls += 1
+        if progress is not None:
+            progress("preparing_cache", 0, len(self.values))
+            progress("preparing_cache", len(self.values), len(self.values))
 
     def get_many(self, identifiers):
         for identifier in identifiers:
@@ -275,6 +278,188 @@ class PlannerIntegrationTests(unittest.TestCase):
         candidate = next(iter(prepared["candidates"]))
         self.assertEqual(candidate["catalog_status"], "resolved")
         self.assertNotIn("pricing_status", candidate["amazon_listings"][0])
+
+    def test_cache_index_progress_flows_through_preparation_callback(self):
+        events = []
+        cache = FakeCache({self.identifiers[0]: resolved_cache()})
+        prepare_incremental_job(
+            self.state("progress", budget=1),
+            supplier_store=FakeSupplierStore(self.identifiers[:1]),
+            rotation_store=self.rotation, amazon_cache=cache,
+            freshness_policy=AmazonFreshnessPolicy(),
+            progress=lambda phase, current, total: events.append(
+                (phase, current, total)
+            ),
+        )
+        cache_events = [row for row in events if row[0] == "preparing_cache"]
+        self.assertEqual(cache_events, [
+            ("preparing_cache", 0, 1), ("preparing_cache", 1, 1),
+        ])
+
+
+class CacheIndexRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.store = DiscoveryIncrementalStore(
+            Path(self.temporary.name) / "incremental.sqlite3"
+        )
+        self.rotation = DiscoveryRotationStore(
+            Path(self.temporary.name) / "rotation.sqlite3"
+        )
+        self.identifiers = [valid_gtin(value) for value in range(3)]
+        candidates = []
+        for index, identifier in enumerate(self.identifiers):
+            listing = {
+                "asin": f"B{index:09d}", "bsr_beauty": 100 + index,
+                "pricing_status": "success", "competition_status": "passed",
+                "reference_price": 20 + index, "currency": "EUR",
+                "catalog_observed_at": FRESH,
+            }
+            if index == 0:
+                listing["amazon_observation_id"] = "observation-modern"
+            candidates.append({
+                "canonical_ean": identifier, "gtin": identifier,
+                "catalog_status": "resolved", "scenarios": [],
+                "amazon_listings": [listing],
+            })
+        self.store.create_job(
+            {"job_id": "source", "status": "completed", "phase": "completed",
+             "filters": {}},
+            candidates,
+        )
+        self.store.upsert_observations("source", [
+            {
+                "observation_id": "observation-modern",
+                "canonical_ean": self.identifiers[0], "asin": "B000000000",
+                "reference_price": 20, "currency": "EUR",
+                "fee_status": "valid", "observed_at": FRESH,
+                "fee_last_attempt_at": FRESH,
+            },
+            {
+                "observation_id": "observation-legacy",
+                "canonical_ean": self.identifiers[1], "asin": "B000000001",
+                "reference_price": 21, "currency": "EUR",
+                "fee_status": "unavailable", "observed_at": FRESH,
+                "fee_last_attempt_at": FRESH,
+            },
+        ])
+
+    @staticmethod
+    def state(job_id, budget="all", margin=20):
+        return {
+            "job_id": job_id,
+            "status": "initialized", "phase": "initialized",
+            "selected_suppliers": ["qogita"], "run_budget": budget,
+            "discovery_planner_version": "automatic_amazon_freshness_v1",
+            "filters": {
+                "bsr_min": 0, "bsr_max": 20000, "max_fba_sellers": 5,
+                "max_total_sellers": 10, "minimum_margin": margin,
+                "minimum_qogita_stock": 100,
+            },
+        }
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _marker(self):
+        with self.store._connect() as connection:
+            return connection.execute(
+                "SELECT * FROM discovery_amazon_cache_indexed_jobs "
+                "WHERE source_job_id='source'"
+            ).fetchone()
+
+    def test_observations_are_selected_once_and_both_lookup_paths_are_equivalent(self):
+        statements = []
+        original = self.store._new_connection
+
+        def traced_connection():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        self.store._new_connection = traced_connection
+        progress = []
+        cache = DiscoveryAmazonCache(self.store)
+        self.assertEqual(
+            cache.index_completed_jobs(
+                progress=lambda *row: progress.append(row), batch_size=2,
+            ),
+            3,
+        )
+        payload_selects = [
+            sql for sql in statements
+            if "SELECT observation_id,observation_json,updated_at" in sql
+            and "FROM discovery_observations" in sql
+        ]
+        self.assertEqual(len(payload_selects), 1)
+        modern = cache.get(self.identifiers[0])
+        legacy = cache.get(self.identifiers[1])
+        without_observation = cache.get(self.identifiers[2])
+        self.assertEqual(modern["fee_status"], "valid")
+        self.assertEqual(legacy["fee_status"], "unavailable")
+        self.assertIsNone(without_observation["fee_status"])
+        self.assertEqual(modern["pricing_observed_at"], FRESH)
+        self.assertEqual(legacy["competition_observed_at"], FRESH)
+        currents = [row[1] for row in progress]
+        self.assertEqual(currents, sorted(currents))
+        self.assertEqual(progress[0], ("preparing_cache", 0, 3))
+        self.assertEqual(progress[-1], ("preparing_cache", 3, 3))
+        self.assertIn(("preparing_cache", 2, 3), progress)
+        with self.store._connect() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM discovery_amazon_cache").fetchone()[0],
+                3,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM discovery_amazon_fee_cache").fetchone()[0],
+                2,
+            )
+
+    def test_stable_revision_ignores_job_only_updates_and_remains_idempotent(self):
+        cache = DiscoveryAmazonCache(self.store)
+        self.assertEqual(cache.index_completed_jobs(), 3)
+        marker = str(self._marker()["source_updated_at"])
+        self.assertTrue(marker.startswith("cache-v2:"))
+        self.store.set_phase("source", "export_pending", status="completed")
+        self.store.add_checkpoint_bytes("source", 123)
+        self.store.set_phase("source", "completed", status="completed")
+        self.assertEqual(cache.index_completed_jobs(), 0)
+        self.assertEqual(str(self._marker()["source_updated_at"]), marker)
+        with self.store._connect() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM discovery_amazon_cache").fetchone()[0],
+                3,
+            )
+
+    def test_each_cache_relevant_dataset_changes_revision_and_reindexes(self):
+        cache = DiscoveryAmazonCache(self.store)
+        self.assertEqual(cache.index_completed_jobs(), 3)
+        updates = (
+            ("discovery_catalog_results", "diagnostics_json='{}'"),
+            ("discovery_listings", "listing_json=listing_json"),
+            ("discovery_observations", "observation_json=observation_json"),
+        )
+        for offset, (table, assignment) in enumerate(updates, start=1):
+            with self.store._connect() as connection:
+                connection.execute(
+                    f"UPDATE {table} SET {assignment},updated_at=? WHERE job_id='source'",
+                    (f"2099-01-01T00:00:0{offset}Z",),
+                )
+                connection.commit()
+            self.assertEqual(cache.index_completed_jobs(), 3)
+
+    def test_legacy_marker_is_upgraded_without_false_reindex(self):
+        cache = DiscoveryAmazonCache(self.store)
+        self.assertEqual(cache.index_completed_jobs(), 3)
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE discovery_amazon_cache_indexed_jobs "
+                "SET source_updated_at='legacy-job-updated-at',"
+                "indexed_at='2099-01-01T00:00:00Z' WHERE source_job_id='source'"
+            )
+            connection.commit()
+        self.assertEqual(cache.index_completed_jobs(), 0)
+        self.assertTrue(str(self._marker()["source_updated_at"]).startswith("cache-v2:"))
 
     def test_cache_index_is_additive_and_preserves_historical_job(self):
         root = Path(self.temporary.name)

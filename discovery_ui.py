@@ -74,6 +74,7 @@ def discovery_phase_label(runtime: dict[str, Any], persisted_phase: str | None =
 
 def discovery_phase_progress(runtime: dict[str, Any]) -> dict[str, Any]:
     key = discovery_phase_key(runtime)
+    raw_phase = str(runtime.get("phase") or "").lower()
     current = max(0, int(runtime.get("progress_current") or 0))
     total = max(0, int(runtime.get("progress_total") or 0))
     if key == "completed":
@@ -90,6 +91,8 @@ def discovery_phase_progress(runtime: dict[str, Any]) -> dict[str, Any]:
         "export": "Righe Excel elaborate",
         "completed": "Prodotti valutati",
     }
+    if raw_phase == "preparing_cache":
+        labels["preparing"] = "Preparazione cache Amazon"
     return {
         "phase_key": key,
         "phase_label": _PHASE_LABELS[key],

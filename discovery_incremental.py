@@ -1731,7 +1731,7 @@ def prepare_incremental_job(
         policy = freshness_policy or AmazonFreshnessPolicy.from_environment()
         if amazon_cache is None:
             amazon_cache = DiscoveryAmazonCache(DiscoveryIncrementalStore())
-        amazon_cache.index_completed_jobs()
+        amazon_cache.index_completed_jobs(progress=progress)
         action_order = {
             PlanAction.NEW_LOOKUP.value: 0,
             PlanAction.REFRESH_CATALOG.value: 1,
