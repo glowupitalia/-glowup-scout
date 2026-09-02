@@ -1,11 +1,14 @@
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from supplier_weekly import (
-    IncrementalWeeklyHandler, SupplierRatePolicy, WeeklySupplierOrchestrator, WeeklySupplierStore,
-    next_weekly_refresh, schedule_key,
+    IncrementalWeeklyHandler, QOGITA_KOREAN_BEAUTY_STEP, SupplierRatePolicy,
+    WEEKLY_STEPS, WEEKLY_SUPPLIERS, WeeklySupplierOrchestrator,
+    WeeklySupplierStore, next_weekly_refresh, schedule_key,
 )
 from supplier_incremental import SupplierIncrementalStore
 from supplier_weekly_adapters import (
@@ -52,21 +55,32 @@ class WeeklyStoreTests(unittest.TestCase):
         def qudo(**kwargs):
             calls.append("qudo")
             return {"status": "success", "new": 2, "baseline_after": "q2"}
+        def korean_beauty(**kwargs):
+            calls.append(QOGITA_KOREAN_BEAUTY_STEP)
+            return {"status": "success", "baseline_after": "kb2"}
         result = WeeklySupplierOrchestrator(
-            {"umma": umma, "qudo": qudo}, store=self.store,
-            baseline_provider=lambda supplier: {"abw": "a1", "umma": "u1", "qudo": "q1"}[supplier],
+            {"umma": umma, "qudo": qudo,
+             QOGITA_KOREAN_BEAUTY_STEP: korean_beauty}, store=self.store,
+            baseline_provider=lambda supplier: {
+                "abw": "a1", "umma": "u1", "qudo": "q1",
+                QOGITA_KOREAN_BEAUTY_STEP: "kb1",
+            }[supplier],
         ).run()
         states = {row["supplier"]: row for row in result["suppliers"]}
-        self.assertEqual(calls, ["umma", "qudo"])
+        self.assertEqual(calls, ["umma", "qudo", QOGITA_KOREAN_BEAUTY_STEP])
         self.assertEqual(states["abw"]["status"], "waiting_for_source")
         self.assertEqual(states["abw"]["baseline_after"], "a1")
         self.assertEqual(states["umma"]["promotion_result"], "baseline_preserved")
         self.assertEqual(states["qudo"]["baseline_after"], "q2")
+        self.assertEqual(states[QOGITA_KOREAN_BEAUTY_STEP]["baseline_after"], "kb2")
         self.assertEqual(result["status"], "partial_success")
 
     def test_rate_policy_is_persisted(self):
         policy = SupplierRatePolicy(reconciliation_days=60, reconciliation_budget=12)
-        handlers = {supplier: (lambda **kwargs: {"status": "success"}) for supplier in ("abw", "umma", "qudo")}
+        handlers = {
+            supplier: (lambda **kwargs: {"status": "success"})
+            for supplier in WEEKLY_STEPS
+        }
         result = WeeklySupplierOrchestrator(
             handlers, store=self.store, policies={"qudo": policy},
         ).run(sources={"abw": "catalog.xlsx"})
@@ -87,6 +101,18 @@ class WeeklyStoreTests(unittest.TestCase):
         value = json.loads(raw)
         self.assertEqual(value["scheduled_local_date"], "2026-03-29")
         self.assertEqual(value["schedule_key"], "2026-03-29-weekly-supplier-sync")
+
+    def test_second_sunday_trigger_skips_completed_calendar_run(self):
+        first = datetime(2026, 9, 6, 0, 0, tzinfo=timezone.utc)
+        run_id = self.store.start_run(
+            trigger_type="scheduled", scheduled_at=first.isoformat(),
+        )
+        with sqlite3.connect(self.store.path) as connection:
+            connection.execute(
+                "UPDATE supplier_weekly_runs SET status='partial_success' WHERE run_id=?",
+                (run_id,),
+            )
+        self.assertTrue(self.store.has_completed_schedule(first + timedelta(hours=1)))
 
     def test_qudo_queue_checkpoint_resume_and_zero_double_claim(self):
         run_id = self.store.start_run(trigger_type="manual")
@@ -193,10 +219,65 @@ class WeeklyStoreTests(unittest.TestCase):
 
     def test_production_routes_use_incremental_adapters_not_legacy_full_collectors(self):
         handlers = build_weekly_handlers()
-        self.assertEqual(set(handlers), {"abw", "umma", "qudo"})
+        self.assertEqual(set(handlers), set(WEEKLY_STEPS))
+        self.assertEqual(WEEKLY_SUPPLIERS, ("abw", "umma", "qudo"))
+        self.assertNotIn("qogita", WEEKLY_STEPS)
         self.assertIsInstance(handlers["umma"].adapter, UmmaIncrementalAdapter)
         self.assertIsInstance(handlers["qudo"].adapter, QudoIncrementalAdapter)
         self.assertIsInstance(handlers["qudo"].incremental_handler, IncrementalWeeklyHandler)
+
+    def test_korean_beauty_handler_only_runs_membership_refresh(self):
+        expected = {
+            "membership_activation": True,
+            "previous_membership_version_id": "membership-1",
+            "active_membership": {"membership_version_id": "membership-2"},
+            "membership_diff": {
+                "gtin_added_count": 2, "fid_changed_count": 1,
+                "gtin_unchanged_count": 8, "gtin_removed_count": 3,
+            },
+            "curated": {
+                "pages_requested": 4, "http_retry_count": 1,
+                "http_status_counts": {"200": 4},
+            },
+            "validation_errors": [],
+        }
+        with patch(
+            "supplier_weekly_adapters.refresh_korean_beauty_membership",
+            return_value=expected,
+        ) as refresh:
+            handler = build_weekly_handlers()[QOGITA_KOREAN_BEAUTY_STEP]
+            result = handler(
+                run_id="weekly", source=None, policy=SupplierRatePolicy(),
+                work_store=self.store,
+            )
+        refresh.assert_called_once()
+        kwargs = refresh.call_args.kwargs
+        self.assertTrue(kwargs["persist"])
+        self.assertTrue(kwargs["activate"])
+        self.assertEqual(result["promotion_result"], "membership_activated")
+        self.assertEqual(result["baseline_after"], "membership-2")
+        self.assertEqual(result["new"], 2)
+
+    def test_korean_beauty_runs_after_supplier_failures_without_changing_policy(self):
+        calls = []
+        handlers = {
+            "abw": lambda **_: {"status": "success"},
+            "umma": lambda **_: (_ for _ in ()).throw(RuntimeError("umma failed")),
+            "qudo": lambda **_: (_ for _ in ()).throw(RuntimeError("qudo failed")),
+            QOGITA_KOREAN_BEAUTY_STEP: lambda **_: (
+                calls.append(QOGITA_KOREAN_BEAUTY_STEP) or {
+                    "status": "success", "baseline_after": "membership-2",
+                }
+            ),
+        }
+        result = WeeklySupplierOrchestrator(
+            handlers, store=self.store, baseline_provider=lambda _: None,
+        ).run(sources={"abw": "catalog.xlsx"})
+        self.assertEqual(calls, [QOGITA_KOREAN_BEAUTY_STEP])
+        states = {row["supplier"]: row for row in result["suppliers"]}
+        self.assertEqual(states[QOGITA_KOREAN_BEAUTY_STEP]["status"], "success")
+        self.assertEqual(states["umma"]["status"], "failed")
+        self.assertEqual(states["qudo"]["status"], "failed")
 
     def test_umma_gap_guard_tolerates_known_gap_and_quarantines_jump(self):
         validate_umma_gap(26, 26)

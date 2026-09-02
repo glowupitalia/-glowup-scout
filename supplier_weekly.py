@@ -25,6 +25,8 @@ from supplier_incremental import SupplierIncrementalStore
 
 
 WEEKLY_SUPPLIERS = ("abw", "umma", "qudo")
+QOGITA_KOREAN_BEAUTY_STEP = "qogita_korean_beauty"
+WEEKLY_STEPS = (*WEEKLY_SUPPLIERS, QOGITA_KOREAN_BEAUTY_STEP)
 WEEKLY_TIMEZONE = "Europe/Rome"
 WEEKLY_WEEKDAY = 6  # datetime.weekday(): Sunday
 WEEKLY_HOUR = 2
@@ -59,6 +61,11 @@ DEFAULT_RATE_POLICIES = {
     "abw": SupplierRatePolicy(min_pacing_seconds=0.75, max_requests_per_run=5_000),
     "umma": SupplierRatePolicy(min_pacing_seconds=0.5, max_requests_per_run=10_000),
     "qudo": SupplierRatePolicy(min_pacing_seconds=0.6, max_requests_per_run=15_000),
+    # This policy is used only by the curated-membership collector.  It does
+    # not opt Qogita into the normal supplier enrichment pipeline.
+    QOGITA_KOREAN_BEAUTY_STEP: SupplierRatePolicy(
+        min_pacing_seconds=0.35, max_requests_per_run=1_000, max_retries=4,
+    ),
 }
 
 
@@ -406,7 +413,7 @@ class WeeklySupplierOrchestrator:
             trigger_type=trigger_type,
             scheduled_at=_utc(scheduled_at) if scheduled_at else None,
         )
-        for sequence, supplier in enumerate(WEEKLY_SUPPLIERS, start=1):
+        for sequence, supplier in enumerate(WEEKLY_STEPS, start=1):
             baseline = self.baseline_provider(supplier)
             policy = self.policies[supplier]
             self.store.start_supplier(run_id, supplier, sequence, baseline, policy)

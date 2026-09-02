@@ -2,7 +2,8 @@
 """CLI boundary for the Scout weekly supplier pipeline.
 
 Live supplier handlers are loaded from ``supplier_weekly_adapters``. The CLI
-never includes Qogita and refuses to run when an adapter is unavailable.
+refreshes only the Korean Beauty membership for Qogita; it never runs the
+global Qogita supplier/bootstrap pipeline.
 """
 
 from __future__ import annotations
@@ -13,12 +14,17 @@ from datetime import datetime, timezone
 
 from supplier_catalog import SupplierCatalogStore
 from supplier_weekly import (
-    DEFAULT_WEEKLY_DATABASE_PATH, WEEKLY_SUPPLIERS, WeeklySupplierOrchestrator,
-    WeeklySupplierStore, next_weekly_refresh, weekly_lock,
+    DEFAULT_WEEKLY_DATABASE_PATH, QOGITA_KOREAN_BEAUTY_STEP, WEEKLY_STEPS,
+    WeeklySupplierOrchestrator, WeeklySupplierStore, next_weekly_refresh,
+    weekly_lock,
 )
+from qogita_korean_beauty import QogitaMembershipStore
 
 
 def _baseline(supplier: str) -> str | None:
+    if supplier == QOGITA_KOREAN_BEAUTY_STEP:
+        active = QogitaMembershipStore().active()
+        return active.get("membership_version_id") if active else None
     metadata = SupplierCatalogStore().active_generation_metadata(supplier)
     return metadata.get("run_id") if metadata else None
 
@@ -37,7 +43,7 @@ def status_payload(store: WeeklySupplierStore) -> dict:
         "next_refresh": next_weekly_refresh().isoformat(),
         "suppliers": {
             supplier: store.latest_supplier_state(supplier)
-            for supplier in WEEKLY_SUPPLIERS
+            for supplier in WEEKLY_STEPS
         },
     }
 
@@ -57,14 +63,18 @@ def main(argv=None) -> int:
         handlers = _handlers()
         print(json.dumps({
             "status": "dry_run", "live_calls": 0,
-            "order": list(WEEKLY_SUPPLIERS),
+            "order": list(WEEKLY_STEPS),
             "suppliers": {
                 supplier: {
                     "baseline": _baseline(supplier),
                     "handler": "waiting_for_source" if supplier == "abw" and not args.abw_export
-                    else ("incremental" if supplier in handlers else "unavailable"),
+                    else (
+                        "membership_refresh" if supplier == QOGITA_KOREAN_BEAUTY_STEP
+                        and supplier in handlers else
+                        ("incremental" if supplier in handlers else "unavailable")
+                    ),
                     "source": "manual_official_xlsx" if supplier == "abw" and args.abw_export else None,
-                } for supplier in WEEKLY_SUPPLIERS
+                } for supplier in WEEKLY_STEPS
             },
         }, ensure_ascii=False))
         return 0
@@ -87,6 +97,11 @@ def main(argv=None) -> int:
                                           "promotion_result": "baseline_preserved"},
                     "qudo": lambda **_: {"status": "skipped", "baseline_after": _baseline("qudo"),
                                           "promotion_result": "baseline_preserved"},
+                    QOGITA_KOREAN_BEAUTY_STEP: lambda **_: {
+                        "status": "skipped",
+                        "baseline_after": _baseline(QOGITA_KOREAN_BEAUTY_STEP),
+                        "promotion_result": "baseline_preserved",
+                    },
                 }
             orchestrator = WeeklySupplierOrchestrator(
                 handlers, store=store, baseline_provider=_baseline,

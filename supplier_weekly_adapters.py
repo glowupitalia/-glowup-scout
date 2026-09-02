@@ -2,7 +2,8 @@
 
 Only lightweight supplier-wide indexes are enumerated up front.  Expensive
 detail calls are made by :class:`IncrementalWeeklyHandler` for NEW/CHANGED or
-bounded reconciliation work.  Qogita is deliberately outside this module.
+bounded reconciliation work.  Global Qogita enrichment remains outside this
+module; the only Qogita step is the identity-only Korean Beauty membership.
 """
 
 from __future__ import annotations
@@ -15,6 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from purchase_scenarios import normalize_purchase_scenario
+from qogita_korean_beauty import (
+    QogitaKoreanBeautyCollector, refresh_korean_beauty_membership,
+)
 from supplier_catalog import (
     SupplierCatalogGeneration, SupplierCatalogStore, canonical_gtin14,
     supplier_product_cache_key, supplier_promotion_gate,
@@ -515,4 +519,55 @@ def _make_handler(adapter):
 
 def build_weekly_handlers():
     abw=AbwIncrementalAdapter(); umma=UmmaIncrementalAdapter(); qudo=QudoIncrementalAdapter()
-    return {"abw":_make_handler(abw),"umma":_make_handler(umma),"qudo":_make_handler(qudo)}
+    def korean_beauty(*, policy, **_kwargs):
+        collector = QogitaKoreanBeautyCollector(
+            pacing_seconds=policy.min_pacing_seconds,
+            max_attempts=policy.max_retries + 1,
+        )
+        try:
+            report = refresh_korean_beauty_membership(
+                collector=collector, persist=True, activate=True,
+            )
+        finally:
+            collector.close()
+        diff = report["membership_diff"]
+        curated = report["curated"]
+        if not report["membership_activation"]:
+            return {
+                "status": "failed",
+                "baseline_after": report["previous_membership_version_id"],
+                "promotion_result": "baseline_preserved",
+                "failures": 1,
+                "requests": curated.get("pages_requested", 0),
+                "retry": curated.get("http_retry_count", 0),
+                "rate_limits": curated.get("http_status_counts", {}).get("429", 0),
+                "server_errors": sum(
+                    count for status, count in curated.get("http_status_counts", {}).items()
+                    if int(status) >= 500
+                ),
+                "error_code": "membership_validation_failed",
+                "error_message": ", ".join(report["validation_errors"]),
+                "diagnostics": report,
+            }
+        return {
+            "status": "success",
+            "baseline_after": report["active_membership"]["membership_version_id"],
+            "promotion_result": "membership_activated",
+            "new": diff["gtin_added_count"],
+            "changed": diff["fid_changed_count"],
+            "unchanged": diff["gtin_unchanged_count"],
+            "removed": diff["gtin_removed_count"],
+            "requests": curated.get("pages_requested", 0),
+            "retry": curated.get("http_retry_count", 0),
+            "rate_limits": curated.get("http_status_counts", {}).get("429", 0),
+            "server_errors": sum(
+                count for status, count in curated.get("http_status_counts", {}).items()
+                if int(status) >= 500
+            ),
+            "diagnostics": report,
+        }
+    return {
+        "abw": _make_handler(abw), "umma": _make_handler(umma),
+        "qudo": _make_handler(qudo),
+        "qogita_korean_beauty": korean_beauty,
+    }

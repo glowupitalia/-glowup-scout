@@ -617,3 +617,162 @@ class QogitaMembershipStore:
         result = dict(row)
         result["metrics"] = json.loads(result.pop("metrics_json") or "{}")
         return result
+
+    def entries(self, membership_version_id: str) -> list[dict[str, Any]]:
+        with _connect(self.path, read_only=True) as connection:
+            return [dict(row) for row in connection.execute(
+                """SELECT canonical_gtin,canonical_product_key,variant_fid
+                     FROM qogita_membership_entries
+                    WHERE membership_version_id=? ORDER BY canonical_gtin""",
+                (membership_version_id,),
+            )]
+
+
+def active_qogita_context(path: str | Path = DEFAULT_DATABASE_PATH) -> dict[str, str]:
+    """Return the immutable global Qogita context used by membership refresh."""
+    with _connect(path, read_only=True) as connection:
+        row = connection.execute(
+            """SELECT snapshot.source_generation_id,snapshot.bootstrap_run_id,
+                      snapshot.serving_generation_id
+                 FROM qogita_serving_active active
+                 JOIN qogita_serving_snapshots snapshot
+                   ON snapshot.serving_generation_id=active.serving_generation_id
+                WHERE active.supplier='qogita' AND snapshot.status='valid'"""
+        ).fetchone()
+    if not row:
+        raise RuntimeError("No active valid Qogita serving snapshot")
+    return dict(row)
+
+
+def compare_memberships(
+    previous_entries: Iterable[dict[str, Any]],
+    current_entries: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare identity membership without interpreting catalog/enrichment state."""
+    previous = {
+        str(row["canonical_gtin"]): str(row.get("variant_fid") or "") or None
+        for row in previous_entries
+    }
+    current = {
+        str(row["canonical_gtin"]): str(row.get("variant_fid") or "") or None
+        for row in current_entries
+    }
+    previous_gtins = set(previous)
+    current_gtins = set(current)
+    retained = previous_gtins & current_gtins
+    fid_changed = sorted(gtin for gtin in retained if previous[gtin] != current[gtin])
+    previous_count = len(previous_gtins)
+    current_count = len(current_gtins)
+    return {
+        "previous_entry_count": previous_count,
+        "current_entry_count": current_count,
+        "gtin_added_count": len(current_gtins - previous_gtins),
+        "gtin_removed_count": len(previous_gtins - current_gtins),
+        "gtin_unchanged_count": len(retained),
+        "fid_unchanged_count": len(retained) - len(fid_changed),
+        "fid_changed_count": len(fid_changed),
+        "fid_changed_gtins": fid_changed,
+        "entry_delta_percent": (
+            (current_count - previous_count) / previous_count * 100.0
+            if previous_count else (100.0 if current_count else 0.0)
+        ),
+    }
+
+
+def membership_validation_errors(
+    acquisition_status: str, metrics: dict[str, Any], entries: Iterable[dict[str, Any]],
+) -> list[str]:
+    """Mirror the existing membership validation gate without persisting a version."""
+    errors = []
+    if acquisition_status not in {"complete", "complete_with_anomalies"}:
+        errors.append(f"acquisition_status={acquisition_status}")
+    if not list(entries):
+        errors.append("membership_empty")
+    for field in (
+        "gtin_fid_conflict_count", "fid_gtin_conflict_count",
+        "catalog_fid_different_count", "invalid_gtin_count", "fid_missing_count",
+    ):
+        if int(metrics.get(field) or 0):
+            errors.append(f"{field}={int(metrics[field])}")
+    return errors
+
+
+def refresh_korean_beauty_membership(
+    *, path: str | Path = DEFAULT_DATABASE_PATH,
+    collector: QogitaKoreanBeautyCollector | None = None,
+    persist: bool = False, activate: bool = False,
+    max_pages: int | None = None,
+    membership_version_id: str | None = None,
+) -> dict[str, Any]:
+    """Acquire, compare and optionally atomically publish the curated membership.
+
+    ``persist=False`` is a production-safe dry run: all database access is
+    read-only and the proposed version identifier is never inserted.
+    """
+    if activate and not persist:
+        raise ValueError("activate requires persist")
+    database = Path(path).expanduser().resolve()
+    context = active_qogita_context(database)
+    store = QogitaMembershipStore(database)
+    previous = store.active()
+    previous_entries = store.entries(previous["membership_version_id"]) if previous else []
+    owned_collector = collector is None
+    collector = collector or QogitaKoreanBeautyCollector()
+    try:
+        acquisition = collector.collect(max_pages=max_pages)
+    finally:
+        if owned_collector:
+            collector.close()
+    reconciliation = QogitaMembershipReconciler(database).reconcile(
+        acquisition["entries"],
+        source_generation_id=context["source_generation_id"],
+        bootstrap_run_id=context["bootstrap_run_id"],
+        serving_generation_id=context["serving_generation_id"],
+    )
+    combined_metrics = {**acquisition["metrics"], **reconciliation["metrics"]}
+    membership_diff = compare_memberships(previous_entries, reconciliation["entries"])
+    validation_errors = membership_validation_errors(
+        acquisition["acquisition_status"], combined_metrics, reconciliation["entries"],
+    )
+    proposed_version_id = membership_version_id or uuid4().hex
+    membership_version = None
+    active_membership = None
+    if persist:
+        membership_version = store.create_version(
+            source_generation_id=context["source_generation_id"],
+            membership_version_id=proposed_version_id,
+        )
+        membership_version = store.finalize_version(
+            proposed_version_id,
+            entries=reconciliation["entries"],
+            acquisition_status=acquisition["acquisition_status"],
+            metrics={**combined_metrics, "membership_diff": membership_diff},
+            error_message="; ".join(validation_errors) or None,
+        )
+        if activate and membership_version["status"] == "valid":
+            active_membership = store.activate(proposed_version_id)
+    return {
+        "status": "membership_activated" if active_membership else (
+            "membership_persisted" if membership_version else (
+                "dry_run_invalid" if validation_errors else "dry_run_complete"
+            )
+        ),
+        "production_writes": bool(persist),
+        "membership_activation": bool(active_membership),
+        "would_activate": not validation_errors,
+        "proposed_membership_version_id": proposed_version_id,
+        "previous_membership_version_id": (
+            previous.get("membership_version_id") if previous else None
+        ),
+        **context,
+        "acquisition_status": acquisition["acquisition_status"],
+        "curated": acquisition["metrics"],
+        "catalog_bootstrap_serving": reconciliation["metrics"],
+        "catalog_absent_gtins": reconciliation["catalog_absent_gtins"],
+        "gtin_fid_conflicts": acquisition["gtin_fid_conflicts"],
+        "fid_gtin_conflicts": acquisition["fid_gtin_conflicts"],
+        "membership_diff": membership_diff,
+        "validation_errors": validation_errors,
+        "membership_version": membership_version,
+        "active_membership": active_membership,
+    }
