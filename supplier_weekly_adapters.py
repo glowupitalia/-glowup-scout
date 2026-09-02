@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,9 @@ from supplier_incremental import SupplierIncrementalStore
 from supplier_weekly import IncrementalWeeklyHandler
 from umma_discovery import normalize_umma_barcode, normalize_umma_candidates
 from qudo_discovery import normalize_qudo_candidates
+
+
+logger = logging.getLogger(__name__)
 
 
 def _iso_now():
@@ -68,6 +72,42 @@ class _ResponseTelemetry:
     def delta(self, before):
         current = self.snapshot()
         return tuple(current[index] - before[index] for index in range(3))
+
+
+class _StableAsyncAdapter:
+    """Keep an async client's complete lifecycle on one owned event loop."""
+
+    def __init__(self):
+        self._runner: asyncio.Runner | None = None
+
+    def _run_async(self, coroutine):
+        if self._runner is None:
+            self._runner = asyncio.Runner()
+        return self._runner.run(coroutine)
+
+    def _close_async_client(self) -> None:
+        runner = self._runner
+        if runner is None:
+            return
+        close_error = None
+        try:
+            client = getattr(self, "_client", None)
+            if client is not None:
+                runner.run(client.close())
+        except BaseException as exc:
+            close_error = exc
+        finally:
+            self._client = None
+            try:
+                runner.close()
+            except BaseException as exc:
+                if close_error is None:
+                    close_error = exc
+                else:
+                    logger.exception("weekly adapter runner cleanup also failed")
+            self._runner = None
+        if close_error is not None:
+            raise close_error
 
 
 def validate_umma_gap(current_gap: int, previous_gap: int) -> None:
@@ -187,10 +227,11 @@ def _catalog_generation(supplier, run_id, enumeration, incremental_store,
     return {"run_id": run_id, "promotion_result": "promoted"}
 
 
-class UmmaIncrementalAdapter:
+class UmmaIncrementalAdapter(_StableAsyncAdapter):
     supplier = "umma"
 
     def __init__(self, *, catalog_store=None, manager_root=MANAGER_ROOT):
+        super().__init__()
         self.store = catalog_store or SupplierCatalogStore()
         self.manager_root = Path(manager_root)
         self._client = None
@@ -202,7 +243,7 @@ class UmmaIncrementalAdapter:
         return value.get("run_id") if value else None
 
     def enumerate_catalog(self, *, source=None, policy=None):
-        return asyncio.run(self._enumerate(policy))
+        return self._run_async(self._enumerate(policy))
 
     async def _enumerate(self, policy):
         _load_manager_environment(self.manager_root)
@@ -237,22 +278,25 @@ class UmmaIncrementalAdapter:
                         sku = str(option.get("sku") or option.get("erpSku") or "") or None
                         barcode = str(option.get("barcode") or "").strip()
                         try:
-                            identity = normalize_umma_barcode(barcode, "standard") if barcode else {"canonical_ean": None, "identifier_type": None}
+                            canonical_ean, identifier_type, _, _ = (
+                                normalize_umma_barcode(barcode, "standard")
+                                if barcode else (None, None, "", None)
+                            )
                         except (TypeError, ValueError):
-                            identity = {"canonical_ean": None, "identifier_type": None}
+                            canonical_ean, identifier_type = None, None
                         key = supplier_product_cache_key(
                             "umma", product_id, supplier_option_id=option_id,
-                            supplier_sku=sku, fallback_identifier=identity.get("canonical_ean"),
+                            supplier_sku=sku, fallback_identifier=canonical_ean,
                         )
                         if key in seen: continue
                         seen.add(key)
                         products.append({
                             "canonical_product_key": key,
-                            "canonical_ean": identity.get("canonical_ean"),
-                            "canonical_gtin": canonical_gtin14(identity.get("canonical_ean")),
-                            "identifier_type": identity.get("identifier_type"),
+                            "canonical_ean": canonical_ean,
+                            "canonical_gtin": canonical_gtin14(canonical_ean),
+                            "identifier_type": identifier_type,
                             "raw_identifiers": ([{"value": barcode, "type": "UMMA_BARCODE"}] if barcode else []),
-                            "identifier_valid": bool(identity.get("canonical_ean")),
+                            "identifier_valid": bool(canonical_ean),
                             "supplier_product_id": product_id, "supplier_option_id": option_id,
                             "supplier_sku": sku, "brand": item.get("brandName") or item.get("brand"),
                             "title": option.get("englishName") or item.get("englishName"),
@@ -282,7 +326,7 @@ class UmmaIncrementalAdapter:
                     "enumeration_gap": gap}}
 
     def enrich_product(self, *, canonical_product_key, product, policy):
-        return asyncio.run(self._enrich(product, policy))
+        return self._run_async(self._enrich(product, policy))
 
     async def _enrich(self, product, policy):
         from purchase_prices.umma import UmmaError, normalize_offer, parse_product_modes
@@ -326,7 +370,7 @@ class UmmaIncrementalAdapter:
                 "server_errors": server_errors}
 
     def close(self):
-        if self._client: asyncio.run(self._client.close())
+        self._close_async_client()
 
 
 class AbwIncrementalAdapter:
@@ -391,10 +435,11 @@ class AbwIncrementalAdapter:
         return None
 
 
-class QudoIncrementalAdapter:
+class QudoIncrementalAdapter(_StableAsyncAdapter):
     supplier = "qudo"
 
     def __init__(self, *, catalog_store=None, manager_root=MANAGER_ROOT):
+        super().__init__()
         self.store = catalog_store or SupplierCatalogStore(); self.manager_root = Path(manager_root)
         self._client = None
         self._telemetry = _ResponseTelemetry()
@@ -404,7 +449,7 @@ class QudoIncrementalAdapter:
         return value.get("run_id") if value else None
 
     def enumerate_catalog(self, *, source=None, policy=None):
-        return asyncio.run(self._enumerate(policy))
+        return self._run_async(self._enumerate(policy))
 
     async def _enumerate(self, policy):
         _load_manager_environment(self.manager_root)
@@ -453,7 +498,7 @@ class QudoIncrementalAdapter:
                     "global_catalog_total":total,"qudo_offer_products":len(products),"enumerated_count":len(products)}}
 
     def enrich_product(self, *, canonical_product_key, product, policy):
-        return asyncio.run(self._enrich(product, policy))
+        return self._run_async(self._enrich(product, policy))
 
     async def _enrich(self, product, policy):
         from purchase_prices.qudo import parse_product_page, parse_store_offer
@@ -495,7 +540,7 @@ class QudoIncrementalAdapter:
             "identifier_valid":True}}
 
     def close(self):
-        if self._client: asyncio.run(self._client.close())
+        self._close_async_client()
 
 
 def _make_handler(adapter):
@@ -509,9 +554,19 @@ def _make_handler(adapter):
     )
     def run(**kwargs):
         try:
-            return handler(**kwargs)
-        finally:
+            result = handler(**kwargs)
+        except BaseException:
+            try:
+                adapter.close()
+            except BaseException:
+                logger.exception(
+                    "weekly supplier adapter cleanup failed; preserving primary error",
+                    extra={"supplier": adapter.supplier},
+                )
+            raise
+        else:
             adapter.close()
+            return result
     run.incremental_handler = handler
     run.adapter = adapter
     return run

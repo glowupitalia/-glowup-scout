@@ -1,8 +1,11 @@
+import asyncio
 import sqlite3
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
 from supplier_weekly import (
@@ -12,9 +15,10 @@ from supplier_weekly import (
 )
 from supplier_incremental import SupplierIncrementalStore
 from supplier_weekly_adapters import (
-    QudoIncrementalAdapter, UmmaIncrementalAdapter, build_weekly_handlers,
-    validate_umma_gap,
+    QudoIncrementalAdapter, UmmaIncrementalAdapter, _make_handler,
+    build_weekly_handlers, validate_umma_gap,
 )
+from umma_discovery import normalize_umma_barcode
 
 
 class WeeklyScheduleTests(unittest.TestCase):
@@ -151,6 +155,33 @@ class WeeklyStoreTests(unittest.TestCase):
         self.store.fail_item(run_id, "qudo", "p2", "worker", retryable=False, error_class="invalid")
         self.assertEqual(self.store.queue_summary(run_id, "qudo"), {"pending": 1, "permanent_failure": 1})
 
+    def test_permanent_failure_still_blocks_publication(self):
+        incremental = SupplierIncrementalStore(
+            Path(self.temporary.name) / "strict-incremental.sqlite3"
+        )
+        published = []
+        handler = IncrementalWeeklyHandler(
+            "qudo",
+            enumerate_catalog=lambda **_: {"products": [{
+                "canonical_product_key": "qudo-product-1",
+                "product_id": "1", "variation_id": "2",
+                "identifier_valid": False,
+            }]},
+            enrich_product=lambda **_: (_ for _ in ()).throw(ValueError("invalid price")),
+            publish_generation=lambda **kwargs: published.append(kwargs) or {},
+            previous_run_id=lambda: "qudo-baseline",
+            incremental_store=incremental,
+        )
+        result = handler(
+            run_id="weekly-strict", source=None, policy=SupplierRatePolicy(),
+            work_store=self.store,
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "incremental_queue_incomplete")
+        self.assertEqual(result["baseline_after"], "qudo-baseline")
+        self.assertEqual(result["diagnostics"]["queue"], {"permanent_failure": 1})
+        self.assertEqual(published, [])
+
     def test_incremental_handler_enriches_new_and_is_idempotent(self):
         incremental = SupplierIncrementalStore(Path(self.temporary.name) / "incremental.sqlite3")
         published = []
@@ -283,6 +314,180 @@ class WeeklyStoreTests(unittest.TestCase):
         validate_umma_gap(26, 26)
         with self.assertRaisesRegex(RuntimeError, "gap increased"):
             validate_umma_gap(100, 26)
+
+
+class WeeklyAdapterAsyncLifecycleTests(unittest.TestCase):
+    class _Client:
+        def __init__(self, loop_ids):
+            self.loop_ids = loop_ids
+            self.closed = False
+
+        async def close(self):
+            self.loop_ids.append(id(asyncio.get_running_loop()))
+            self.closed = True
+
+    def _assert_stable_lifecycle(self, adapter_class):
+        adapter = adapter_class(catalog_store=object())
+        loop_ids = []
+        client = self._Client(loop_ids)
+
+        async def enumerate_catalog(_policy):
+            loop_ids.append(id(asyncio.get_running_loop()))
+            adapter._client = client
+            return {"products": []}
+
+        async def enrich_product(_product, _policy):
+            loop_ids.append(id(asyncio.get_running_loop()))
+            return {"scenarios": [], "requests": 0}
+
+        adapter._enumerate = enumerate_catalog
+        adapter._enrich = enrich_product
+        adapter.enumerate_catalog(policy=SupplierRatePolicy())
+        adapter.enrich_product(
+            canonical_product_key="one", product={}, policy=SupplierRatePolicy(),
+        )
+        adapter.enrich_product(
+            canonical_product_key="two", product={}, policy=SupplierRatePolicy(),
+        )
+        adapter.close()
+
+        self.assertEqual(len(set(loop_ids)), 1)
+        self.assertTrue(client.closed)
+        self.assertIsNone(adapter._runner)
+        self.assertIsNone(adapter._client)
+
+    def test_umma_enumeration_enrichments_and_close_share_one_loop(self):
+        self._assert_stable_lifecycle(UmmaIncrementalAdapter)
+
+    def test_umma_enumeration_consumes_barcode_tuple_contract(self):
+        loop_ids = []
+
+        class Store:
+            @staticmethod
+            def active_generation_metadata(_supplier):
+                return None
+
+        class HttpClient:
+            event_hooks = {"response": []}
+
+        class Client:
+            def __init__(self):
+                self.client = HttpClient()
+                self.request_count = 0
+
+            async def _get(self, _path, params=None):
+                loop_ids.append(id(asyncio.get_running_loop()))
+                self.request_count += 1
+                return {
+                    "totalCount": 1,
+                    "items": [{
+                        "id": "product-1",
+                        "mapperSaleProducts": [
+                            {"id": "mapper-valid", "productOption": {
+                                "id": "valid", "sku": "valid",
+                                "barcode": "8809640735820",
+                            }},
+                            {"id": "mapper-invalid", "productOption": {
+                                "id": "invalid", "sku": "invalid",
+                                "barcode": "not-a-barcode",
+                            }},
+                            {"id": "mapper-missing", "productOption": {
+                                "id": "missing", "sku": "missing",
+                            }},
+                        ],
+                    }],
+                }
+
+            async def close(self):
+                loop_ids.append(id(asyncio.get_running_loop()))
+
+        class FxClient:
+            async def latest_usd_to_eur(self):
+                return 0.9
+
+            async def close(self):
+                pass
+
+        purchase_prices = ModuleType("purchase_prices")
+        purchase_prices.__path__ = []
+        umma_module = ModuleType("purchase_prices.umma")
+        umma_module.UmmaClient = Client
+        fx_module = ModuleType("purchase_prices.fx")
+        fx_module.EcbFxClient = FxClient
+        fx_module.FxError = RuntimeError
+
+        contract = normalize_umma_barcode("8809640735820", "standard")
+        self.assertEqual(contract, (
+            "8809640735820", "EAN", "8809640735820", None,
+        ))
+
+        adapter = UmmaIncrementalAdapter(catalog_store=Store())
+        with (
+            patch("supplier_weekly_adapters._load_manager_environment"),
+            patch("supplier_weekly_adapters._baseline_seed", return_value=({}, {})),
+            patch.dict(sys.modules, {
+                "purchase_prices": purchase_prices,
+                "purchase_prices.umma": umma_module,
+                "purchase_prices.fx": fx_module,
+            }),
+        ):
+            result = adapter.enumerate_catalog(policy=SupplierRatePolicy())
+            adapter.close()
+
+        products = {row["supplier_option_id"]: row for row in result["products"]}
+        self.assertEqual(products["valid"]["canonical_ean"], "8809640735820")
+        self.assertEqual(products["valid"]["identifier_type"], "EAN")
+        self.assertEqual(products["valid"]["canonical_gtin"], "08809640735820")
+        self.assertTrue(products["valid"]["identifier_valid"])
+        self.assertEqual(products["valid"]["raw_identifiers"], [{
+            "value": "8809640735820", "type": "UMMA_BARCODE",
+        }])
+        self.assertIsNone(products["invalid"]["canonical_ean"])
+        self.assertFalse(products["invalid"]["identifier_valid"])
+        self.assertEqual(products["invalid"]["raw_identifiers"], [{
+            "value": "not-a-barcode", "type": "UMMA_BARCODE",
+        }])
+        self.assertIsNone(products["missing"]["canonical_ean"])
+        self.assertFalse(products["missing"]["identifier_valid"])
+        self.assertEqual(products["missing"]["raw_identifiers"], [])
+        self.assertEqual(len(set(loop_ids)), 1)
+
+    def test_qudo_enumeration_enrichments_and_close_share_one_loop(self):
+        self._assert_stable_lifecycle(QudoIncrementalAdapter)
+
+    def test_cleanup_failure_does_not_mask_primary_failure(self):
+        class FailingAdapter:
+            supplier = "umma"
+            store = object()
+
+            @staticmethod
+            def enumerate_catalog(**_kwargs):
+                raise ValueError("primary enumeration failure")
+
+            @staticmethod
+            def enrich_product(**_kwargs):
+                return []
+
+            @staticmethod
+            def previous_run_id():
+                return None
+
+            @staticmethod
+            def close():
+                raise RuntimeError("cleanup failure")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            handler = _make_handler(FailingAdapter())
+            with self.assertLogs("supplier_weekly_adapters", level="ERROR") as logs:
+                with self.assertRaisesRegex(ValueError, "primary enumeration failure"):
+                    handler(
+                        run_id="weekly-primary-error", source=None,
+                        policy=SupplierRatePolicy(),
+                        work_store=WeeklySupplierStore(
+                            Path(temporary) / "weekly.sqlite3"
+                        ),
+                    )
+        self.assertIn("cleanup failed; preserving primary error", "\n".join(logs.output))
 
 
 if __name__ == "__main__":
