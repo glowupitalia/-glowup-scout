@@ -868,7 +868,9 @@ def _discovery_compact_state(job_id):
         return {}
 
 
-def _load_authoritative_discovery_state(job_id, *, runtime=None):
+def _load_authoritative_discovery_state(
+    job_id, *, runtime=None, hydrate_results=True,
+):
     """Resolve UI state by persistence authority, never by legacy mtime alone."""
     root = Path(os.environ.get("DISCOVERY_CHECKPOINT_ROOT", "data/discovery_jobs"))
     compact = _discovery_compact_state(job_id)
@@ -892,9 +894,9 @@ def _load_authoritative_discovery_state(job_id, *, runtime=None):
     state = reconcile_discovery_state(
         legacy=legacy, compact=compact, incremental=incremental, registry=registry,
     )
-    # Completed result rows remain incrementally hydrated and are never copied
-    # into the compact UI state.
-    if state.get("status") == "completed" and compact:
+    # Completed result rows are hydrated only for result views and are never
+    # copied into the compact UI state used by Home/runtime cards.
+    if hydrate_results and state.get("status") == "completed" and compact:
         try:
             hydrated = DiscoveryCheckpointStore(root).load(job_id)
             state.update({
@@ -917,7 +919,7 @@ def _authoritative_discovery_runtime(runtime):
     if not runtime:
         return runtime
     return _load_authoritative_discovery_state(
-        runtime["job_id"], runtime=runtime,
+        runtime["job_id"], runtime=runtime, hydrate_results=False,
     )
 
 

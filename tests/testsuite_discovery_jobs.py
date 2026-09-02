@@ -297,6 +297,67 @@ class DiscoveryJobUiTests(unittest.TestCase):
             self.assertIn("100.00%", rendered)
             self.assertTrue(any(row.value == "Discovery recenti" for row in app.subheader))
 
+    def test_completed_home_defers_result_hydration_until_results_are_opened(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint_root = root / "checkpoints"
+            checkpoint_root.mkdir()
+            registry = self._running_registry(temporary)
+            export_path = root / "operational.xlsx"
+            export_path.write_bytes(b"operational workbook")
+            state = {
+                "job_id": "ui-running-job", "status": "completed",
+                "phase": "completed", "started_at": "2026-08-27T09:20:27Z",
+                "completed_at": "2026-08-27T10:20:27Z", "run_budget": "all",
+                "sampled_identifier_count": 3902, "selected_count": 3902,
+                "progress_current": 3902, "progress_total": 3902,
+                "selected_suppliers": ["qudo"], "filters": default_filters(),
+                "final_opportunity_count": 11, "fee_target_count": 142,
+                "fee_valid_count": 142, "fee_unavailable_count": 0,
+                "operational_export": {
+                    "path": str(export_path), "file_name": export_path.name,
+                },
+                "discovery_schema_version": "supplier_multi_listing_v1",
+                "persistence": "incremental_sqlite_v1", "errors": [],
+                "results": [],
+            }
+            registry.finish(
+                state["job_id"], state, export_path=str(export_path),
+            )
+            (checkpoint_root / "ui-running-job.state.json").write_text(
+                json.dumps(state), encoding="utf-8",
+            )
+            with patch.dict(os.environ, {
+                "DISCOVERY_JOB_DATABASE": str(registry.path),
+                "DISCOVERY_CHECKPOINT_ROOT": str(checkpoint_root),
+                "DISCOVERY_INCREMENTAL_DATABASE": str(root / "incremental.sqlite3"),
+            }), patch.object(
+                DiscoveryCheckpointStore, "load", autospec=True,
+                return_value=state,
+            ) as hydrate:
+                app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
+                self.assertEqual(hydrate.call_count, 0)
+                rendered = " ".join(row.value for row in app.caption)
+                self.assertIn("11 opportunità", rendered)
+                self.assertIn("3.902 prodotti valutati", rendered)
+                open_results = next(
+                    row for row in app.button
+                    if row.label == "Visualizza risultati / Scarica Excel"
+                )
+                app = open_results.click().run()
+                if not app.subheader:
+                    app = app.run()
+
+            self.assertEqual(hydrate.call_count, 1)
+            self.assertEqual(len(app.exception), 0)
+            self.assertTrue(any(
+                row.value == "DISCOVERY COMPLETATA" for row in app.subheader
+            ))
+            self.assertIn(
+                "SCARICA EXCEL",
+                [row.proto.label for row in app.get("download_button")],
+            )
+
     def test_no_job_home_offers_discovery_start(self):
         with tempfile.TemporaryDirectory() as temporary, patch.dict(
             os.environ,
