@@ -38,6 +38,7 @@ from direct_lookup import (
     format_eur,
     run_direct_lookup,
 )
+from manager_canonical import ManagerCanonicalClient
 from purchase_scenarios import (
     recommended_combination,
     recommended_scenario,
@@ -1253,6 +1254,7 @@ elif ui_state == "single_result":
                 state = run_direct_lookup(
                     ean, catalog_batch=direct_catalog_batch,
                     pricing_batch=direct_pricing_batch,
+                    manager_lookup=ManagerCanonicalClient().lookup,
                 )
                 st.session_state["single_product_result"] = state
                 st.session_state["single_status"] = (
@@ -1325,8 +1327,8 @@ elif ui_state == "single_result":
                     )
                 with summary:
                     metrics = st.columns(3)
-                    metrics[0].metric("BSR Beauty", display_value(result.get("bsr_beauty")))
-                    metrics[1].metric("Prezzo riferimento", format_eur(result.get("reference_price")))
+                    metrics[0].metric("BSR", display_value(result.get("bsr_rank")))
+                    metrics[1].metric("Prezzo minimo", format_eur(result.get("lowest_new_price") or result.get("reference_price")))
                     metrics[2].metric("Buy Box", format_eur(result.get("buy_box_price")))
                     metrics = st.columns(3)
                     metrics[0].metric("Minimo FBA", format_eur(result.get("min_fba_price")))
@@ -1335,7 +1337,26 @@ elif ui_state == "single_result":
                     metrics = st.columns(3)
                     metrics[0].metric("Venditori FBA", display_value(result.get("fba_sellers")))
                     metrics[1].metric("Venditori FBM", display_value(result.get("fbm_sellers")))
-                    metrics[2].metric("Stato Amazon", "Disponibile")
+                    pricing_status = {
+                        "success": "Disponibile",
+                        "not_found": "Non disponibile",
+                        "error": "Non disponibile",
+                    }.get(result.get("pricing_status"), "Non disponibile")
+                    identity_status = {
+                        "canonical_manager": "Manager canonico",
+                        "resolved": "Amazon Catalog",
+                    }.get(result.get("identity_status"), "Non disponibile")
+                    bsr_status = {
+                        "available": "Disponibile",
+                        "not_available": "Non disponibile",
+                        "maturing": "In maturazione",
+                    }.get(result.get("bsr_status"), display_value(result.get("bsr_status")))
+                    metrics[2].metric("Pricing live", pricing_status)
+                    st.caption(
+                        f"Identità: {identity_status} · "
+                        f"BSR: {bsr_status} · "
+                        f"Categoria: {display_value(result.get('bsr_category_label') or result.get('category'))}"
+                    )
                     with st.container(horizontal=True, gap="small"):
                         st.link_button(
                             "Apri scheda Amazon", result["amazon_product_url"],

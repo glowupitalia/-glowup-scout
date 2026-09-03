@@ -856,8 +856,37 @@ def _offer_counts(summary, offers):
             fbm += count
     if found_summary:
         return fba, fba + fbm, "summary_number_of_offers"
-    fba = sum(bool(row.get("IsFulfilledByAmazon")) for row in offers)
-    return fba, len(offers), "offers_fallback"
+    if offers:
+        fba = sum(bool(row.get("IsFulfilledByAmazon")) for row in offers)
+        return fba, len(offers), "offers_fallback"
+    return None, None, "unavailable"
+
+
+def _money_component(value, *, allow_zero=False):
+    if not isinstance(value, dict) or "Amount" not in value:
+        return None
+    try:
+        amount = float(value.get("Amount"))
+    except (TypeError, ValueError):
+        return None
+    if amount < 0 or (amount == 0 and not allow_zero):
+        return None
+    currency = str(value.get("CurrencyCode") or "").strip().upper()
+    return amount, currency
+
+
+def _offer_landed_amount(offer):
+    buying = offer.get("BuyingPrice") or {}
+    landed = _money_component(buying.get("LandedPrice") or offer.get("LandedPrice"))
+    if landed is not None:
+        return landed[0]
+    listing = _money_component(buying.get("ListingPrice") or offer.get("ListingPrice"))
+    shipping = _money_component(buying.get("Shipping") or offer.get("Shipping"), allow_zero=True)
+    if listing is None or shipping is None:
+        return None
+    if not listing[1] or not shipping[1] or listing[1] != shipping[1]:
+        return None
+    return listing[0] + shipping[0]
 
 
 def parse_item_offers_batch(entries):
@@ -888,10 +917,8 @@ def parse_item_offers_batch(entries):
             if amount is not None:
                 (fba_prices if channel == "amazon" else fbm_prices).append(amount)
         for offer in offers:
-            listing = _money_amount(offer.get("ListingPrice")) or 0
-            shipping = _money_amount(offer.get("Shipping")) or 0
-            landed = listing + shipping
-            if landed > 0:
+            landed = _offer_landed_amount(offer)
+            if landed is not None and landed > 0:
                 (fba_prices if offer.get("IsFulfilledByAmazon") else fbm_prices).append(landed)
         pricing = {
             "Buy Box Amount": buy_box,

@@ -170,7 +170,7 @@ class DirectAmazonLookupTests(unittest.TestCase):
         result = resolver.lookup(EAN)
         expected = {
             "requested_ean", "canonical_ean", "catalog_status", "asin", "title",
-            "brand", "image_url", "category", "bsr_beauty", "buy_box_price",
+            "brand", "image_url", "category", "bsr_rank", "buy_box_price",
             "reference_price", "min_fba_price", "min_fbm_price", "total_sellers",
             "fba_sellers", "fbm_sellers", "amazon_product_url",
             "amazon_offers_url", "observed_at", "cache_status",
@@ -258,7 +258,7 @@ class DirectLookupUiTests(unittest.TestCase):
         self.assertFalse(app.exception)
         metrics = {row.label for row in app.metric}
         self.assertTrue({
-            "BSR Beauty", "Prezzo riferimento", "Buy Box", "Minimo FBA",
+            "BSR", "Prezzo minimo", "Buy Box", "Minimo FBA",
             "Minimo FBM", "Venditori FBA", "Venditori FBM", "Venditori totali",
         }.issubset(metrics))
         links = {row.proto.label for row in app.get("link_button")}

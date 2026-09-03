@@ -87,6 +87,35 @@ def _pricing_fields(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _manager_listing(value: dict[str, Any]) -> dict[str, Any]:
+    identity = value.get("identity") or {}
+    bsr = value.get("bsr") or {}
+    lowest_new = value.get("lowest_new") or {}
+    return {
+        "asin": identity.get("asin"),
+        "title": identity.get("title"),
+        "brand": identity.get("brand"),
+        "main_image": identity.get("image_url"),
+        "browse_classification": {
+            "classificationId": bsr.get("category_id"),
+            "displayName": bsr.get("category_name"),
+        },
+        "compatibility_status": "compatible",
+        "bsr_rank": bsr.get("rank"),
+        "bsr_category": bsr.get("category_id"),
+        "bsr_category_label": bsr.get("category_name"),
+        "bsr_status": bsr.get("status"),
+        "bsr_observed_at": bsr.get("observed_at"),
+        "bsr_observed_days": bsr.get("observed_days"),
+        "lowest_new_price": lowest_new.get("current_price"),
+        "lowest_new_status": lowest_new.get("status"),
+        "lowest_new_observed_at": lowest_new.get("observed_at"),
+        "lowest_new_observed_date": lowest_new.get("business_date") or lowest_new.get("observed_date"),
+        "lowest_new_source": lowest_new.get("source"),
+        "manager_identity": identity,
+    }
+
+
 def _compatible_listings(listings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     compatible = [
         row for row in listings
@@ -130,8 +159,17 @@ def _display_result(
         "category": browse.get("displayName") or selected.get("product_type"),
         "category_id": browse.get("classificationId"),
         "bsr_beauty": selected.get("bsr_beauty"),
+        "bsr_rank": selected.get("bsr_rank") or selected.get("bsr_beauty"),
         "bsr_category": selected.get("bsr_category"),
         "bsr_category_label": selected.get("bsr_category_label"),
+        "bsr_status": selected.get("bsr_status"),
+        "bsr_observed_at": selected.get("bsr_observed_at"),
+        "bsr_observed_days": selected.get("bsr_observed_days"),
+        "lowest_new_price": selected.get("lowest_new_price"),
+        "lowest_new_status": selected.get("lowest_new_status"),
+        "lowest_new_observed_at": selected.get("lowest_new_observed_at"),
+        "lowest_new_observed_date": selected.get("lowest_new_observed_date"),
+        "lowest_new_source": selected.get("lowest_new_source"),
         "buy_box_price": selected.get("buy_box_price") or (
             selected.get("reference_price")
             if selected.get("price_source") == "buy_box" else None
@@ -150,6 +188,8 @@ def _display_result(
         "catalog_observed_at": catalog_observed_at,
         "pricing_observed_at": selected.get("pricing_observed_at") or pricing_observed_at,
         "cache_status": cache_status,
+        "identity_status": selected.get("identity_status") or catalog_status,
+        "pricing_status": selected.get("pricing_status"),
         "listings": listings,
     }
 
@@ -161,18 +201,27 @@ class DirectAmazonLookup:
         self, *, cache: Any,
         catalog_lookup: Callable[[list[str], str], dict[str, Any]],
         pricing_lookup: Callable[[list[str], str], dict[str, Any]],
+        manager_lookup: Callable[[str], dict[str, Any] | None] | None = None,
         freshness_policy: AmazonFreshnessPolicy | None = None,
         now: Callable[[], datetime] | None = None,
     ):
         self.cache = cache
         self.catalog_lookup = catalog_lookup
         self.pricing_lookup = pricing_lookup
+        self.manager_lookup = manager_lookup
         self.policy = freshness_policy or AmazonFreshnessPolicy.from_environment()
         self.now = now or (lambda: datetime.now(timezone.utc))
 
     def lookup(self, identifier: str) -> dict[str, Any]:
         requested, canonical = _canonical_identifier(identifier)
         now = self.now()
+        if self.manager_lookup is not None:
+            try:
+                manager = self.manager_lookup(canonical)
+            except Exception:
+                manager = None
+            if manager:
+                return self._lookup_manager(requested, canonical, manager, now)
         cached = self.cache.get(canonical) if self.cache is not None else None
         status = str((cached or {}).get("catalog_status") or "")
         catalog_ttl = (
@@ -246,6 +295,45 @@ class DirectAmazonLookup:
             cache_status="cache_miss" if cached is None else "catalog_refreshed",
         )
 
+    def _lookup_manager(self, requested, canonical, manager, now):
+        listing = _manager_listing(manager)
+        listing["identity_status"] = "canonical_manager"
+        missing_catalog = any(
+            not listing.get(field) for field in ("asin", "title", "brand", "main_image")
+        )
+        if missing_catalog:
+            try:
+                catalog = self.catalog_lookup([canonical], f"direct:{canonical}").get(canonical) or {}
+                candidates = _compatible_listings([dict(row) for row in catalog.get("listings") or []])
+                match = next(
+                    (row for row in candidates if row.get("asin") == listing.get("asin")),
+                    None,
+                )
+                if match:
+                    for target, source in (
+                        ("title", "title"), ("brand", "brand"),
+                        ("main_image", "main_image"), ("product_type", "product_type"),
+                    ):
+                        listing[target] = listing.get(target) or match.get(source)
+            except Exception:
+                pass
+        asin = str(listing.get("asin") or "").strip()
+        if asin:
+            try:
+                pricing = dict(self.pricing_lookup([asin], f"direct:{canonical}").get(asin) or {"status": "missing"})
+            except Exception:
+                pricing = {"status": "error"}
+            listing.update(_pricing_fields(pricing))
+            if listing.get("pricing_status") == "success":
+                listing["pricing_observed_at"] = now.isoformat().replace("+00:00", "Z")
+        return _display_result(
+            requested=requested, canonical=canonical, catalog_status="resolved",
+            listings=[listing],
+            catalog_observed_at=(manager.get("identity") or {}).get("updated_at"),
+            pricing_observed_at=listing.get("pricing_observed_at"),
+            cache_status="manager_canonical",
+        )
+
     def _refresh_pricing(
         self, listing: dict[str, Any], context_id: str, now: datetime,
     ) -> None:
@@ -260,6 +348,7 @@ class DirectAmazonLookup:
 
 def run_direct_lookup(
     identifier: str, *, catalog_batch, pricing_batch, cache=None,
+    manager_lookup=None,
     freshness_policy: AmazonFreshnessPolicy | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> dict[str, Any]:
@@ -271,6 +360,7 @@ def run_direct_lookup(
         cache = DiscoveryAmazonCache(DiscoveryIncrementalStore())
     return DirectAmazonLookup(
         cache=cache, catalog_lookup=catalog_batch, pricing_lookup=pricing_batch,
+        manager_lookup=manager_lookup,
         freshness_policy=freshness_policy, now=now,
     ).lookup(identifier)
 
