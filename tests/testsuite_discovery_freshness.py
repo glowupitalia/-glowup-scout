@@ -1,12 +1,17 @@
 import copy
+import hashlib
+import json
 import tempfile
 import tracemalloc
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+from direct_lookup import DirectAmazonLookup
 from discovery_freshness import (
     AmazonFreshnessPolicy,
+    CACHE_PAYLOAD_SCHEMA_VERSION,
     DiscoveryAmazonCache,
     PlanAction,
     fee_cache_key,
@@ -497,7 +502,7 @@ class CacheIndexRegressionTests(unittest.TestCase):
                 0,
             )
 
-    def test_completed_job_cache_reuses_exact_fee_without_copying_listing_payload(self):
+    def test_completed_job_cache_materializes_exact_listing_and_fee_payloads(self):
         root = Path(self.temporary.name)
         store = DiscoveryIncrementalStore(root / "cache.sqlite3")
         identifier = self.identifiers[0]
@@ -532,11 +537,363 @@ class CacheIndexRegressionTests(unittest.TestCase):
             columns = {row["name"] for row in connection.execute(
                 "PRAGMA table_info(discovery_amazon_cache)"
             )}
-            fee_placeholder = connection.execute(
-                "SELECT observation_json FROM discovery_amazon_fee_cache"
-            ).fetchone()[0]
-        self.assertNotIn("payload_json", columns)
-        self.assertEqual(fee_placeholder, "{}")
+            listing_row = connection.execute(
+                "SELECT listings_json,payload_schema_version,payload_sha256 "
+                "FROM discovery_amazon_cache"
+            ).fetchone()
+            fee_row = connection.execute(
+                "SELECT observation_json,payload_schema_version,payload_sha256 "
+                "FROM discovery_amazon_fee_cache"
+            ).fetchone()
+        self.assertIn("listings_json", columns)
+        self.assertEqual(
+            listing_row["payload_schema_version"], CACHE_PAYLOAD_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            hashlib.sha256(listing_row["listings_json"].encode()).hexdigest(),
+            listing_row["payload_sha256"],
+        )
+        self.assertEqual(
+            fee_row["payload_schema_version"], CACHE_PAYLOAD_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            hashlib.sha256(fee_row["observation_json"].encode()).hexdigest(),
+            fee_row["payload_sha256"],
+        )
+        self.assertEqual(json.loads(fee_row["observation_json"])["fee_estimate"], {
+            "total_fees": 5,
+        })
+
+    def test_additive_cache_migration_upgrades_legacy_schema_idempotently(self):
+        root = Path(self.temporary.name)
+        store = DiscoveryIncrementalStore(root / "legacy.sqlite3")
+        store.initialize()
+        with store._connect() as connection:
+            connection.executescript("""
+                CREATE TABLE discovery_amazon_cache (
+                    canonical_identifier TEXT PRIMARY KEY, source_job_id TEXT NOT NULL,
+                    catalog_status TEXT NOT NULL, catalog_observed_at TEXT NOT NULL,
+                    freshness_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL
+                );
+                CREATE TABLE discovery_amazon_fee_cache (
+                    fee_cache_key TEXT PRIMARY KEY, source_job_id TEXT NOT NULL,
+                    observation_id TEXT NOT NULL, fee_status TEXT NOT NULL,
+                    fee_observed_at TEXT NOT NULL,
+                    observation_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL
+                );
+                CREATE TABLE discovery_amazon_cache_indexed_jobs (
+                    source_job_id TEXT PRIMARY KEY, source_updated_at TEXT NOT NULL,
+                    indexed_at TEXT NOT NULL
+                );
+            """)
+        cache = DiscoveryAmazonCache(store)
+        cache.initialize()
+        cache.initialize()
+        with store._connect() as connection:
+            catalog_columns = {
+                row["name"] for row in connection.execute(
+                    "PRAGMA table_info(discovery_amazon_cache)"
+                )
+            }
+            fee_columns = {
+                row["name"] for row in connection.execute(
+                    "PRAGMA table_info(discovery_amazon_fee_cache)"
+                )
+            }
+            marker_columns = {
+                row["name"] for row in connection.execute(
+                    "PRAGMA table_info(discovery_amazon_cache_indexed_jobs)"
+                )
+            }
+        self.assertTrue({
+            "listings_json", "payload_schema_version", "payload_sha256",
+            "materialized_at",
+        }.issubset(catalog_columns))
+        self.assertTrue({
+            "payload_schema_version", "payload_sha256", "materialized_at",
+        }.issubset(fee_columns))
+        self.assertTrue({
+            "materialization_version", "verification_state", "catalog_count",
+            "listing_count", "fee_count", "aggregate_sha256", "verified_at",
+        }.issubset(marker_columns))
+
+    def test_materialized_get_get_many_and_fee_do_not_read_source_payload_tables(self):
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        statements = []
+        original = self.store._new_connection
+
+        def traced_connection():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        self.store._new_connection = traced_connection
+        expected = cache.get(self.identifiers[0])
+        batch = dict(cache.get_many(self.identifiers))
+        fee = cache.fee("B000000000", 20)
+        source_reads = [
+            sql for sql in statements
+            if sql.lstrip().upper().startswith("SELECT")
+            and (
+                "FROM discovery_listings" in sql
+                or "FROM discovery_observations" in sql
+            )
+        ]
+        self.assertEqual(source_reads, [])
+        self.assertEqual(batch[self.identifiers[0]], expected)
+        self.assertEqual(fee["fee_status"], "valid")
+        self.assertEqual(fee["canonical_ean"], self.identifiers[0])
+        self.assertEqual(fee["asin"], "B000000000")
+
+    def test_materialized_negative_and_ambiguous_preserve_order_and_taxonomy(self):
+        root = Path(self.temporary.name)
+        store = DiscoveryIncrementalStore(root / "contracts.sqlite3")
+        negative, ambiguous = self.identifiers[:2]
+        listings = [
+            {
+                "asin": "B000000001", "title": "First", "bsr_beauty": 101,
+                "browse_classification": {
+                    "classification_id": "6306900031",
+                    "path_ids": ["3760911", "6306900031"],
+                },
+            },
+            {
+                "asin": "B000000002", "title": "Second", "bsr_beauty": 102,
+                "browse_classification": {
+                    "classification_id": "6306897031",
+                    "path_ids": ["3760911", "6306897031"],
+                },
+            },
+        ]
+        store.create_job(
+            {"job_id": "contracts", "status": "completed", "phase": "completed", "filters": {}},
+            [
+                {"canonical_ean": negative, "gtin": negative,
+                 "catalog_status": "not_found", "scenarios": []},
+                {"canonical_ean": ambiguous, "gtin": ambiguous,
+                 "catalog_status": "ambiguous", "scenarios": [],
+                 "amazon_listings": listings},
+            ],
+        )
+        cache = DiscoveryAmazonCache(store)
+        cache.index_completed_jobs()
+        statements = []
+        original = store._new_connection
+
+        def traced_connection():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        store._new_connection = traced_connection
+        self.assertEqual(cache.get(negative)["amazon_listings"], [])
+        cached = cache.get(ambiguous)
+        self.assertEqual([row["asin"] for row in cached["amazon_listings"]], [
+            "B000000001", "B000000002",
+        ])
+        self.assertEqual(
+            cached["amazon_listings"][1]["browse_classification"],
+            listings[1]["browse_classification"],
+        )
+        self.assertFalse(any("FROM discovery_listings" in sql for sql in statements))
+
+    def test_corrupt_materialized_payload_falls_back_to_legacy_source(self):
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        expected = cache.get(self.identifiers[0])
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE discovery_amazon_cache SET payload_sha256='corrupt' "
+                "WHERE canonical_identifier=?",
+                (self.identifiers[0],),
+            )
+            connection.commit()
+        statements = []
+        original = self.store._new_connection
+
+        def traced_connection():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        self.store._new_connection = traced_connection
+        self.assertEqual(cache.get(self.identifiers[0]), expected)
+        self.assertTrue(any("FROM discovery_listings" in sql for sql in statements))
+
+    def test_legacy_null_payload_and_fee_use_source_fallback(self):
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE discovery_amazon_cache SET listings_json=NULL,"
+                "payload_schema_version=NULL,payload_sha256=NULL "
+                "WHERE canonical_identifier=?",
+                (self.identifiers[0],),
+            )
+            connection.execute(
+                "UPDATE discovery_amazon_fee_cache SET payload_schema_version=NULL,"
+                "payload_sha256=NULL WHERE fee_cache_key=?",
+                (fee_cache_key("B000000000", 20),),
+            )
+            connection.commit()
+        statements = []
+        original = self.store._new_connection
+
+        def traced_connection():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        self.store._new_connection = traced_connection
+        self.assertEqual(cache.get(self.identifiers[0])["catalog_status"], "resolved")
+        self.assertEqual(cache.fee("B000000000", 20)["fee_status"], "valid")
+        self.assertTrue(any("FROM discovery_listings" in sql for sql in statements))
+        self.assertTrue(any("FROM discovery_observations" in sql for sql in statements))
+
+    def test_corrupt_materialized_fee_falls_back_to_source(self):
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        key = fee_cache_key("B000000000", 20)
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE discovery_amazon_fee_cache SET payload_sha256='corrupt' "
+                "WHERE fee_cache_key=?", (key,),
+            )
+            connection.commit()
+        statements = []
+        original = self.store._new_connection
+
+        def traced_connection():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        self.store._new_connection = traced_connection
+        self.assertEqual(cache.fee("B000000000", 20)["observation_id"], "observation-modern")
+        self.assertTrue(any("FROM discovery_observations" in sql for sql in statements))
+
+    def test_materialized_cache_serves_direct_lookup_without_source_reads(self):
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        statements = []
+        original = self.store._new_connection
+
+        def traced_connection():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        self.store._new_connection = traced_connection
+        resolver = DirectAmazonLookup(
+            cache=cache,
+            catalog_lookup=lambda *_: self.fail("Catalog must not be called"),
+            pricing_lookup=lambda *_: self.fail("Pricing must not be called"),
+            freshness_policy=AmazonFreshnessPolicy(), now=lambda: NOW,
+        )
+        result = resolver.lookup(self.identifiers[0])
+        self.assertEqual(result["catalog_status"], "resolved")
+        self.assertFalse(any(
+            "FROM discovery_listings" in sql or "FROM discovery_observations" in sql
+            for sql in statements
+        ))
+
+    def test_canonical_payload_hash_is_order_independent_and_semantic(self):
+        from discovery_freshness import _canonical_payload
+
+        first_payload, first_hash = _canonical_payload({"b": 2, "a": {"y": 1, "x": 0}})
+        second_payload, second_hash = _canonical_payload({"a": {"x": 0, "y": 1}, "b": 2})
+        _, changed_hash = _canonical_payload({"a": {"x": 0, "y": 2}, "b": 2})
+        self.assertEqual(first_payload, second_payload)
+        self.assertEqual(first_hash, second_hash)
+        self.assertNotEqual(first_hash, changed_hash)
+
+    def test_materialization_failure_preserves_valid_cache_and_unverified_marker(self):
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        with self.store._connect() as connection:
+            before = connection.execute(
+                "SELECT listings_json,payload_sha256 FROM discovery_amazon_cache "
+                "WHERE canonical_identifier=?", (self.identifiers[0],),
+            ).fetchone()
+            before_marker = dict(self._marker())
+            connection.execute(
+                "UPDATE discovery_listings SET updated_at='2099-01-01T00:00:00Z' "
+                "WHERE job_id='source' AND canonical_identifier=?",
+                (self.identifiers[0],),
+            )
+            connection.commit()
+        with patch(
+            "discovery_freshness._canonical_payload",
+            side_effect=ValueError("materialization failed"),
+        ):
+            with self.assertRaisesRegex(ValueError, "materialization failed"):
+                cache.index_completed_jobs()
+        with self.store._connect() as connection:
+            after = connection.execute(
+                "SELECT listings_json,payload_sha256 FROM discovery_amazon_cache "
+                "WHERE canonical_identifier=?", (self.identifiers[0],),
+            ).fetchone()
+            after_marker = dict(self._marker())
+        self.assertEqual(tuple(before), tuple(after))
+        self.assertEqual(before_marker, after_marker)
+
+    def test_materialization_marker_is_verified_with_counts_and_stable_hash(self):
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        marker = self._marker()
+        self.assertEqual(marker["materialization_version"], CACHE_PAYLOAD_SCHEMA_VERSION)
+        self.assertEqual(marker["verification_state"], "verified")
+        self.assertEqual(marker["catalog_count"], 3)
+        self.assertEqual(marker["listing_count"], 3)
+        self.assertEqual(marker["fee_count"], 2)
+        self.assertEqual(len(marker["aggregate_sha256"]), 64)
+        self.assertTrue(marker["verified_at"])
+
+    def test_materialized_and_legacy_results_have_identical_freshness_contract(self):
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        materialized = dict(cache.get_many(self.identifiers))
+        materialized_plans = {
+            identifier: plan_cached_product(value, policy=AmazonFreshnessPolicy(), now=NOW)
+            for identifier, value in materialized.items()
+        }
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE discovery_amazon_cache SET listings_json=NULL,"
+                "payload_schema_version=NULL,payload_sha256=NULL"
+            )
+            connection.execute(
+                "UPDATE discovery_amazon_fee_cache SET payload_schema_version=NULL,"
+                "payload_sha256=NULL"
+            )
+            connection.commit()
+        legacy = dict(cache.get_many(self.identifiers))
+        legacy_plans = {
+            identifier: plan_cached_product(value, policy=AmazonFreshnessPolicy(), now=NOW)
+            for identifier, value in legacy.items()
+        }
+        self.assertEqual(materialized, legacy)
+        self.assertEqual(materialized_plans, legacy_plans)
+
+    def test_running_and_resumable_jobs_are_not_indexed_or_materialized(self):
+        identifier = valid_gtin(999)
+        self.store.create_job(
+            {"job_id": "running", "status": "running", "phase": "catalog", "filters": {}},
+            [{"canonical_ean": identifier, "gtin": identifier,
+              "catalog_status": "not_found", "scenarios": []}],
+        )
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        with self.store._connect() as connection:
+            self.assertIsNone(connection.execute(
+                "SELECT 1 FROM discovery_amazon_cache WHERE canonical_identifier=?",
+                (identifier,),
+            ).fetchone())
+            self.assertIsNone(connection.execute(
+                "SELECT 1 FROM discovery_amazon_cache_indexed_jobs "
+                "WHERE source_job_id='running'",
+            ).fetchone())
 
     def test_one_thousand_fresh_cached_products_complete_without_amazon_calls(self):
         root = Path(self.temporary.name)

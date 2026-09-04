@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -18,6 +19,28 @@ from typing import Any, Iterable
 
 
 POLICY_VERSION = "amazon_freshness_v1"
+CACHE_PAYLOAD_SCHEMA_VERSION = "amazon_cache_payload_v1"
+
+
+def _canonical_payload(value: Any) -> tuple[str, str]:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return payload, digest
+
+
+def _verified_payload(payload: Any, version: Any, digest: Any) -> Any | None:
+    if payload is None or version != CACHE_PAYLOAD_SCHEMA_VERSION or not digest:
+        return None
+    encoded = str(payload)
+    if hashlib.sha256(encoded.encode("utf-8")).hexdigest() != str(digest):
+        return None
+    try:
+        value = json.loads(encoded)
+    except (TypeError, ValueError):
+        return None
+    return value
 
 
 class PlanAction(str, Enum):
@@ -168,6 +191,10 @@ CREATE TABLE IF NOT EXISTS discovery_amazon_cache (
     catalog_status TEXT NOT NULL,
     catalog_observed_at TEXT NOT NULL,
     freshness_json TEXT NOT NULL DEFAULT '{}',
+    listings_json TEXT NULL,
+    payload_schema_version TEXT NULL,
+    payload_sha256 TEXT NULL,
+    materialized_at TEXT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS discovery_amazon_fee_cache (
@@ -177,6 +204,9 @@ CREATE TABLE IF NOT EXISTS discovery_amazon_fee_cache (
     fee_status TEXT NOT NULL,
     fee_observed_at TEXT NOT NULL,
     observation_json TEXT NOT NULL DEFAULT '{}',
+    payload_schema_version TEXT NULL,
+    payload_sha256 TEXT NULL,
+    materialized_at TEXT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_amazon_cache_source
@@ -184,7 +214,14 @@ ON discovery_amazon_cache(source_job_id);
 CREATE TABLE IF NOT EXISTS discovery_amazon_cache_indexed_jobs (
     source_job_id TEXT PRIMARY KEY,
     source_updated_at TEXT NOT NULL,
-    indexed_at TEXT NOT NULL
+    indexed_at TEXT NOT NULL,
+    materialization_version TEXT NULL,
+    verification_state TEXT NULL,
+    catalog_count INTEGER NULL,
+    listing_count INTEGER NULL,
+    fee_count INTEGER NULL,
+    aggregate_sha256 TEXT NULL,
+    verified_at TEXT NULL
 );
 """
 
@@ -194,20 +231,58 @@ class DiscoveryAmazonCache:
 
     def __init__(self, incremental_store):
         self.store = incremental_store
+        self._initialized = False
 
     def initialize(self):
+        if self._initialized:
+            return
         self.store.initialize()
         with self.store._connect() as connection:
             connection.executescript(CACHE_SCHEMA)
-            columns = {
-                row["name"] for row in connection.execute(
-                    "PRAGMA table_info(discovery_amazon_cache)"
-                )
+            additions = {
+                "discovery_amazon_cache": {
+                    "freshness_json": "TEXT NOT NULL DEFAULT '{}'",
+                    "listings_json": "TEXT NULL",
+                    "payload_schema_version": "TEXT NULL",
+                    "payload_sha256": "TEXT NULL",
+                    "materialized_at": "TEXT NULL",
+                },
+                "discovery_amazon_fee_cache": {
+                    "payload_schema_version": "TEXT NULL",
+                    "payload_sha256": "TEXT NULL",
+                    "materialized_at": "TEXT NULL",
+                },
+                "discovery_amazon_cache_indexed_jobs": {
+                    "materialization_version": "TEXT NULL",
+                    "verification_state": "TEXT NULL",
+                    "catalog_count": "INTEGER NULL",
+                    "listing_count": "INTEGER NULL",
+                    "fee_count": "INTEGER NULL",
+                    "aggregate_sha256": "TEXT NULL",
+                    "verified_at": "TEXT NULL",
+                },
             }
-            if "freshness_json" not in columns:
-                connection.execute(
-                    "ALTER TABLE discovery_amazon_cache ADD COLUMN freshness_json TEXT NOT NULL DEFAULT '{}'"
-                )
+            for table, definitions in additions.items():
+                columns = {
+                    row["name"] for row in connection.execute(
+                        f"PRAGMA table_info({table})"
+                    )
+                }
+                for name, definition in definitions.items():
+                    if name not in columns:
+                        try:
+                            connection.execute(
+                                f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                            )
+                        except sqlite3.OperationalError:
+                            current = {
+                                row["name"] for row in connection.execute(
+                                    f"PRAGMA table_info({table})"
+                                )
+                            }
+                            if name not in current:
+                                raise
+        self._initialized = True
 
     @staticmethod
     def _source_revision(connection, job_id: str) -> tuple[str, str, int, list]:
@@ -295,6 +370,9 @@ class DiscoveryAmazonCache:
         for job, revision, _item_count, observation_rows in pending_jobs:
             job_id = str(job["job_id"])
             with self.store._connect() as connection:
+                materialized_catalog = []
+                materialized_fees = []
+                listing_count = 0
                 observations = []
                 observations_by_id = {}
                 observations_by_pair = {}
@@ -317,13 +395,14 @@ class DiscoveryAmazonCache:
                 ).fetchall()
                 for row in rows:
                     identifier = str(row["canonical_identifier"])
-                    listings = [
+                    source_listings = [
                         json.loads(value[0]) for value in connection.execute(
                             """SELECT listing_json FROM discovery_listings
                                WHERE job_id=? AND canonical_identifier=? ORDER BY asin""",
                             (job_id, identifier),
                         )
                     ]
+                    listings = [dict(listing) for listing in source_listings]
                     for listing in listings:
                         listing.setdefault("catalog_observed_at", row["updated_at"])
                         asin = str(listing.get("asin") or "")
@@ -375,20 +454,30 @@ class DiscoveryAmazonCache:
                              if item.get("fee_observed_at")), default=None,
                         ),
                     }
+                    listings_json, listings_sha256 = _canonical_payload(source_listings)
                     connection.execute(
                         """INSERT INTO discovery_amazon_cache
                            (canonical_identifier,source_job_id,catalog_status,catalog_observed_at,
-                            freshness_json,updated_at) VALUES (?,?,?,?,?,?)
+                            freshness_json,listings_json,payload_schema_version,payload_sha256,
+                            materialized_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(canonical_identifier) DO UPDATE SET
                              source_job_id=excluded.source_job_id,
                              catalog_status=excluded.catalog_status,
                              catalog_observed_at=excluded.catalog_observed_at,
                              freshness_json=excluded.freshness_json,
+                             listings_json=excluded.listings_json,
+                             payload_schema_version=excluded.payload_schema_version,
+                             payload_sha256=excluded.payload_sha256,
+                             materialized_at=excluded.materialized_at,
                              updated_at=excluded.updated_at
                            WHERE excluded.catalog_observed_at >= discovery_amazon_cache.catalog_observed_at""",
                         (identifier, job_id, row["catalog_status"], row["updated_at"],
-                         json.dumps(freshness, sort_keys=True, separators=(",", ":")), observed),
+                         json.dumps(freshness, sort_keys=True, separators=(",", ":")),
+                         listings_json, CACHE_PAYLOAD_SCHEMA_VERSION, listings_sha256,
+                         observed, observed),
                     )
+                    listing_count += len(source_listings)
+                    materialized_catalog.append((identifier, listings_sha256))
                     indexed += 1
                     completed += 1
                     if progress is not None and (
@@ -402,30 +491,54 @@ class DiscoveryAmazonCache:
                     if not key or not value.get("fee_status"):
                         continue
                     fee_at = value.get("fee_last_attempt_at") or value.get("observed_at") or row["updated_at"]
+                    observation_json, observation_sha256 = _canonical_payload(value)
                     connection.execute(
                         """INSERT INTO discovery_amazon_fee_cache
                            (fee_cache_key,source_job_id,observation_id,fee_status,fee_observed_at,
-                            observation_json,updated_at) VALUES (?,?,?,?,?,'{}',?)
+                            observation_json,payload_schema_version,payload_sha256,materialized_at,
+                            updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(fee_cache_key) DO UPDATE SET
                              source_job_id=excluded.source_job_id,
                              observation_id=excluded.observation_id,
                              fee_status=excluded.fee_status,
                              fee_observed_at=excluded.fee_observed_at,
-                             observation_json='{}',
+                             observation_json=excluded.observation_json,
+                             payload_schema_version=excluded.payload_schema_version,
+                             payload_sha256=excluded.payload_sha256,
+                             materialized_at=excluded.materialized_at,
                              updated_at=excluded.updated_at
                            WHERE excluded.fee_observed_at >= discovery_amazon_fee_cache.fee_observed_at""",
                         (key, job_id, row["observation_id"], value["fee_status"], fee_at,
-                         observed),
+                         observation_json, CACHE_PAYLOAD_SCHEMA_VERSION,
+                         observation_sha256, observed, observed),
                     )
+                    materialized_fees.append((key, observation_sha256))
                     if progress is not None and observation_index % max(1, int(batch_size)) == 0:
                         progress("preparing_cache", completed, total)
+                aggregate_payload = {
+                    "catalog": sorted(materialized_catalog),
+                    "fees": sorted(materialized_fees),
+                    "source_revision": revision,
+                }
+                _, aggregate_sha256 = _canonical_payload(aggregate_payload)
                 connection.execute(
                     """INSERT INTO discovery_amazon_cache_indexed_jobs
-                       (source_job_id,source_updated_at,indexed_at) VALUES (?,?,?)
+                       (source_job_id,source_updated_at,indexed_at,materialization_version,
+                        verification_state,catalog_count,listing_count,fee_count,
+                        aggregate_sha256,verified_at) VALUES (?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(source_job_id) DO UPDATE SET
                          source_updated_at=excluded.source_updated_at,
-                         indexed_at=excluded.indexed_at""",
-                    (job_id, revision, observed),
+                         indexed_at=excluded.indexed_at,
+                         materialization_version=excluded.materialization_version,
+                         verification_state=excluded.verification_state,
+                         catalog_count=excluded.catalog_count,
+                         listing_count=excluded.listing_count,
+                         fee_count=excluded.fee_count,
+                         aggregate_sha256=excluded.aggregate_sha256,
+                         verified_at=excluded.verified_at""",
+                    (job_id, revision, observed, CACHE_PAYLOAD_SCHEMA_VERSION,
+                     "verified", len(materialized_catalog), listing_count,
+                     len(materialized_fees), aggregate_sha256, observed),
                 )
                 connection.commit()
         if progress is not None and pending_jobs:
@@ -436,19 +549,27 @@ class DiscoveryAmazonCache:
         self.initialize()
         with self.store._connect() as connection:
             row = connection.execute(
-                """SELECT source_job_id,catalog_status,catalog_observed_at,freshness_json
+                """SELECT source_job_id,catalog_status,catalog_observed_at,freshness_json,
+                          listings_json,payload_schema_version,payload_sha256
                    FROM discovery_amazon_cache WHERE canonical_identifier=?""",
                 (identifier,),
             ).fetchone()
             if not row:
                 return None
-            listings = []
-            for value in connection.execute(
-                """SELECT listing_json,updated_at FROM discovery_listings
-                   WHERE job_id=? AND canonical_identifier=? ORDER BY asin""",
-                (row["source_job_id"], identifier),
-            ):
-                listing = json.loads(value["listing_json"])
+            listings = _verified_payload(
+                row["listings_json"], row["payload_schema_version"],
+                row["payload_sha256"],
+            )
+            if not isinstance(listings, list):
+                listings = [
+                    json.loads(value["listing_json"])
+                    for value in connection.execute(
+                        """SELECT listing_json,updated_at FROM discovery_listings
+                           WHERE job_id=? AND canonical_identifier=? ORDER BY asin""",
+                        (row["source_job_id"], identifier),
+                    )
+                ]
+            for listing in listings:
                 listing.setdefault("catalog_observed_at", row["catalog_observed_at"])
                 key = fee_cache_key(
                     listing.get("asin"), listing.get("reference_price"),
@@ -463,7 +584,6 @@ class DiscoveryAmazonCache:
                         listing["fee_cache_key"] = key
                         listing["fee_status"] = fee_row["fee_status"]
                         listing["fee_observed_at"] = fee_row["fee_observed_at"]
-                listings.append(listing)
         value = {
             "source_job_id": row["source_job_id"],
             "catalog_status": row["catalog_status"],
@@ -504,22 +624,47 @@ class DiscoveryAmazonCache:
             with self.store._connect() as connection:
                 rows = connection.execute(
                     f"""SELECT canonical_identifier,source_job_id,catalog_status,catalog_observed_at,
-                               freshness_json
+                               freshness_json,listings_json,payload_schema_version,payload_sha256
                         FROM discovery_amazon_cache
                         WHERE canonical_identifier IN ({placeholders})""",
                     tuple(batch),
                 ).fetchall()
-                listing_rows = connection.execute(
-                    f"""SELECT l.job_id,l.canonical_identifier,l.listing_json,l.updated_at
-                        FROM discovery_listings l JOIN discovery_amazon_cache c
-                          ON c.source_job_id=l.job_id
-                         AND c.canonical_identifier=l.canonical_identifier
-                        WHERE c.canonical_identifier IN ({placeholders})
-                        ORDER BY l.canonical_identifier,l.asin""",
-                    tuple(batch),
-                ).fetchall()
+                materialized = {}
+                legacy_identifiers = []
+                for row in rows:
+                    identifier = str(row["canonical_identifier"])
+                    listings = _verified_payload(
+                        row["listings_json"], row["payload_schema_version"],
+                        row["payload_sha256"],
+                    )
+                    if isinstance(listings, list):
+                        materialized[identifier] = listings
+                    else:
+                        legacy_identifiers.append(identifier)
+                if legacy_identifiers:
+                    legacy_placeholders = ",".join("?" for _ in legacy_identifiers)
+                    listing_rows = connection.execute(
+                        f"""SELECT l.job_id,l.canonical_identifier,l.listing_json,l.updated_at
+                            FROM discovery_listings l JOIN discovery_amazon_cache c
+                              ON c.source_job_id=l.job_id
+                             AND c.canonical_identifier=l.canonical_identifier
+                            WHERE c.canonical_identifier IN ({legacy_placeholders})
+                            ORDER BY l.canonical_identifier,l.asin""",
+                        tuple(legacy_identifiers),
+                    ).fetchall()
+                else:
+                    listing_rows = []
                 parsed_listing_rows = []
                 fee_keys = set()
+                for identifier, listings in materialized.items():
+                    for listing in listings:
+                        key = fee_cache_key(
+                            listing.get("asin"), listing.get("reference_price"),
+                            listing.get("currency") or "EUR",
+                        )
+                        if key:
+                            fee_keys.add(key)
+                        parsed_listing_rows.append((identifier, listing, key))
                 for listing_row in listing_rows:
                     listing = json.loads(listing_row["listing_json"])
                     key = fee_cache_key(
@@ -528,7 +673,9 @@ class DiscoveryAmazonCache:
                     )
                     if key:
                         fee_keys.add(key)
-                    parsed_listing_rows.append((listing_row, listing, key))
+                    parsed_listing_rows.append((
+                        str(listing_row["canonical_identifier"]), listing, key,
+                    ))
                 if fee_keys:
                     fee_placeholders = ",".join("?" for _ in fee_keys)
                     fee_rows = connection.execute(
@@ -542,14 +689,14 @@ class DiscoveryAmazonCache:
             found = {str(row["canonical_identifier"]): row for row in rows}
             fee_by_key = {str(row["fee_cache_key"]): row for row in fee_rows}
             listings_by_identifier: dict[str, list[dict[str, Any]]] = {}
-            for listing_row, listing, key in parsed_listing_rows:
+            for listing_identifier, listing, key in parsed_listing_rows:
                 fee_row = fee_by_key.get(key or "")
                 if fee_row:
                     listing["fee_cache_key"] = key
                     listing["fee_status"] = fee_row["fee_status"]
                     listing["fee_observed_at"] = fee_row["fee_observed_at"]
                 listings_by_identifier.setdefault(
-                    str(listing_row["canonical_identifier"]), []
+                    listing_identifier, []
                 ).append(listing)
             for identifier in batch:
                 row = found.get(identifier)
@@ -635,17 +782,27 @@ class DiscoveryAmazonCache:
         self.initialize()
         with self.store._connect() as connection:
             row = connection.execute(
-                """SELECT observation.observation_json,cache.fee_observed_at
-                   FROM discovery_amazon_fee_cache cache
-                   JOIN discovery_observations observation
-                     ON observation.job_id=cache.source_job_id
-                    AND observation.observation_id=cache.observation_id
-                   WHERE cache.fee_cache_key=?""",
+                """SELECT source_job_id,observation_id,observation_json,fee_observed_at,
+                          payload_schema_version,payload_sha256
+                   FROM discovery_amazon_fee_cache WHERE fee_cache_key=?""",
                 (key,),
             ).fetchone()
         if not row:
             return None
-        value = json.loads(row["observation_json"])
+        value = _verified_payload(
+            row["observation_json"], row["payload_schema_version"],
+            row["payload_sha256"],
+        )
+        if not isinstance(value, dict):
+            with self.store._connect() as connection:
+                source = connection.execute(
+                    """SELECT observation_json FROM discovery_observations
+                       WHERE job_id=? AND observation_id=?""",
+                    (row["source_job_id"], row["observation_id"]),
+                ).fetchone()
+            if not source:
+                return None
+            value = json.loads(source["observation_json"])
         value["fee_observed_at"] = row["fee_observed_at"]
         value["fee_cache_key"] = key
         return value
@@ -653,6 +810,7 @@ class DiscoveryAmazonCache:
 
 __all__ = [
     "AmazonFreshnessPolicy", "DiscoveryAmazonCache", "PlanAction",
-    "POLICY_VERSION", "fee_cache_key", "plan_cached_product", "planning_counts",
+    "CACHE_PAYLOAD_SCHEMA_VERSION", "POLICY_VERSION", "fee_cache_key",
+    "plan_cached_product", "planning_counts",
     "reusable_fee",
 ]
