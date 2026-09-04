@@ -28,6 +28,9 @@ from discovery_taxonomy import projection_rows
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATABASE = PROJECT_ROOT / "data" / "discovery_incremental.sqlite3"
 SCHEMA_VERSION = 1
+RETENTION_MODE_FULL = "full"
+RETENTION_MODE_FINAL_ONLY = "final_only"
+TERMINAL_SUMMARY_VERSION = 1
 TERMINAL_CATALOG_STATUSES = {
     "resolved", "ambiguous", "not_found", "invalid_identifier",
 }
@@ -173,6 +176,15 @@ def _dump(value: Any) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         default=str,
     )
+
+
+def _terminal_summary_digest(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(_dump(payload).encode("utf-8")).hexdigest()
+
+
+def _retention_mode(metadata: dict[str, Any]) -> str:
+    value = str(metadata.get("retention_mode") or RETENTION_MODE_FULL).casefold()
+    return value if value in {RETENTION_MODE_FULL, RETENTION_MODE_FINAL_ONLY} else RETENTION_MODE_FULL
 
 
 def _scenario_identity(candidate_identifier: str, scenario: dict[str, Any], index: int) -> str:
@@ -683,8 +695,9 @@ class DiscoveryIncrementalStore:
         )
 
     def summary(self, job_id: str, *, connection=None) -> dict[str, Any]:
-        self.initialize()
         owns = connection is None
+        if owns:
+            self.initialize()
         connection = connection or self._new_connection()
         try:
             job = connection.execute(
@@ -692,6 +705,37 @@ class DiscoveryIncrementalStore:
             ).fetchone()
             if not job:
                 raise KeyError(job_id)
+            metadata = json.loads(job["metadata_json"] or "{}")
+            public_metadata = {
+                key: value for key, value in metadata.items()
+                if key not in {"terminal_summary", "terminal_summary_sha256"}
+            }
+            mode = _retention_mode(metadata)
+            terminal = metadata.get("terminal_summary")
+            terminal_hash = metadata.get("terminal_summary_sha256")
+            terminal_valid = (
+                isinstance(terminal, dict)
+                and int(metadata.get("terminal_summary_version") or 0)
+                == TERMINAL_SUMMARY_VERSION
+                and terminal_hash == _terminal_summary_digest(terminal)
+            )
+            if mode == RETENTION_MODE_FINAL_ONLY:
+                if not terminal_valid:
+                    raise ValueError(
+                        f"FINAL_ONLY job {job_id} has no valid terminal summary"
+                    )
+                return {
+                    **public_metadata, **terminal,
+                    "job_id": job_id,
+                    "incremental_schema_version": int(job["schema_version"]),
+                    "incremental_store": str(self.path),
+                    "status": job["status"], "phase": job["phase"],
+                    "retention_mode": RETENTION_MODE_FINAL_ONLY,
+                    "exact_replay_capable": False,
+                    "legacy_checkpoint_path": job["legacy_checkpoint_path"],
+                    "legacy_checkpoint_sha256": job["legacy_checkpoint_sha256"],
+                    "updated_at": job["updated_at"],
+                }
             statuses = {
                 (row["catalog_status"] or "pending"): int(row["amount"])
                 for row in connection.execute(
@@ -705,10 +749,9 @@ class DiscoveryIncrementalStore:
             scenarios = connection.execute(
                 "SELECT COUNT(*) FROM discovery_purchase_scenarios WHERE job_id=?", (job_id,)
             ).fetchone()[0]
-            metadata = json.loads(job["metadata_json"] or "{}")
             completed = sum(statuses.get(value, 0) for value in TERMINAL_CATALOG_STATUSES)
             return {
-                **metadata,
+                **public_metadata,
                 "job_id": job_id,
                 "incremental_schema_version": int(job["schema_version"]),
                 "incremental_store": str(self.path),
@@ -723,10 +766,197 @@ class DiscoveryIncrementalStore:
                 "last_completed_batch": int(job["last_completed_batch"]),
                 "checkpoint_bytes_written": int(job["checkpoint_bytes_written"]),
                 "updated_at": job["updated_at"],
+                "retention_mode": mode,
+                "exact_replay_capable": True,
             }
         finally:
             if owns:
                 connection.close()
+
+    def _terminal_summary_payload(
+        self, job_id: str, *, connection, state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Capture only terminal facts that would otherwise depend on prunable rows."""
+        current = self.summary(job_id, connection=connection)
+        notification = self.notification_summary(job_id, connection=connection)
+        payload = {
+            key: current.get(key)
+            for key in (
+                "selected_count", "catalog_completed_count", "catalog_pending_count",
+                "catalog_status_counts", "listing_count", "scenario_count",
+                "last_completed_batch", "checkpoint_bytes_written",
+            )
+        }
+        payload.update(notification)
+        allowed_state = {
+            "sampled_identifier_count", "prepared_current", "prepared_total",
+            "progress_current", "progress_total", "progress_phase",
+            "total_supplier_ean_universe", "eligible_identifier_count",
+            "requested_universe_count", "amazon_found_count", "beauty_count",
+            "bsr_passed_count", "pricing_target_count", "pricing_valid_count",
+            "competition_input_count", "competition_passed_count",
+            "fee_target_count", "fee_valid_count", "fee_unavailable_count",
+            "fee_pending_count", "fee_coverage_partial", "combination_count",
+            "final_opportunity_count", "final_products", "funnel",
+            "partial_coverage", "errors", "created_at", "started_at",
+            "completed_at", "duration_seconds", "phase_durations",
+            "operational_export", "export_state", "technical_export",
+        }
+        for key in allowed_state:
+            if state is not None and key in state:
+                payload[key] = state[key]
+        payload["retention_mode"] = RETENTION_MODE_FULL
+        payload["exact_replay_capable"] = True
+        return payload
+
+    def terminal_summary_status(self, job_id: str, *, connection=None) -> dict[str, Any]:
+        """Return the additive storage contract without reading heavy job rows."""
+        owns = connection is None
+        if owns:
+            self.initialize()
+        connection = connection or self._new_connection()
+        try:
+            row = connection.execute(
+                "SELECT status,metadata_json FROM discovery_incremental_jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(job_id)
+            metadata = json.loads(row["metadata_json"] or "{}")
+            payload = metadata.get("terminal_summary")
+            valid = (
+                isinstance(payload, dict)
+                and int(metadata.get("terminal_summary_version") or 0)
+                == TERMINAL_SUMMARY_VERSION
+                and metadata.get("terminal_summary_sha256")
+                == _terminal_summary_digest(payload)
+            )
+            return {
+                "retention_mode": _retention_mode(metadata),
+                "exact_replay_capable": _retention_mode(metadata) == RETENTION_MODE_FULL,
+                "terminal_summary_present": isinstance(payload, dict),
+                "terminal_summary_valid": valid,
+                "terminal_summary_sha256": metadata.get("terminal_summary_sha256"),
+                "status": row["status"],
+            }
+        finally:
+            if owns:
+                connection.close()
+
+    def terminal_summary_dry_run(
+        self, job_id: str, *, state: dict[str, Any] | None = None, connection=None,
+    ) -> dict[str, Any]:
+        """Build and verify a historical snapshot without writing production state."""
+        owns = connection is None
+        if owns:
+            self.initialize()
+            connection = self._new_connection()
+        try:
+            row = connection.execute(
+                "SELECT status FROM discovery_incremental_jobs WHERE job_id=?", (job_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(job_id)
+            payload = self._terminal_summary_payload(
+                job_id, connection=connection, state=state,
+            )
+            source_status = row["status"]
+            blockers = []
+            if str(source_status) != "completed":
+                blockers.append("source_not_completed")
+            if int(payload.get("catalog_pending_count") or 0) != 0:
+                blockers.append("catalog_not_terminal")
+            return {
+                "job_id": job_id, "source_status": source_status,
+                "eligible_source": not blockers, "blockers": blockers,
+                "terminal_summary": payload,
+                "terminal_summary_sha256": _terminal_summary_digest(payload),
+            }
+        finally:
+            if owns:
+                connection.close()
+
+    def complete_with_terminal_summary(
+        self, job_id: str, state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically persist terminal facts and the completed job transition."""
+        self.initialize()
+        observed = _now()
+
+        def complete(connection):
+            row = connection.execute(
+                "SELECT metadata_json FROM discovery_incremental_jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(job_id)
+            metadata = json.loads(row["metadata_json"] or "{}")
+            existing = metadata.get("terminal_summary")
+            existing_valid = (
+                isinstance(existing, dict)
+                and int(metadata.get("terminal_summary_version") or 0)
+                == TERMINAL_SUMMARY_VERSION
+                and metadata.get("terminal_summary_sha256")
+                == _terminal_summary_digest(existing)
+            )
+            payload = existing if existing_valid else self._terminal_summary_payload(
+                job_id, connection=connection, state=state,
+            )
+            if int(payload.get("catalog_pending_count") or 0) != 0:
+                raise ValueError("Discovery computation is not complete")
+            metadata.update({
+                "retention_mode": RETENTION_MODE_FULL,
+                "terminal_summary_version": TERMINAL_SUMMARY_VERSION,
+                "terminal_summary": payload,
+                "terminal_summary_sha256": _terminal_summary_digest(payload),
+                "terminal_summary_created_at": metadata.get(
+                    "terminal_summary_created_at"
+                ) or observed,
+            })
+            connection.execute(
+                """UPDATE discovery_incremental_jobs
+                   SET status='completed',phase='completed',metadata_json=?,updated_at=?
+                   WHERE job_id=?""",
+                (_dump(metadata), observed, job_id),
+            )
+            return payload
+
+        payload = self._immediate_transaction(
+            complete, job_id=job_id, name="complete_with_terminal_summary",
+        )
+        return {**state, **payload, "status": "completed", "phase": "completed"}
+
+    def set_retention_mode(
+        self, job_id: str, mode: str, *, eligibility: dict[str, Any] | None = None,
+    ) -> None:
+        """Change only the explicit storage contract; this never deletes rows."""
+        normalized = str(mode).casefold()
+        if normalized not in {RETENTION_MODE_FULL, RETENTION_MODE_FINAL_ONLY}:
+            raise ValueError(f"Unsupported retention mode: {mode}")
+
+        def update(connection):
+            row = connection.execute(
+                "SELECT status,metadata_json FROM discovery_incremental_jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(job_id)
+            metadata = json.loads(row["metadata_json"] or "{}")
+            if normalized == RETENTION_MODE_FINAL_ONLY:
+                if not eligibility or not eligibility.get("eligible"):
+                    raise ValueError(
+                        "FINAL_ONLY requires a successful reference-aware eligibility gate"
+                    )
+                status = self.terminal_summary_status(job_id, connection=connection)
+                if row["status"] != "completed" or not status["terminal_summary_valid"]:
+                    raise ValueError("Only completed jobs with a valid terminal summary can be FINAL_ONLY")
+            metadata["retention_mode"] = normalized
+            connection.execute(
+                "UPDATE discovery_incremental_jobs SET metadata_json=?,updated_at=? WHERE job_id=?",
+                (_dump(metadata), _now(), job_id),
+            )
+
+        self._immediate_transaction(update, job_id=job_id, name="set_retention_mode")
 
     def pending_catalog_batch(self, job_id: str, limit: int = 20) -> list[dict[str, Any]]:
         self.initialize()
@@ -1330,7 +1560,7 @@ class DiscoveryIncrementalStore:
             ).fetchone()
         return int(row["completed"] or 0), int(row["total"] or 0)
 
-    def notification_summary(self, job_id: str) -> dict[str, Any]:
+    def notification_summary(self, job_id: str, *, connection=None) -> dict[str, Any]:
         """Return a bounded, authoritative terminal-notification projection.
 
         Terminal email rendering must not depend on an in-memory ``results``
@@ -1338,8 +1568,11 @@ class DiscoveryIncrementalStore:
         and only the single best final product (plus its recommended scenario)
         is decoded.
         """
-        self.initialize()
-        with self._connect() as connection:
+        owns = connection is None
+        if owns:
+            self.initialize()
+        connection = connection or self._new_connection()
+        try:
             job = connection.execute(
                 """SELECT selected_count FROM discovery_incremental_jobs
                    WHERE job_id=?""", (job_id,),
@@ -1419,10 +1652,10 @@ class DiscoveryIncrementalStore:
                     if combination.get("score") is not None else product.get("score"),
                     "combination_id": combination.get("combination_id"),
                 }
-        target = int(observation["target_count"] or 0)
-        valid = int(observation["valid_count"] or 0)
-        unavailable = int(observation["unavailable_count"] or 0)
-        return {
+            target = int(observation["target_count"] or 0)
+            valid = int(observation["valid_count"] or 0)
+            unavailable = int(observation["unavailable_count"] or 0)
+            return {
             "selected_count": int(job["selected_count"]),
             "sampled_identifier_count": int(job["selected_count"]),
             "amazon_found_count": int(listing["product_count"] or 0),
@@ -1440,8 +1673,11 @@ class DiscoveryIncrementalStore:
             "combination_count": int(combination_count),
             "final_opportunity_count": int(final_count),
             "final_products": int(final_count),
-            "best_opportunity": best_opportunity,
-        }
+                "best_opportunity": best_opportunity,
+            }
+        finally:
+            if owns:
+                connection.close()
 
     def definitive_catalog_statuses(self, job_id: str) -> dict[str, str]:
         with self._connect() as connection:

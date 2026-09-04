@@ -22,6 +22,7 @@ from discovery_incremental import (
     DiscoveryIncrementalStore,
     IncrementalCandidateCollection,
     LightweightCheckpointStore,
+    RETENTION_MODE_FINAL_ONLY,
 )
 from discovery_jobs import DiscoveryJobRegistry
 from discovery_resources import ResourcePause, ResourceSnapshot
@@ -132,6 +133,107 @@ class FinalizationTests(unittest.TestCase):
         self.assertNotIn("results", state)
         self.assertEqual(state["final_opportunity_count"], 1)
         self.assertEqual(state["best_opportunity"]["asin"], "B012345678")
+
+    def test_legacy_job_defaults_to_full_exact_replay_contract(self):
+        status = self.store.terminal_summary_status("job")
+        self.assertEqual(status["retention_mode"], "full")
+        self.assertTrue(status["exact_replay_capable"])
+        self.assertFalse(status["terminal_summary_present"])
+
+    def test_completion_atomically_persists_idempotent_terminal_summary(self):
+        completed = self.store.complete_with_terminal_summary("job", self.state)
+        first = self.store.terminal_summary_status("job")
+        completed_again = self.store.complete_with_terminal_summary("job", completed)
+        second = self.store.terminal_summary_status("job")
+        self.assertTrue(first["terminal_summary_valid"])
+        self.assertEqual(first["terminal_summary_sha256"], second["terminal_summary_sha256"])
+        self.assertEqual(completed_again["final_opportunity_count"], 1)
+        self.assertEqual(completed_again["fee_valid_count"], 1)
+
+    def test_final_only_summary_does_not_recalculate_pruned_intermediates(self):
+        expected = self.store.complete_with_terminal_summary("job", self.state)
+        self.store.set_retention_mode(
+            "job", RETENTION_MODE_FINAL_ONLY, eligibility={"eligible": True},
+        )
+        with self.store._connect() as connection:
+            connection.execute("DELETE FROM discovery_listings WHERE job_id='job'")
+            connection.execute("DELETE FROM discovery_observations WHERE job_id='job'")
+            connection.execute("DELETE FROM discovery_combinations WHERE job_id='job'")
+            connection.commit()
+        summary = self.store.summary("job")
+        self.assertEqual(summary["retention_mode"], "final_only")
+        self.assertFalse(summary["exact_replay_capable"])
+        self.assertEqual(summary["listing_count"], expected["listing_count"])
+        self.assertEqual(summary["fee_valid_count"], expected["fee_valid_count"])
+        self.assertEqual(summary["final_opportunity_count"], 1)
+
+    def test_final_only_reader_never_reads_intermediate_tables_for_summary(self):
+        self.store.complete_with_terminal_summary("job", self.state)
+        self.store.set_retention_mode(
+            "job", RETENTION_MODE_FINAL_ONLY, eligibility={"eligible": True},
+        )
+        connection = self.store._new_connection()
+        blocked = {
+            "discovery_job_items", "discovery_purchase_scenarios",
+            "discovery_listings", "discovery_observations", "discovery_combinations",
+        }
+
+        def authorizer(action, table, *_args):
+            if action == sqlite3.SQLITE_READ and table in blocked:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(authorizer)
+        try:
+            summary = self.store.summary("job", connection=connection)
+        finally:
+            connection.close()
+        self.assertEqual(summary["final_opportunity_count"], 1)
+
+    def test_final_opportunity_and_operational_export_survive_final_only(self):
+        state = {
+            **self.state,
+            "operational_export": {"path": "/tmp/job.operational.xlsx", "status": "completed"},
+        }
+        self.store.complete_with_terminal_summary("job", state)
+        self.store.set_retention_mode(
+            "job", RETENTION_MODE_FINAL_ONLY, eligibility={"eligible": True},
+        )
+        summary = self.store.summary("job")
+        self.assertEqual(summary["final_opportunity_count"], 1)
+        self.assertEqual(summary["operational_export"]["status"], "completed")
+        self.assertEqual(len(list(IncrementalCandidateCollection(self.store, "job", final_only=True))), 1)
+        with self.assertRaisesRegex(ValueError, "Technical export is unavailable"):
+            export_offline(
+                "job", self.root / "technical.xlsx", store=self.store,
+                checkpoints=self.checkpoints,
+            )
+
+    def test_running_job_cannot_be_marked_final_only(self):
+        self.store.set_phase("job", "catalog", status="running")
+        with self.assertRaisesRegex(ValueError, "completed jobs"):
+            self.store.set_retention_mode(
+                "job", RETENTION_MODE_FINAL_ONLY, eligibility={"eligible": True},
+            )
+
+    def test_final_only_requires_reference_aware_eligibility(self):
+        self.store.complete_with_terminal_summary("job", self.state)
+        with self.assertRaisesRegex(ValueError, "reference-aware eligibility"):
+            self.store.set_retention_mode("job", RETENTION_MODE_FINAL_ONLY)
+
+    def test_terminal_summary_dry_run_is_read_only_and_complete(self):
+        before = self.store.path.read_bytes()
+        candidate = self.store.terminal_summary_dry_run("job", state=self.state)
+        after = self.store.path.read_bytes()
+        self.assertEqual(before, after)
+        self.assertTrue(candidate["eligible_source"])
+        payload = candidate["terminal_summary"]
+        for key in (
+            "selected_count", "catalog_status_counts", "listing_count",
+            "scenario_count", "fee_target_count", "fee_valid_count",
+            "combination_count", "final_opportunity_count", "completed_at",
+        ):
+            self.assertIn(key, payload)
 
     def test_export_iterator_hydrates_combinations_and_closes_every_batch(self):
         opened = []
@@ -264,6 +366,10 @@ class FinalizationTests(unittest.TestCase):
         self.assertIsNone(runtime["worker_pid"])
         self.assertIsNone(runtime["lease_expires_at"])
         self.assertEqual(list(self.root.glob(".*.xlsx")), [])
+        contract = self.store.terminal_summary_status("job")
+        self.assertTrue(contract["terminal_summary_valid"])
+        compact = self.checkpoints.load("job")
+        self.assertEqual(compact["retention_mode"], "full")
 
     def test_resource_pause_is_export_specific_and_resumable(self):
         snapshot = ResourceSnapshot(

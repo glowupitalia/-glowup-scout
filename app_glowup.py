@@ -906,6 +906,7 @@ def _load_authoritative_discovery_state(
                     "status", "phase", "progress_current", "progress_total",
                     "resumable", "worker_pid", "lease_expires_at", "updated_at",
                     "completed_at", "error",
+                    "retention_mode", "exact_replay_capable",
                 }
             })
         except (OSError, ValueError, KeyError, sqlite3.Error):
@@ -982,6 +983,8 @@ def _render_active_discovery(runtime, *, key_prefix):
 def _render_completed_discovery(runtime, *, key_prefix):
     counts = _discovery_completion_counts(runtime)
     st.subheader("DISCOVERY COMPLETATA")
+    if runtime.get("retention_mode") == "final_only":
+        st.caption("Storico compatto")
     st.caption(
         f"{counts['opportunities']:,} opportunità · "
         f"{counts['evaluated']:,} prodotti valutati · "
@@ -2024,6 +2027,8 @@ elif ui_state == "discovery_result":
             100.0 * fee_valid_count / fee_target_count if fee_target_count else 0.0
         )
         st.subheader("DISCOVERY COMPLETATA")
+        if state.get("retention_mode") == "final_only":
+            st.caption("Storico compatto")
         completion_columns = st.columns(3)
         completion_columns[0].metric("Opportunità trovate", result_count)
         completion_columns[1].metric("Prodotti valutati", f"{evaluated_count:,}".replace(",", "."))

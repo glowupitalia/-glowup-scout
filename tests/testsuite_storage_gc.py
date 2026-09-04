@@ -17,6 +17,7 @@ from storage_gc import (
     classify_disk,
     classify_swap,
     discovery_gc_plan,
+    final_only_contract_eligibility,
     qogita_snapshot_plan,
     storage_monitor_snapshot,
     supplier_generation_plan,
@@ -166,6 +167,23 @@ class StorageGcTests(unittest.TestCase):
         files = build_storage_gc_dry_run(self.root)["files"]["files"]
         operational = next(row for row in files if row["path"].endswith("operational.xlsx"))
         self.assertEqual(operational["decision"], KEEP)
+
+    def test_final_only_gate_accepts_sent_outbox_and_verified_cache(self):
+        result = final_only_contract_eligibility(
+            job_status="completed", terminal_summary_valid=True,
+            cache_verification_state="verified", outbox_statuses=["sent"],
+        )
+        self.assertTrue(result["eligible"])
+
+    def test_final_only_gate_blocks_pending_outbox_and_running_job(self):
+        result = final_only_contract_eligibility(
+            job_status="running", terminal_summary_valid=True,
+            cache_verification_state="verified", outbox_statuses=["pending"],
+            resumable=True,
+        )
+        self.assertFalse(result["eligible"])
+        self.assertIn("job_not_terminal_non_resumable", result["blockers"])
+        self.assertIn("outbox_non_terminal:pending", result["blockers"])
 
     def test_snapshot_active_history_and_unreferenced(self):
         plan = qogita_snapshot_plan(self.supplier, historical_snapshot_roots={"snapshot-history"})

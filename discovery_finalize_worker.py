@@ -66,9 +66,15 @@ def finalization_state(
 ) -> dict:
     persisted = store.summary(job_id)
     compact = checkpoints.load(job_id)
+    notification = (
+        {} if persisted.get("retention_mode") == "final_only"
+        else store.notification_summary(job_id)
+    )
     state = {
-        **persisted, **compact, **store.notification_summary(job_id),
+        **persisted, **compact, **notification,
         "job_id": job_id,
+        "retention_mode": persisted.get("retention_mode") or "full",
+        "exact_replay_capable": persisted.get("exact_replay_capable", True),
     }
     if int(state.get("selected_count") or 0) <= 0:
         raise ValueError("Discovery finalization has no persisted selection")
@@ -99,6 +105,10 @@ def export_offline(
         database_path=store.path, disk_path=Path(output_path).parent,
     )
     state = finalization_state(job_id, store, checkpoints)
+    if state.get("retention_mode") == "final_only":
+        raise ValueError(
+            "Technical export is unavailable for FINAL_ONLY result history"
+        )
 
     def progress(_phase, _current, _total):
         governor.before_next_batch()
@@ -208,7 +218,8 @@ def finalize(
             notification = send_discovery_terminal_notification(
                 state, database_path=registry.path, runtime=registry.get(job_id),
             )
-        store.set_phase(job_id, "completed", status="completed")
+        state = store.complete_with_terminal_summary(job_id, state)
+        checkpoints.save(state)
         registry.finish(job_id, state, export_path=str(target))
         logger.info(
             "DISCOVERY FINALIZATION COMPLETED | job_id=%s export=%s notification=%s",

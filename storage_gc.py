@@ -37,10 +37,33 @@ REPOINT = "REPOINT_REQUIRED"
 UNKNOWN = "UNKNOWN_KEEP"
 SQL_DEADLINE_SECONDS = 10.0
 MONITOR_MAX_RECORDS = 336
+OUTBOX_TERMINAL_STATUSES = {"sent", "not_configured", "failed"}
 
 
 class ReadBudgetExceeded(RuntimeError):
     """Raised when a read-only audit query exceeds its bounded deadline."""
+
+
+def final_only_contract_eligibility(
+    *, job_status: str, terminal_summary_valid: bool,
+    cache_verification_state: str | None, outbox_statuses: Iterable[str] = (),
+    resumable: bool = False,
+) -> dict[str, Any]:
+    """Pure future-GC gate; it never mutates retention state or deletes rows."""
+    blockers: list[str] = []
+    if str(job_status).casefold() != "completed" or resumable:
+        blockers.append("job_not_terminal_non_resumable")
+    if not terminal_summary_valid:
+        blockers.append("terminal_summary_missing_or_invalid")
+    if str(cache_verification_state or "").casefold() != "verified":
+        blockers.append("cache_not_verified")
+    non_terminal = sorted({
+        str(value).casefold() for value in outbox_statuses
+        if str(value).casefold() not in OUTBOX_TERMINAL_STATUSES
+    })
+    if non_terminal:
+        blockers.append("outbox_non_terminal:" + ",".join(non_terminal))
+    return {"eligible": not blockers, "blockers": blockers}
 
 
 def _utc_now() -> str:

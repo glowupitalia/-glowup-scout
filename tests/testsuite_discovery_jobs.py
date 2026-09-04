@@ -317,6 +317,7 @@ class DiscoveryJobUiTests(unittest.TestCase):
                 "selected_suppliers": ["qudo"], "filters": default_filters(),
                 "final_opportunity_count": 11, "fee_target_count": 142,
                 "fee_valid_count": 142, "fee_unavailable_count": 0,
+                "retention_mode": "final_only", "exact_replay_capable": False,
                 "operational_export": {
                     "path": str(export_path), "file_name": export_path.name,
                 },
@@ -343,6 +344,7 @@ class DiscoveryJobUiTests(unittest.TestCase):
                 rendered = " ".join(row.value for row in app.caption)
                 self.assertIn("11 opportunità", rendered)
                 self.assertIn("3.902 prodotti valutati", rendered)
+                self.assertIn("Storico compatto", rendered)
                 open_results = next(
                     row for row in app.button
                     if row.label == "Visualizza risultati / Scarica Excel"
