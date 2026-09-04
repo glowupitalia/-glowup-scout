@@ -20,6 +20,7 @@ from discovery_incremental import (
 from discovery_jobs import DiscoveryJobRegistry, PROJECT_ROOT
 from discovery_resources import DiscoveryResourceGovernor, ResourcePause
 from notifications import send_discovery_terminal_notification
+from storage_gc import append_storage_audit_event, collect_storage_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -221,6 +222,14 @@ def finalize(
         state = store.complete_with_terminal_summary(job_id, state)
         checkpoints.save(state)
         registry.finish(job_id, state, export_path=str(target))
+        append_storage_audit_event({
+            "event": "workload_finalized", "workload_id": job_id,
+            "workload_type": "discovery",
+            "universe_size": int(state.get("selected_count") or 0),
+            "export_bytes": target.stat().st_size if target.exists() else 0,
+            "success": True, "storage_after": collect_storage_metrics(),
+            "retention_execution": False,
+        }, path=Path(registry.path).parent / "storage-workload-metrics.jsonl")
         logger.info(
             "DISCOVERY FINALIZATION COMPLETED | job_id=%s export=%s notification=%s",
             job_id, target.name,

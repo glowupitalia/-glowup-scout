@@ -65,6 +65,11 @@ from discovery_taxonomy import (
     QOGITA_CATEGORY_TREE,
     default_qogita_category_filter,
 )
+from storage_gc import (
+    collect_storage_metrics,
+    evaluate_discovery_admission,
+    production_retention_plan,
+)
 
 
 DISCOVERY_OPERATIONAL_SUPPLIERS = ("qogita", "umma", "abw", "qudo")
@@ -785,6 +790,16 @@ def discovery_amazon_plan_preview(selected_suppliers, qogita_universe="full"):
     )
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def discovery_storage_metrics():
+    return collect_storage_metrics()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def discovery_retention_preview(watermark_state):
+    return production_retention_plan(watermark_state)
+
+
 def new_discovery_search():
     st.session_state["ui_state"] = "discovery"
     st.session_state.pop("discovery_result", None)
@@ -1049,6 +1064,35 @@ def _render_discovery_runtime(job_id):
     if runtime["status"] == "completed":
         _load_discovery_result(runtime["job_id"], runtime)
         st.rerun(scope="app")
+    elif runtime["status"] == "admission_blocked_storage":
+        state = _load_authoritative_discovery_state(
+            runtime["job_id"], runtime=runtime,
+        )
+        try:
+            admission = json.loads(runtime.get("error") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            admission = {}
+        admission_watermark = admission.get("watermark") or {}
+        free_bytes = admission_watermark.get("filesystem_free_bytes")
+        free_gib = (
+            float(free_bytes) / (1024 ** 3) if free_bytes is not None else None
+        )
+        state_label = admission_watermark.get("state") or "UNKNOWN"
+        st.warning("Workload bloccato per spazio")
+        detail = f"Storage: {state_label}"
+        if isinstance(free_gib, (int, float)):
+            detail += f" · {free_gib:.1f} GiB liberi"
+        st.caption(
+            detail
+            + " · il job non è stato avviato e non è classificato come errore Discovery."
+        )
+        if st.button(
+            "Rivaluta spazio e riprendi",
+            key="resume_storage_admission",
+            type="primary",
+        ):
+            _start_discovery_worker(state)
+            st.rerun(scope="app")
     elif runtime["status"] in {"resource_paused", "export_resource_paused"}:
         state = _load_authoritative_discovery_state(
             runtime["job_id"], runtime=runtime,
@@ -1110,8 +1154,17 @@ if ui_state == "home":
             _render_completed_discovery(latest_discovery, key_prefix="home_completed")
     elif latest_discovery and latest_discovery.get("resumable"):
         with st.container(border=True):
-            st.subheader("DISCOVERY SOSPESA")
+            storage_blocked = (
+                latest_discovery.get("status") == "admission_blocked_storage"
+            )
+            st.subheader(
+                "WORKLOAD BLOCCATO PER SPAZIO" if storage_blocked
+                else "DISCOVERY SOSPESA"
+            )
             st.caption(
+                "Il job non è stato avviato. Aprendolo, lo spazio verrà rivalutato "
+                "dal worker prima di qualsiasi claim."
+                if storage_blocked else
                 "Il job persistito può essere aperto e ripreso senza creare un nuovo campione."
             )
             if st.button(
@@ -1818,7 +1871,38 @@ elif ui_state == "discovery":
             "Scout riutilizzerà automaticamente i dati Amazon recenti e "
             "aggiornerà solo quelli necessari."
         )
+        storage_metrics = discovery_storage_metrics()
+        storage_admission = evaluate_discovery_admission(
+            tuple(selected_suppliers), qogita_universe, metrics=storage_metrics,
+        )
+        storage_watermark = storage_metrics.get("watermark") or {}
+        storage_state = str(storage_watermark.get("state") or "UNKNOWN")
+        storage_free = storage_metrics.get("filesystem_free_bytes")
+        storage_percent = storage_metrics.get("filesystem_free_percent")
+        storage_caption = f"Storage: {storage_state}"
+        if storage_free is not None and storage_percent is not None:
+            storage_caption += (
+                f" · {float(storage_free) / (1024 ** 3):.1f} GiB liberi"
+                f" · {float(storage_percent):.1f}%"
+            )
+        st.caption(storage_caption)
+        if storage_state in {"PREVENTIVE", "PRESSURE", "CRITICAL", "EMERGENCY"}:
+            retention_preview = discovery_retention_preview(storage_state)
+            retention_summary = retention_preview.get("summary") or {}
+            st.caption(
+                "Retention dry-run: "
+                f"{int(retention_summary.get('candidate_count') or 0)} candidate · "
+                f"{float(retention_summary.get('logical_reclaim_bytes') or 0) / (1024 ** 3):.2f} GiB logici · "
+                "esecuzione automatica disattivata"
+            )
+        if not storage_admission.get("allowed"):
+            st.warning(
+                "Workload bloccato per spazio: lo spazio stimato a fine Discovery "
+                "non rispetta il margine di sicurezza. Nessun job è stato avviato."
+            )
         validation_error = discovery_filter_error(filters, selected_suppliers)
+        if not validation_error and not storage_admission.get("allowed"):
+            validation_error = "Workload bloccato per spazio."
         if not validation_error and eligible == 0:
             validation_error = "Nessun prodotto idoneo nelle baseline selezionate."
         if validation_error:

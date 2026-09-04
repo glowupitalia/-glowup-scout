@@ -372,6 +372,30 @@ class DiscoveryJobUiTests(unittest.TestCase):
         self.assertEqual(len(app.exception), 0)
         self.assertIn("Apri Discovery", [row.label for row in app.button])
 
+    def test_storage_admission_block_is_distinct_from_discovery_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            registry = DiscoveryJobRegistry(Path(temporary) / "runtime.sqlite3")
+            registry.register_checkpoint({
+                "job_id": "storage-blocked", "phase": "initialized",
+                "selected_suppliers": ["qogita"], "filters": default_filters(),
+            })
+            registry.admission_blocked("storage-blocked", decision={
+                "watermark": {
+                    "state": "PRESSURE", "filesystem_free_bytes": 30 * 1024 ** 3,
+                },
+                "reason": "post_run_floor_not_met",
+            })
+            with patch.dict(os.environ, {
+                "DISCOVERY_JOB_DATABASE": str(registry.path),
+            }):
+                app = AppTest.from_file("app_glowup.py", default_timeout=20).run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertIn(
+                "WORKLOAD BLOCCATO PER SPAZIO",
+                [row.value for row in app.subheader],
+            )
+            self.assertNotIn("DISCOVERY COMPLETATA", [row.value for row in app.subheader])
+
     def test_discovery_configuration_shows_notification_status(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

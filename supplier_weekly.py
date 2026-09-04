@@ -256,7 +256,10 @@ class WeeklySupplierStore:
             states = [dict(row) for row in connection.execute(
                 "SELECT * FROM supplier_weekly_states WHERE run_id=? ORDER BY sequence_number", (run_id,),
             )]
-            usable = {"success", "waiting_for_source", "skipped"}
+            usable = {
+                "success", "waiting_for_source", "skipped",
+                "admission_blocked_storage",
+            }
             status = "success" if states and all(row["status"] == "success" for row in states) else (
                 "partial_success" if any(row["status"] in usable for row in states) else "failed"
             )
@@ -400,11 +403,15 @@ class WeeklySupplierOrchestrator:
     def __init__(self, handlers: dict[str, Callable[..., dict[str, Any]]], *,
                  store: WeeklySupplierStore | None = None,
                  policies: dict[str, SupplierRatePolicy] | None = None,
-                 baseline_provider: Callable[[str], str | None] | None = None):
+                 baseline_provider: Callable[[str], str | None] | None = None,
+                 admission_check: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+                 storage_metrics: Callable[[], dict[str, Any]] | None = None):
         self.handlers = handlers
         self.store = store or WeeklySupplierStore()
         self.policies = {**DEFAULT_RATE_POLICIES, **(policies or {})}
         self.baseline_provider = baseline_provider or (lambda supplier: None)
+        self.admission_check = admission_check
+        self.storage_metrics = storage_metrics
 
     def run(self, *, trigger_type: str = "manual", scheduled_at: datetime | None = None,
             sources: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -418,7 +425,23 @@ class WeeklySupplierOrchestrator:
             policy = self.policies[supplier]
             self.store.start_supplier(run_id, supplier, sequence, baseline, policy)
             started = time.monotonic()
-            if supplier == "abw" and not sources.get("abw"):
+            storage_before = self.storage_metrics() if self.storage_metrics else None
+            admission = (
+                self.admission_check(supplier, storage_before or {})
+                if self.admission_check else {"allowed": True, "status": "admitted"}
+            )
+            if not admission.get("allowed"):
+                result = {
+                    "status": "admission_blocked_storage",
+                    "baseline_after": baseline,
+                    "promotion_result": "baseline_preserved",
+                    "error_code": "admission_blocked_storage",
+                    "error_message": str(admission.get("reason") or "storage headroom unavailable"),
+                    "diagnostics": {
+                        "storage_admission": admission, "retention_execution": False,
+                    },
+                }
+            elif supplier == "abw" and not sources.get("abw"):
                 result = {
                     "status": "waiting_for_source", "baseline_after": baseline,
                     "promotion_result": "baseline_preserved",
@@ -447,6 +470,16 @@ class WeeklySupplierOrchestrator:
                         "failures": 1, "error_code": type(exc).__name__,
                         "error_message": str(exc),
                     }
+            diagnostics = dict(result.get("diagnostics") or {})
+            diagnostics["storage"] = {
+                "workload_type": f"weekly_{supplier}",
+                "filesystem_pre": storage_before,
+                "filesystem_post": self.storage_metrics() if self.storage_metrics else None,
+                "admission": admission,
+                "elapsed_seconds": time.monotonic() - started,
+                "success": result.get("status") == "success",
+            }
+            result["diagnostics"] = diagnostics
             result["duration_seconds"] = time.monotonic() - started
             self.store.finish_supplier(run_id, supplier, result)
         return self.store.finish_run(run_id)

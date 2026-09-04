@@ -25,6 +25,12 @@ from supplier_catalog import DEFAULT_DATABASE_PATH, utc_now
 from qogita_serving import (
     QogitaServingStore, REST_WINDOW_SECONDS, RUN_WINDOW_SECONDS,
 )
+from storage_gc import (
+    append_storage_audit_event,
+    collect_storage_metrics,
+    evaluate_qogita_window_admission,
+    production_retention_plan,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -235,7 +241,50 @@ def main(argv=None):
                 **credentials, auth_manager=auth_manager, rate_limiter=rate_limiter,
             )
 
+        last_storage_block_key = None
+        window_storage_before = None
         while True:
+            persisted_duty = serving_store.duty_state(pointer["bootstrap_run_id"])
+            now_utc = datetime.now(timezone.utc)
+            needs_new_window = not persisted_duty
+            if persisted_duty and persisted_duty.get("state") == "resting":
+                rest_value = persisted_duty.get("rest_until")
+                needs_new_window = bool(
+                    not rest_value
+                    or now_utc >= datetime.fromisoformat(
+                        str(rest_value).replace("Z", "+00:00")
+                    ).astimezone(timezone.utc)
+                )
+            if needs_new_window:
+                window_storage_before = collect_storage_metrics(ROOT)
+                admission = evaluate_qogita_window_admission(
+                    metrics=window_storage_before,
+                )
+                if not admission["allowed"]:
+                    state = str((admission.get("watermark") or {}).get("state") or "UNKNOWN")
+                    plan = production_retention_plan(state)
+                    admission["retention_plan"] = plan.get("summary")
+                    block_key = (state, admission.get("reason"))
+                    if block_key != last_storage_block_key:
+                        append_storage_audit_event({
+                            "event": "admission", "workload_type": "qogita_window",
+                            "workload_id": pointer["bootstrap_run_id"],
+                            "decision": admission, "retention_execution": False,
+                        }, path=database.parent / "storage-workload-metrics.jsonl")
+                        logging.warning(
+                            "QOGITA WINDOW ADMISSION BLOCKED | state=%s reason=%s",
+                            state, admission.get("reason"),
+                        )
+                        last_storage_block_key = block_key
+                    time.sleep(60.0)
+                    continue
+                append_storage_audit_event({
+                    "event": "admission", "workload_type": "qogita_window",
+                    "workload_id": pointer["bootstrap_run_id"],
+                    "decision": admission, "storage_before": window_storage_before,
+                    "retention_execution": False,
+                }, path=database.parent / "storage-workload-metrics.jsonl")
+                last_storage_block_key = None
             duty = serving_store.ensure_running_window(
                 pointer["bootstrap_run_id"], run_window_seconds=args.run_window_seconds,
                 rest_window_seconds=args.rest_window_seconds,
@@ -310,6 +359,17 @@ def main(argv=None):
                 result.get("status"), result.get("invocation_products_attempted"),
                 result.get("graceful_stop"),
             )
+            append_storage_audit_event({
+                "event": "workload_completed", "workload_type": "qogita_window",
+                "workload_id": pointer["bootstrap_run_id"],
+                "window_number": duty.get("window_number"),
+                "universe_size": int(result.get("invocation_products_attempted") or 0),
+                "elapsed_seconds": result.get("wall_elapsed_seconds"),
+                "success": not bool(result.get("auto_stop_reason")),
+                "storage_before": window_storage_before,
+                "storage_after": collect_storage_metrics(ROOT),
+                "retention_execution": False,
+            }, path=database.parent / "storage-workload-metrics.jsonl")
             if result.get("auto_stop_reason"):
                 serving_store.mark_auto_stopped(pointer["bootstrap_run_id"])
                 return 0

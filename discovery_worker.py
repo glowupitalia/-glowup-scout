@@ -32,6 +32,12 @@ from product_fees import search_product_fees_batch
 from supplier_catalog import SupplierCatalogStore
 from discovery_rotation import DiscoveryRotationStore
 from discovery_freshness import DiscoveryAmazonCache
+from storage_gc import (
+    append_storage_audit_event,
+    collect_storage_metrics,
+    evaluate_discovery_admission,
+    production_retention_plan,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -86,6 +92,47 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
     registry = registry or DiscoveryJobRegistry()
     checkpoint_store = checkpoint_store or DiscoveryCheckpointStore()
     pid = os.getpid()
+    runtime = registry.get(job_id) or {}
+    selected_suppliers = runtime.get("selected_suppliers") or []
+    qogita_universe = "full"
+    for hint_path in (checkpoint_store.state_path(job_id), checkpoint_store.path(job_id)):
+        try:
+            if hint_path.is_file() and hint_path.stat().st_size <= 1024 * 1024:
+                import json
+                with hint_path.open("r", encoding="utf-8") as source:
+                    qogita_universe = str(json.load(source).get("qogita_universe") or "full")
+                break
+        except (OSError, ValueError, TypeError):
+            # FULL is the conservative budget when a legacy hint is unavailable.
+            qogita_universe = "full"
+    storage_before = collect_storage_metrics()
+    admission = evaluate_discovery_admission(
+        selected_suppliers, qogita_universe, metrics=storage_before,
+    )
+    if not admission["allowed"]:
+        plan = production_retention_plan(
+            str((admission.get("watermark") or {}).get("state") or "UNKNOWN")
+        )
+        admission["retention_plan"] = plan.get("summary")
+        registry.admission_blocked(job_id, decision=admission)
+        append_storage_audit_event({
+            "event": "admission", "workload_id": job_id,
+            "decision": admission, "storage_before": storage_before,
+            "retention_execution": False,
+        }, path=Path(registry.path).parent / "storage-workload-metrics.jsonl")
+        logger.warning(
+            "DISCOVERY ADMISSION BLOCKED | job_id=%s reason=%s",
+            job_id, admission.get("reason"),
+        )
+        return {
+            "job_id": job_id, "status": "admission_blocked_storage",
+            "phase": "admission_blocked_storage", "storage_admission": admission,
+        }
+    append_storage_audit_event({
+        "event": "admission", "workload_id": job_id,
+        "decision": admission, "storage_before": storage_before,
+        "retention_execution": False,
+    }, path=Path(registry.path).parent / "storage-workload-metrics.jsonl")
     if not registry.claim(job_id, pid=pid):
         raise RuntimeError(f"Discovery job {job_id} is already owned by another worker")
     incremental_store = DiscoveryIncrementalStore()
@@ -228,6 +275,14 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
                 "DISCOVERY COMPUTATION HANDED OFF | job_id=%s finalizer_pid=%s",
                 job_id, finalizer_pid,
             )
+            append_storage_audit_event({
+                "event": "workload_computed", "workload_id": job_id,
+                "workload_type": admission.get("workload_type"),
+                "universe_size": int(result.get("selected_count") or 0),
+                "success": True, "storage_before": storage_before,
+                "storage_after": collect_storage_metrics(),
+                "retention_execution": False,
+            }, path=Path(registry.path).parent / "storage-workload-metrics.jsonl")
             return result
 
         output_path = None
@@ -246,6 +301,16 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
         else:
             checkpoint_store.save(result)
         registry.finish(job_id, result, export_path=str(output_path) if output_path else None)
+        append_storage_audit_event({
+            "event": "workload_completed", "workload_id": job_id,
+            "workload_type": admission.get("workload_type"),
+            "universe_size": int(result.get("sampled_identifier_count") or 0),
+            "export_bytes": output_path.stat().st_size if output_path else 0,
+            "success": result.get("status") == "completed",
+            "storage_before": storage_before,
+            "storage_after": collect_storage_metrics(),
+            "retention_execution": False,
+        }, path=Path(registry.path).parent / "storage-workload-metrics.jsonl")
         try:
             send_discovery_terminal_notification(
                 result, database_path=registry.path, runtime=registry.get(job_id),

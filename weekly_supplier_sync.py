@@ -19,6 +19,11 @@ from supplier_weekly import (
     weekly_lock,
 )
 from qogita_korean_beauty import QogitaMembershipStore
+from storage_gc import (
+    collect_storage_metrics,
+    evaluate_weekly_admission,
+    production_retention_plan,
+)
 
 
 def _baseline(supplier: str) -> str | None:
@@ -35,6 +40,14 @@ def _handlers():
         return build_weekly_handlers()
     except ImportError:
         return {}
+
+
+def _weekly_admission(supplier: str, metrics: dict) -> dict:
+    decision = evaluate_weekly_admission(supplier, metrics=metrics)
+    if not decision["allowed"]:
+        state = str((decision.get("watermark") or {}).get("state") or "UNKNOWN")
+        decision["retention_plan"] = production_retention_plan(state).get("summary")
+    return decision
 
 
 def status_payload(store: WeeklySupplierStore) -> dict:
@@ -105,6 +118,8 @@ def main(argv=None) -> int:
                 }
             orchestrator = WeeklySupplierOrchestrator(
                 handlers, store=store, baseline_provider=_baseline,
+                admission_check=_weekly_admission,
+                storage_metrics=collect_storage_metrics,
             )
             result = orchestrator.run(
                 trigger_type=args.trigger,

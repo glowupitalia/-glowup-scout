@@ -27,6 +27,7 @@ RESUMABLE_CHECKPOINT_STATUSES = {
     "running", "failed", "interrupted", "waiting_retry",
     "qogita_refresh_failed", "supplier_preparation_failed",
     "resource_paused",
+    "admission_blocked_storage",
     "computed", "export_pending", "export_running", "export_resource_paused",
     "export_complete", "notification_pending",
 }
@@ -487,6 +488,23 @@ class DiscoveryJobRegistry:
                    resumable=1,error=?,updated_at=?,worker_pid=NULL,lease_expires_at=NULL
                    WHERE job_id=?""",
                 (phase, message, utc_now(), job_id),
+            )
+            connection.commit()
+
+    def admission_blocked(self, job_id: str, *, decision: dict[str, Any]) -> None:
+        """Release a not-yet-claimed job without classifying storage as failure."""
+        message = json.dumps(
+            decision, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            default=str,
+        )[:4000]
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE discovery_job_runtime
+                      SET status='admission_blocked_storage',
+                          phase='admission_blocked_storage',resumable=1,error=?,
+                          updated_at=?,worker_pid=NULL,lease_expires_at=NULL
+                    WHERE job_id=?""",
+                (message, utc_now(), job_id),
             )
             connection.commit()
 

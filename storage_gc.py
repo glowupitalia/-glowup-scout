@@ -9,6 +9,8 @@ potentially non-trivial query has a deadline.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -38,6 +40,78 @@ UNKNOWN = "UNKNOWN_KEEP"
 SQL_DEADLINE_SECONDS = 10.0
 MONITOR_MAX_RECORDS = 336
 OUTBOX_TERMINAL_STATUSES = {"sent", "not_configured", "failed"}
+
+GIB = 1024 ** 3
+WATERMARK_VERSION = "storage_watermark_v1"
+ESTIMATOR_VERSION = "storage_workload_estimator_v1"
+RETENTION_POLICY_VERSION = "storage_retention_policy_v1"
+STORAGE_AUDIT_MAX_RECORDS = 336
+DEFAULT_STORAGE_AUDIT = DATA_DIR / "storage-workload-metrics.jsonl"
+DB1E11_JOB_ID = "db1e11b8d6294342b811a343ca4a4142"
+
+# Each state is entered only when both dimensions meet its lower boundary.
+# Selecting the worse of the absolute and percentage classifications makes the
+# policy fail-safe across volumes of different sizes.
+WATERMARK_THRESHOLDS = (
+    ("NORMAL", 50 * GIB, 20.0),
+    ("PREVENTIVE", 40 * GIB, 16.0),
+    ("PRESSURE", 25 * GIB, 10.0),
+    ("CRITICAL", 15 * GIB, 6.0),
+)
+WATERMARK_SEVERITY = {
+    "NORMAL": 0, "PREVENTIVE": 1, "PRESSURE": 2,
+    "CRITICAL": 3, "EMERGENCY": 4, "UNKNOWN": 5,
+}
+
+# Versioned seed values.  They are deliberately internal defaults rather than
+# user settings; completed-workload observations can supersede them later.
+WORKLOAD_ESTIMATORS = {
+    "discovery_full": {
+        "db_growth_bytes": int(3.04 * GIB), "wal_headroom_bytes": int(0.75 * GIB),
+        "export_headroom_bytes": int(0.25 * GIB), "other_headroom_bytes": int(0.46 * GIB),
+        "post_run_floor_bytes": 40 * GIB, "maximum_post_state": "PREVENTIVE",
+    },
+    "discovery_korean_beauty": {
+        "db_growth_bytes": int(0.21 * GIB), "wal_headroom_bytes": int(0.25 * GIB),
+        "export_headroom_bytes": int(0.05 * GIB), "other_headroom_bytes": int(0.49 * GIB),
+        "post_run_floor_bytes": 25 * GIB, "maximum_post_state": "PRESSURE",
+    },
+    "discovery_qudo": {
+        "db_growth_bytes": int(0.03 * GIB), "wal_headroom_bytes": int(0.15 * GIB),
+        "export_headroom_bytes": int(0.03 * GIB), "other_headroom_bytes": int(0.49 * GIB),
+        "post_run_floor_bytes": 25 * GIB, "maximum_post_state": "PRESSURE",
+    },
+    "discovery_small": {
+        "db_growth_bytes": int(0.23 * GIB), "wal_headroom_bytes": int(0.25 * GIB),
+        "export_headroom_bytes": int(0.05 * GIB), "other_headroom_bytes": int(0.47 * GIB),
+        "post_run_floor_bytes": 25 * GIB, "maximum_post_state": "PRESSURE",
+    },
+    "qogita_window": {
+        "db_growth_bytes": int(0.26 * GIB), "wal_headroom_bytes": int(0.68 * GIB),
+        "export_headroom_bytes": int(0.10 * GIB), "other_headroom_bytes": int(0.20 * GIB),
+        "post_run_floor_bytes": 25 * GIB, "maximum_post_state": "PRESSURE",
+    },
+    "weekly_abw": {
+        "db_growth_bytes": int(0.30 * GIB), "wal_headroom_bytes": int(0.25 * GIB),
+        "export_headroom_bytes": 0, "other_headroom_bytes": int(0.20 * GIB),
+        "post_run_floor_bytes": 25 * GIB, "maximum_post_state": "PRESSURE",
+    },
+    "weekly_umma": {
+        "db_growth_bytes": int(0.20 * GIB), "wal_headroom_bytes": int(0.20 * GIB),
+        "export_headroom_bytes": 0, "other_headroom_bytes": int(0.20 * GIB),
+        "post_run_floor_bytes": 25 * GIB, "maximum_post_state": "PRESSURE",
+    },
+    "weekly_qudo": {
+        "db_growth_bytes": int(0.10 * GIB), "wal_headroom_bytes": int(0.15 * GIB),
+        "export_headroom_bytes": 0, "other_headroom_bytes": int(0.20 * GIB),
+        "post_run_floor_bytes": 25 * GIB, "maximum_post_state": "PRESSURE",
+    },
+    "weekly_qogita_korean_beauty": {
+        "db_growth_bytes": int(0.05 * GIB), "wal_headroom_bytes": int(0.05 * GIB),
+        "export_headroom_bytes": 0, "other_headroom_bytes": int(0.10 * GIB),
+        "post_run_floor_bytes": 25 * GIB, "maximum_post_state": "PRESSURE",
+    },
+}
 
 
 class ReadBudgetExceeded(RuntimeError):
@@ -88,6 +162,590 @@ def _readonly_connection(path: Path):
     connection.execute("PRAGMA query_only=ON")
     connection.execute("PRAGMA busy_timeout=250")
     return connection
+
+
+def _sqlite_file_metrics(path: Path) -> dict[str, Any]:
+    """Return bounded physical/free-page metrics without creating a database."""
+    result = {
+        "path": str(path), "readable": False, "file_size_bytes": _file_size(path),
+        "wal_bytes": _file_size(Path(str(path) + "-wal")),
+        "shm_bytes": _file_size(Path(str(path) + "-shm")),
+        "page_size": None, "page_count": None, "freelist_count": None,
+        "freelist_bytes": None, "freelist_percent": None,
+    }
+    if not path.is_file():
+        return {**result, "error": "database_missing"}
+    try:
+        with _readonly_connection(path) as connection:
+            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+            freelist_count = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+        freelist_bytes = page_size * freelist_count
+        allocated = page_size * page_count
+        return {
+            **result, "readable": True, "page_size": page_size,
+            "page_count": page_count, "freelist_count": freelist_count,
+            "freelist_bytes": freelist_bytes,
+            "freelist_percent": (
+                (freelist_bytes * 100.0 / allocated) if allocated else 0.0
+            ),
+        }
+    except (OSError, sqlite3.Error) as error:
+        return {**result, "error": f"{type(error).__name__}: {error}"}
+
+
+def classify_storage_watermark(
+    *, filesystem_total_bytes: int | None, filesystem_free_bytes: int | None,
+) -> dict[str, Any]:
+    """Classify storage by the worse of approved absolute/percentage bands."""
+    try:
+        total = int(filesystem_total_bytes or 0)
+        free = int(filesystem_free_bytes if filesystem_free_bytes is not None else -1)
+    except (TypeError, ValueError):
+        total, free = 0, -1
+    if total <= 0 or free < 0 or free > total:
+        return {
+            "version": WATERMARK_VERSION, "state": "UNKNOWN", "reliable": False,
+            "reason": "filesystem_metrics_unavailable", "threshold_crossed": "unknown",
+            "filesystem_free_bytes": None if free < 0 else free,
+            "filesystem_free_percent": None,
+        }
+    percent = free * 100.0 / total
+
+    def dimension_state(value: float, *, percentage: bool) -> str:
+        for state, absolute, ratio in WATERMARK_THRESHOLDS:
+            threshold = ratio if percentage else absolute
+            if value >= threshold:
+                return state
+        return "EMERGENCY"
+
+    absolute_state = dimension_state(float(free), percentage=False)
+    percentage_state = dimension_state(percent, percentage=True)
+    state = max(
+        (absolute_state, percentage_state),
+        key=lambda value: WATERMARK_SEVERITY[value],
+    )
+    controlling = (
+        "both" if absolute_state == percentage_state
+        else ("absolute" if state == absolute_state else "percentage")
+    )
+    return {
+        "version": WATERMARK_VERSION, "state": state, "reliable": True,
+        "reason": (
+            f"prudent_max:absolute={absolute_state},percentage={percentage_state}"
+        ),
+        "threshold_crossed": controlling,
+        "absolute_state": absolute_state, "percentage_state": percentage_state,
+        "filesystem_total_bytes": total, "filesystem_free_bytes": free,
+        "filesystem_free_percent": percent,
+    }
+
+
+def archive_volume_status(
+    archive_volume_uuid: str | None,
+    *, verifier: Callable[[str], dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
+    """Describe optional future Tier 2 without ever guessing a filesystem path."""
+    volume_uuid = str(archive_volume_uuid or "").strip() or None
+    if volume_uuid is None:
+        return {
+            "archive_volume_uuid": None, "archive_available": False,
+            "archive_reason": "tier2_not_configured",
+        }
+    if verifier is None:
+        return {
+            "archive_volume_uuid": volume_uuid, "archive_available": False,
+            "archive_reason": "volume_verification_unavailable_fail_closed",
+        }
+    try:
+        observed = verifier(volume_uuid) or {}
+    except Exception as error:
+        return {
+            "archive_volume_uuid": volume_uuid, "archive_available": False,
+            "archive_reason": f"volume_verification_failed:{type(error).__name__}",
+        }
+    verified = bool(
+        observed.get("mounted")
+        and str(observed.get("volume_uuid") or "") == volume_uuid
+        and observed.get("verified")
+    )
+    return {
+        "archive_volume_uuid": volume_uuid, "archive_available": verified,
+        "archive_reason": "verified" if verified else "volume_not_mounted_or_verified",
+    }
+
+
+def collect_storage_metrics(
+    project_root: str | Path = PROJECT_ROOT, *, disk_usage: Callable = shutil.disk_usage,
+    archive_volume_uuid: str | None = None,
+    archive_volume_verifier: Callable[[str], dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
+    """Collect admission metrics with constant-size filesystem/PRAGMA reads."""
+    root = Path(project_root).resolve()
+    data = root / "data"
+    try:
+        usage = disk_usage(root)
+        total, free = int(usage.total), int(usage.free)
+        filesystem_error = None
+    except (OSError, ValueError) as error:
+        total = free = None
+        filesystem_error = f"{type(error).__name__}: {error}"
+    databases = {
+        "discovery": _sqlite_file_metrics(data / "discovery_incremental.sqlite3"),
+        "supplier": _sqlite_file_metrics(data / "supplier_catalog.sqlite3"),
+        "rotation": _sqlite_file_metrics(data / "discovery_rotation.sqlite3"),
+    }
+    watermark = classify_storage_watermark(
+        filesystem_total_bytes=total, filesystem_free_bytes=free,
+    )
+    discovery_freelist = databases["discovery"].get("freelist_bytes")
+    reliable = bool(
+        watermark["reliable"]
+        and all(value.get("readable") for value in databases.values())
+    )
+    archive = archive_volume_status(
+        archive_volume_uuid, verifier=archive_volume_verifier,
+    )
+    return {
+        "version": "storage_metrics_v1", "timestamp": _utc_now(),
+        "reliable": reliable, "filesystem_error": filesystem_error,
+        "filesystem_total_bytes": total, "filesystem_free_bytes": free,
+        "filesystem_free_percent": watermark.get("filesystem_free_percent"),
+        "filesystem_reusable_bytes": free,
+        "discovery_sqlite_freelist_bytes": discovery_freelist,
+        "discovery_effective_reusable_bytes": (
+            free + discovery_freelist
+            if free is not None and discovery_freelist is not None else None
+        ),
+        "effective_reusable_scope": "discovery_db_growth_only",
+        "databases": databases, "watermark": watermark,
+        **archive,
+    }
+
+
+def discovery_workload_type(
+    selected_suppliers: Iterable[str], qogita_universe: str | None = "full",
+) -> str:
+    suppliers = tuple(sorted({str(value).casefold() for value in selected_suppliers if value}))
+    universe = str(qogita_universe or "full").casefold()
+    if "qogita" in suppliers and universe == "full":
+        return "discovery_full"
+    if len(suppliers) >= 3 and universe != "korean_beauty":
+        return "discovery_full"
+    if suppliers == ("qogita",) and universe == "korean_beauty":
+        return "discovery_korean_beauty"
+    if suppliers == ("qudo",):
+        return "discovery_qudo"
+    return "discovery_small"
+
+
+def workload_estimate(workload_type: str) -> dict[str, Any]:
+    seed = WORKLOAD_ESTIMATORS.get(str(workload_type))
+    if not seed:
+        return {
+            "version": ESTIMATOR_VERSION, "workload_type": str(workload_type),
+            "reliable": False, "reason": "unknown_workload_type",
+        }
+    return {
+        "version": ESTIMATOR_VERSION, "workload_type": str(workload_type),
+        "reliable": True, "source": "versioned_seed", **seed,
+    }
+
+
+def storage_admission_decision(
+    metrics: dict[str, Any], workload_type: str,
+    *, estimate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a pure fail-closed decision; it never reserves or changes storage."""
+    estimate = dict(estimate or workload_estimate(workload_type))
+    watermark = dict(metrics.get("watermark") or {})
+    if not metrics.get("reliable") or not watermark.get("reliable") or not estimate.get("reliable"):
+        return {
+            "allowed": False, "status": "admission_blocked_storage",
+            "reason": "storage_metrics_or_estimate_unreliable", "workload_type": workload_type,
+            "watermark": watermark, "estimate": estimate, "retention_execution": False,
+        }
+    current_state = str(watermark.get("state") or "UNKNOWN")
+    if current_state in {"CRITICAL", "EMERGENCY", "UNKNOWN"}:
+        return {
+            "allowed": False, "status": "admission_blocked_storage",
+            "reason": f"new_heavy_workload_blocked_in_{current_state.casefold()}",
+            "workload_type": workload_type, "watermark": watermark,
+            "estimate": estimate, "retention_execution": False,
+        }
+    free = int(metrics["filesystem_free_bytes"])
+    total = int(metrics["filesystem_total_bytes"])
+    discovery_workload = str(workload_type).startswith("discovery_")
+    reusable_freelist = int(metrics.get("discovery_sqlite_freelist_bytes") or 0) if discovery_workload else 0
+    main_growth = max(0, int(estimate["db_growth_bytes"]) - reusable_freelist)
+    required = sum((
+        main_growth, int(estimate.get("wal_headroom_bytes") or 0),
+        int(estimate.get("export_headroom_bytes") or 0),
+        int(estimate.get("other_headroom_bytes") or 0),
+    ))
+    post_free = free - required
+    post_watermark = classify_storage_watermark(
+        filesystem_total_bytes=total, filesystem_free_bytes=post_free,
+    )
+    floor = int(estimate["post_run_floor_bytes"])
+    maximum_state = str(estimate["maximum_post_state"])
+    allowed = bool(
+        post_free >= floor
+        and post_watermark.get("reliable")
+        and WATERMARK_SEVERITY.get(str(post_watermark.get("state")), 99)
+        <= WATERMARK_SEVERITY[maximum_state]
+    )
+    reasons = []
+    if post_free < floor:
+        reasons.append("post_run_floor_not_met")
+    if WATERMARK_SEVERITY.get(str(post_watermark.get("state")), 99) > WATERMARK_SEVERITY[maximum_state]:
+        reasons.append("post_run_watermark_too_severe")
+    return {
+        "allowed": allowed,
+        "status": "admitted" if allowed else "admission_blocked_storage",
+        "reason": "admission_headroom_satisfied" if allowed else ",".join(reasons),
+        "workload_type": workload_type, "watermark": watermark,
+        "post_run_watermark": post_watermark, "estimate": estimate,
+        "required_filesystem_headroom_bytes": required,
+        "discovery_freelist_credit_bytes": reusable_freelist,
+        "filesystem_free_after_estimate_bytes": post_free,
+        "retention_execution": False,
+    }
+
+
+def evaluate_discovery_admission(
+    selected_suppliers: Iterable[str], qogita_universe: str | None = "full",
+    *, metrics: dict[str, Any] | None = None, project_root: str | Path = PROJECT_ROOT,
+) -> dict[str, Any]:
+    workload_type = discovery_workload_type(selected_suppliers, qogita_universe)
+    return storage_admission_decision(
+        metrics or collect_storage_metrics(project_root), workload_type,
+    )
+
+
+def evaluate_qogita_window_admission(
+    *, metrics: dict[str, Any] | None = None, project_root: str | Path = PROJECT_ROOT,
+) -> dict[str, Any]:
+    return storage_admission_decision(
+        metrics or collect_storage_metrics(project_root), "qogita_window",
+    )
+
+
+def evaluate_weekly_admission(
+    supplier: str, *, metrics: dict[str, Any] | None = None,
+    project_root: str | Path = PROJECT_ROOT,
+) -> dict[str, Any]:
+    return storage_admission_decision(
+        metrics or collect_storage_metrics(project_root),
+        f"weekly_{str(supplier).casefold()}",
+    )
+
+
+def compaction_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    discovery = ((metrics.get("databases") or {}).get("discovery") or {})
+    freelist = discovery.get("freelist_bytes")
+    ratio = discovery.get("freelist_percent")
+    known = freelist is not None and ratio is not None
+    return {
+        "version": "compaction_advisory_v1",
+        "freelist_bytes": freelist, "freelist_percent": ratio,
+        "compaction_recommended": bool(
+            known and (int(freelist) >= 5 * GIB or float(ratio) >= 30.0)
+        ),
+        "execution_supported": False,
+    }
+
+
+def append_storage_audit_event(
+    event: dict[str, Any], path: str | Path = DEFAULT_STORAGE_AUDIT,
+    *, max_records: int = STORAGE_AUDIT_MAX_RECORDS,
+) -> bool:
+    """Persist a bounded operational audit; callers decide when writes are allowed."""
+    record = {"timestamp": _utc_now(), "schema_version": 1, **event}
+    before = event.get("storage_before") or {}
+    after = event.get("storage_after") or {}
+    if before or after:
+        workload_type = str(event.get("workload_type") or "")
+        database_name = "discovery" if workload_type.startswith("discovery") else (
+            "supplier" if workload_type.startswith(("qogita", "weekly")) else None
+        )
+        before_db = ((before.get("databases") or {}).get(database_name) or {})
+        after_db = ((after.get("databases") or {}).get(database_name) or {})
+        record["workload_metrics"] = {
+            "estimator_version": ESTIMATOR_VERSION,
+            "filesystem_free_pre_bytes": before.get("filesystem_free_bytes"),
+            "filesystem_free_post_bytes": after.get("filesystem_free_bytes"),
+            "relevant_database": database_name,
+            "relevant_db_pre_bytes": before_db.get("file_size_bytes"),
+            "relevant_db_post_bytes": after_db.get("file_size_bytes"),
+            "freelist_pre_bytes": before_db.get("freelist_bytes"),
+            "freelist_post_bytes": after_db.get("freelist_bytes"),
+            "wal_peak_observed_bytes": max(
+                int(before_db.get("wal_bytes") or 0),
+                int(after_db.get("wal_bytes") or 0),
+            ),
+            "export_bytes": int(event.get("export_bytes") or 0),
+            "universe_size": int(event.get("universe_size") or 0),
+            "elapsed_seconds": event.get("elapsed_seconds"),
+            "success": event.get("success"),
+        }
+    try:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.with_name(destination.name + ".lock").open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            append_monitor_snapshot(destination, record, max_records=max_records)
+        return True
+    except (OSError, TypeError, ValueError):
+        # A telemetry write must never replace the primary workload outcome.
+        return False
+
+
+def _retention_gate(job: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    if str(job.get("job_id")) == DB1E11_JOB_ID:
+        blockers.append("explicit_db1e11_exclusion")
+    if str(job.get("retention_mode") or "full").casefold() != "full":
+        blockers.append("storage_mode_not_full")
+    if str(job.get("status") or "").casefold() != "completed" or job.get("resumable"):
+        blockers.append("job_not_terminal_non_resumable")
+    if not job.get("terminal_summary_valid"):
+        blockers.append("terminal_summary_missing_or_invalid")
+    if str(job.get("cache_verification_state") or "").casefold() != "verified":
+        blockers.append("cache_not_verified")
+    if any(
+        str(value).casefold() not in OUTBOX_TERMINAL_STATUSES
+        for value in (job.get("outbox_statuses") or [])
+    ):
+        blockers.append("outbox_non_terminal")
+    if not job.get("rotation_committed"):
+        blockers.append("rotation_not_committed")
+    if not job.get("operational_export_preserved"):
+        blockers.append("operational_export_missing")
+    if not job.get("references_known"):
+        blockers.append("reference_state_unknown")
+    if not job.get("scope"):
+        blockers.append("scope_unknown")
+    return sorted(set(blockers))
+
+
+def plan_discovery_retention(
+    jobs: Iterable[dict[str, Any]], watermark_state: str,
+) -> dict[str, Any]:
+    """Apply approved E/D policy to an inventory without mutating any job."""
+    state = str(watermark_state or "UNKNOWN").upper()
+    global_keep = 10 if state == "PREVENTIVE" else (
+        5 if state in {"PRESSURE", "CRITICAL", "EMERGENCY"} else None
+    )
+    inventory = [dict(job) for job in jobs]
+
+    def order_key(job: dict[str, Any]):
+        return (
+            str(job.get("completed_at") or job.get("created_at") or ""),
+            str(job.get("job_id") or ""),
+        )
+
+    full_completed = sorted(
+        [job for job in inventory if str(job.get("status") or "").casefold() == "completed"
+         and str(job.get("retention_mode") or "full").casefold() == "full"],
+        key=order_key, reverse=True,
+    )
+    globally_protected = {
+        str(job.get("job_id")) for job in (
+            full_completed if global_keep is None else full_completed[:global_keep]
+        )
+    }
+    scope_representatives: set[str] = set()
+    represented_scopes: set[str] = set()
+    for job in full_completed:
+        scope = str(job.get("scope") or "")
+        if scope and scope not in represented_scopes:
+            scope_representatives.add(str(job.get("job_id")))
+            represented_scopes.add(scope)
+
+    rows = []
+    for job in sorted(inventory, key=order_key, reverse=True):
+        job_id = str(job.get("job_id") or "")
+        blockers = _retention_gate(job)
+        reasons: list[str] = []
+        if not job.get("references_known"):
+            classification = "UNKNOWN_KEEP"
+            reasons.extend(blockers or ["reference_state_unknown"])
+        elif blockers:
+            classification = "KEEP_BLOCKED"
+            reasons.extend(blockers)
+        elif job_id in scope_representatives:
+            classification = "KEEP_SCOPE_REPRESENTATIVE"
+            reasons.append("latest_full_for_scope")
+        elif job_id in globally_protected or global_keep is None:
+            classification = "KEEP_FULL_RECENT"
+            reasons.append(
+                "normal_no_retention" if global_keep is None
+                else f"latest_{global_keep}_global_full"
+            )
+        else:
+            classification = "FINAL_ONLY_ELIGIBLE"
+            reasons.extend((
+                "all_reference_aware_gates_passed",
+                "newer_full_exists_in_scope",
+                f"outside_latest_{global_keep}_global_full",
+            ))
+        sqlite_reclaim = (
+            int(job.get("estimated_sqlite_reclaim_bytes") or 0)
+            if classification == "FINAL_ONLY_ELIGIBLE" else 0
+        )
+        file_reclaim = (
+            int(job.get("estimated_filesystem_reclaim_bytes") or 0)
+            if classification == "FINAL_ONLY_ELIGIBLE" else 0
+        )
+        rows.append({
+            **job, "classification": classification, "reasons": reasons,
+            "estimated_logical_reclaim_bytes": sqlite_reclaim + file_reclaim,
+            "estimated_sqlite_freelist_gain_bytes": sqlite_reclaim,
+            "estimated_filesystem_file_reclaim_bytes": file_reclaim,
+        })
+    eligible = [row for row in rows if row["classification"] == "FINAL_ONLY_ELIGIBLE"]
+    return {
+        "version": RETENTION_POLICY_VERSION, "watermark_state": state,
+        "policy": (
+            "NONE" if global_keep is None
+            else ("E_KEEP_GLOBAL_10_SCOPE_1" if global_keep == 10 else "D_KEEP_GLOBAL_5_SCOPE_1")
+        ),
+        "execution_supported": False, "writes_performed": 0,
+        "jobs": rows,
+        "summary": {
+            "job_count": len(rows), "candidate_count": len(eligible),
+            "logical_reclaim_bytes": sum(row["estimated_logical_reclaim_bytes"] for row in eligible),
+            "sqlite_freelist_gain_bytes": sum(row["estimated_sqlite_freelist_gain_bytes"] for row in eligible),
+            "filesystem_file_reclaim_bytes": sum(row["estimated_filesystem_file_reclaim_bytes"] for row in eligible),
+            "final_only_changes": 0, "delete_operations": 0,
+        },
+    }
+
+
+def _terminal_summary_valid(metadata: dict[str, Any]) -> bool:
+    payload = metadata.get("terminal_summary")
+    if not isinstance(payload, dict) or int(metadata.get("terminal_summary_version") or 0) != 1:
+        return False
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return metadata.get("terminal_summary_sha256") == hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _retention_file_estimate(job_id: str, export_path: str | None, jobs_dir: Path) -> int:
+    preserved = Path(export_path).expanduser().resolve() if export_path else None
+    total = 0
+    if not jobs_dir.is_dir():
+        return 0
+    for path in jobs_dir.glob(f"{job_id}.*"):
+        if not path.is_file() or path.name.endswith(".state.json"):
+            continue
+        if preserved and path.resolve() == preserved:
+            continue
+        if path.name.endswith(".operational.xlsx"):
+            continue
+        total += _file_size(path)
+    return total
+
+
+def discovery_retention_inventory(
+    project_root: str | Path = PROJECT_ROOT,
+) -> dict[str, Any]:
+    """Build the approved retention inputs; uncertainty is explicit and sticky."""
+    root = Path(project_root).resolve()
+    incremental_path = root / "data/discovery_incremental.sqlite3"
+    runtime_path = root / "data/discovery_jobs.sqlite3"
+    rotation_path = root / "data/discovery_rotation.sqlite3"
+    jobs_dir = root / "data/discovery_jobs"
+    errors: list[str] = []
+    incremental: dict[str, dict[str, Any]] = {}
+    markers: dict[str, str] = {}
+    runtime: dict[str, dict[str, Any]] = {}
+    outbox: dict[str, list[str]] = defaultdict(list)
+    rotations: dict[str, dict[str, Any]] = {}
+    estimates: dict[str, int] = {}
+    try:
+        gc_plan = discovery_gc_plan(incremental_path, runtime_path, rotation_path)
+        estimates = {str(row["job_id"]): int(row.get("estimated_bytes") or 0) for row in gc_plan["jobs"]}
+    except (OSError, sqlite3.Error, ReadBudgetExceeded) as error:
+        errors.append(f"component_estimates:{type(error).__name__}")
+    try:
+        with _readonly_connection(incremental_path) as connection:
+            for row in _query(connection, "SELECT * FROM discovery_incremental_jobs"):
+                incremental[str(row["job_id"])] = dict(row)
+            if "discovery_amazon_cache_indexed_jobs" in _table_names(connection):
+                for row in _query(
+                    connection,
+                    "SELECT source_job_id,verification_state FROM discovery_amazon_cache_indexed_jobs",
+                ):
+                    markers[str(row[0])] = str(row[1])
+    except (OSError, sqlite3.Error, ReadBudgetExceeded) as error:
+        errors.append(f"incremental:{type(error).__name__}")
+    try:
+        with _readonly_connection(runtime_path) as connection:
+            tables = _table_names(connection)
+            for row in _query(connection, "SELECT * FROM discovery_job_runtime"):
+                runtime[str(row["job_id"])] = dict(row)
+            if "notification_outbox" in tables:
+                for row in _query(connection, "SELECT entity_id,status FROM notification_outbox"):
+                    outbox[str(row[0])].append(str(row[1]))
+    except (OSError, sqlite3.Error, ReadBudgetExceeded) as error:
+        errors.append(f"runtime:{type(error).__name__}")
+    try:
+        with _readonly_connection(rotation_path) as connection:
+            for row in _query(
+                connection,
+                """SELECT job_id,scope_key,COUNT(*) AS total,
+                          SUM(status='analyzed') AS analyzed
+                     FROM discovery_rotation_selections GROUP BY job_id,scope_key""",
+            ):
+                rotations[str(row["job_id"])] = dict(row)
+    except (OSError, sqlite3.Error, ReadBudgetExceeded) as error:
+        errors.append(f"rotation:{type(error).__name__}")
+    all_ids = set(incremental) | set(runtime) | set(rotations)
+    jobs = []
+    for job_id in sorted(all_ids):
+        inc = incremental.get(job_id) or {}
+        run = runtime.get(job_id) or {}
+        rotation = rotations.get(job_id) or {}
+        metadata = _json_dict(inc.get("metadata_json"))
+        export_path = run.get("export_path")
+        references_known = bool(
+            not errors and inc and run and rotation and job_id in markers
+        )
+        jobs.append({
+            "job_id": job_id,
+            "status": run.get("status") or inc.get("status") or "unknown",
+            "created_at": inc.get("created_at") or run.get("started_at"),
+            "completed_at": run.get("completed_at") or metadata.get("completed_at"),
+            "scope": rotation.get("scope_key") or metadata.get("rotation_scope"),
+            "retention_mode": metadata.get("retention_mode") or "full",
+            "resumable": bool(run.get("resumable")),
+            "terminal_summary_valid": _terminal_summary_valid(metadata),
+            "cache_verification_state": markers.get(job_id),
+            "outbox_statuses": outbox.get(job_id, []),
+            "rotation_committed": bool(
+                rotation and int(rotation.get("total") or 0) == int(rotation.get("analyzed") or 0)
+            ),
+            "operational_export_preserved": bool(export_path and Path(str(export_path)).is_file()),
+            "references_known": references_known,
+            "estimated_sqlite_reclaim_bytes": int(estimates.get(job_id) or 0),
+            "estimated_filesystem_reclaim_bytes": _retention_file_estimate(
+                job_id, str(export_path) if export_path else None, jobs_dir,
+            ),
+        })
+    return {"jobs": jobs, "errors": errors, "reliable": not errors}
+
+
+def production_retention_plan(
+    watermark_state: str, project_root: str | Path = PROJECT_ROOT,
+) -> dict[str, Any]:
+    inventory = discovery_retention_inventory(project_root)
+    plan = plan_discovery_retention(inventory["jobs"], watermark_state)
+    plan["inventory_reliable"] = inventory["reliable"]
+    plan["inventory_errors"] = inventory["errors"]
+    return plan
 
 
 def _query(connection, sql: str, parameters: Iterable[Any] = ()) -> list[sqlite3.Row]:
