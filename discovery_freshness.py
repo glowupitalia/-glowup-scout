@@ -507,7 +507,22 @@ class DiscoveryAmazonCache:
                              payload_sha256=excluded.payload_sha256,
                              materialized_at=excluded.materialized_at,
                              updated_at=excluded.updated_at
-                           WHERE excluded.fee_observed_at >= discovery_amazon_fee_cache.fee_observed_at""",
+                           WHERE excluded.fee_observed_at > discovery_amazon_fee_cache.fee_observed_at
+                              OR (
+                                excluded.fee_observed_at = discovery_amazon_fee_cache.fee_observed_at
+                                AND COALESCE(
+                                  json_extract(
+                                    discovery_amazon_fee_cache.observation_json,
+                                    '$.fee_cache_reused'
+                                  ), 0
+                                ) = 1
+                                AND COALESCE(
+                                  json_extract(
+                                    excluded.observation_json,
+                                    '$.fee_cache_reused'
+                                  ), 0
+                                ) <> 1
+                              )""",
                         (key, job_id, row["observation_id"], value["fee_status"], fee_at,
                          observation_json, CACHE_PAYLOAD_SCHEMA_VERSION,
                          observation_sha256, observed, observed),
@@ -549,16 +564,29 @@ class DiscoveryAmazonCache:
         self.initialize()
         with self.store._connect() as connection:
             row = connection.execute(
-                """SELECT source_job_id,catalog_status,catalog_observed_at,freshness_json,
-                          listings_json,payload_schema_version,payload_sha256
-                   FROM discovery_amazon_cache WHERE canonical_identifier=?""",
+                """SELECT cache.source_job_id,cache.catalog_status,
+                          cache.catalog_observed_at,cache.freshness_json,
+                          cache.listings_json,cache.payload_schema_version,
+                          cache.payload_sha256,marker.verification_state,
+                          marker.materialization_version
+                   FROM discovery_amazon_cache cache
+                   LEFT JOIN discovery_amazon_cache_indexed_jobs marker
+                     ON marker.source_job_id=cache.source_job_id
+                  WHERE cache.canonical_identifier=?""",
                 (identifier,),
             ).fetchone()
             if not row:
                 return None
-            listings = _verified_payload(
-                row["listings_json"], row["payload_schema_version"],
-                row["payload_sha256"],
+            marker_verified = bool(
+                row["verification_state"] == "verified"
+                and row["materialization_version"] == CACHE_PAYLOAD_SCHEMA_VERSION
+            )
+            listings = (
+                _verified_payload(
+                    row["listings_json"], row["payload_schema_version"],
+                    row["payload_sha256"],
+                )
+                if marker_verified else None
             )
             if not isinstance(listings, list):
                 listings = [
@@ -623,19 +651,32 @@ class DiscoveryAmazonCache:
             placeholders = ",".join("?" for _ in batch)
             with self.store._connect() as connection:
                 rows = connection.execute(
-                    f"""SELECT canonical_identifier,source_job_id,catalog_status,catalog_observed_at,
-                               freshness_json,listings_json,payload_schema_version,payload_sha256
-                        FROM discovery_amazon_cache
-                        WHERE canonical_identifier IN ({placeholders})""",
+                    f"""SELECT cache.canonical_identifier,cache.source_job_id,
+                               cache.catalog_status,cache.catalog_observed_at,
+                               cache.freshness_json,cache.listings_json,
+                               cache.payload_schema_version,cache.payload_sha256,
+                               marker.verification_state,marker.materialization_version
+                        FROM discovery_amazon_cache cache
+                        LEFT JOIN discovery_amazon_cache_indexed_jobs marker
+                          ON marker.source_job_id=cache.source_job_id
+                        WHERE cache.canonical_identifier IN ({placeholders})""",
                     tuple(batch),
                 ).fetchall()
                 materialized = {}
                 legacy_identifiers = []
                 for row in rows:
                     identifier = str(row["canonical_identifier"])
-                    listings = _verified_payload(
-                        row["listings_json"], row["payload_schema_version"],
-                        row["payload_sha256"],
+                    marker_verified = bool(
+                        row["verification_state"] == "verified"
+                        and row["materialization_version"]
+                        == CACHE_PAYLOAD_SCHEMA_VERSION
+                    )
+                    listings = (
+                        _verified_payload(
+                            row["listings_json"], row["payload_schema_version"],
+                            row["payload_sha256"],
+                        )
+                        if marker_verified else None
                     )
                     if isinstance(listings, list):
                         materialized[identifier] = listings
@@ -782,16 +823,28 @@ class DiscoveryAmazonCache:
         self.initialize()
         with self.store._connect() as connection:
             row = connection.execute(
-                """SELECT source_job_id,observation_id,observation_json,fee_observed_at,
-                          payload_schema_version,payload_sha256
-                   FROM discovery_amazon_fee_cache WHERE fee_cache_key=?""",
+                """SELECT cache.source_job_id,cache.observation_id,
+                          cache.observation_json,cache.fee_observed_at,
+                          cache.payload_schema_version,cache.payload_sha256,
+                          marker.verification_state,marker.materialization_version
+                   FROM discovery_amazon_fee_cache cache
+                   LEFT JOIN discovery_amazon_cache_indexed_jobs marker
+                     ON marker.source_job_id=cache.source_job_id
+                  WHERE cache.fee_cache_key=?""",
                 (key,),
             ).fetchone()
         if not row:
             return None
-        value = _verified_payload(
-            row["observation_json"], row["payload_schema_version"],
-            row["payload_sha256"],
+        marker_verified = bool(
+            row["verification_state"] == "verified"
+            and row["materialization_version"] == CACHE_PAYLOAD_SCHEMA_VERSION
+        )
+        value = (
+            _verified_payload(
+                row["observation_json"], row["payload_schema_version"],
+                row["payload_sha256"],
+            )
+            if marker_verified else None
         )
         if not isinstance(value, dict):
             with self.store._connect() as connection:

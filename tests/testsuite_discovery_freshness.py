@@ -564,6 +564,103 @@ class CacheIndexRegressionTests(unittest.TestCase):
             "total_fees": 5,
         })
 
+    def _fee_tie_winner(self, *, original_first=True, newer_reused=False):
+        root = Path(self.temporary.name)
+        store = DiscoveryIncrementalStore(
+            root / f"fee-tie-{original_first}-{newer_reused}.sqlite3"
+        )
+        identifier = self.identifiers[0]
+        fee_observed_at = "2026-08-01T10:00:00Z"
+        jobs = [
+            ("original", {
+                "observation_id": "shared-observation",
+                "canonical_ean": identifier,
+                "asin": "B000FEETIE",
+                "reference_price": 20,
+                "currency": "EUR",
+                "fee_status": "valid",
+                "fee_estimate": {"total_fees": 5},
+                "fee_last_attempt_at": fee_observed_at,
+                "observed_at": "2026-08-01T10:00:00Z",
+                "bsr_beauty": 100,
+            }),
+            ("reused", {
+                "observation_id": "shared-observation",
+                "canonical_ean": identifier,
+                "asin": "B000FEETIE",
+                "reference_price": 20,
+                "currency": "EUR",
+                "fee_status": "valid",
+                "fee_estimate": {"total_fees": 5},
+                "fee_last_attempt_at": (
+                    "2026-08-02T10:00:00Z" if newer_reused else fee_observed_at
+                ),
+                "fee_cache_reused": True,
+                "observed_at": "2026-08-03T10:00:00Z",
+                "bsr_beauty": 999,
+            }),
+        ]
+        for job_id, observation in jobs:
+            store.create_job(
+                {"job_id": job_id, "status": "completed", "phase": "completed",
+                 "filters": {}},
+                [{
+                    "canonical_ean": identifier,
+                    "gtin": identifier,
+                    "catalog_status": "resolved",
+                    "scenarios": [],
+                    "amazon_listings": [{
+                        "asin": "B000FEETIE",
+                        "reference_price": 20,
+                        "currency": "EUR",
+                    }],
+                }],
+            )
+            store.upsert_observations(job_id, [observation])
+        ordered = ("original", "reused") if original_first else ("reused", "original")
+        with store._connect() as connection:
+            for offset, job_id in enumerate(ordered):
+                connection.execute(
+                    "UPDATE discovery_incremental_jobs SET updated_at=? WHERE job_id=?",
+                    (f"2026-08-0{offset + 1}T00:00:00Z", job_id),
+                )
+            connection.commit()
+        cache = DiscoveryAmazonCache(store)
+        cache.index_completed_jobs()
+        with store._connect() as connection:
+            row = connection.execute(
+                "SELECT source_job_id,fee_observed_at,observation_json "
+                "FROM discovery_amazon_fee_cache"
+            ).fetchone()
+        return str(row["source_job_id"]), str(row["fee_observed_at"]), json.loads(
+            row["observation_json"]
+        )
+
+    def test_fee_cache_newer_observation_wins_even_when_reused(self):
+        source, observed_at, value = self._fee_tie_winner(
+            original_first=True, newer_reused=True,
+        )
+        self.assertEqual(source, "reused")
+        self.assertEqual(observed_at, "2026-08-02T10:00:00Z")
+        self.assertTrue(value["fee_cache_reused"])
+
+    def test_equal_fee_timestamp_original_beats_reused_in_either_replay_order(self):
+        first = self._fee_tie_winner(original_first=True)
+        second = self._fee_tie_winner(original_first=False)
+        self.assertEqual(first, second)
+        source, observed_at, value = first
+        self.assertEqual(source, "original")
+        self.assertEqual(observed_at, "2026-08-01T10:00:00Z")
+        self.assertNotIn("fee_cache_reused", value)
+        self.assertEqual(value["fee_estimate"], {"total_fees": 5})
+        self.assertEqual(value["bsr_beauty"], 100)
+
+    def test_equal_fee_timestamp_non_fee_updates_do_not_replace_original(self):
+        _, _, value = self._fee_tie_winner(original_first=True)
+        self.assertEqual(value["bsr_beauty"], 100)
+        self.assertEqual(value["observed_at"], "2026-08-01T10:00:00Z")
+        self.assertNotIn("fee_cache_reused", value)
+
     def test_additive_cache_migration_upgrades_legacy_schema_idempotently(self):
         root = Path(self.temporary.name)
         store = DiscoveryIncrementalStore(root / "legacy.sqlite3")
@@ -645,6 +742,135 @@ class CacheIndexRegressionTests(unittest.TestCase):
         self.assertEqual(fee["fee_status"], "valid")
         self.assertEqual(fee["canonical_ean"], self.identifiers[0])
         self.assertEqual(fee["asin"], "B000000000")
+
+    def test_unverified_or_missing_job_marker_forces_catalog_source_fallback(self):
+        for marker_state in ("failed", "pending", "missing"):
+            with self.subTest(marker_state=marker_state):
+                cache = DiscoveryAmazonCache(self.store)
+                cache.index_completed_jobs()
+                with self.store._connect() as connection:
+                    if marker_state == "missing":
+                        connection.execute(
+                            "DELETE FROM discovery_amazon_cache_indexed_jobs "
+                            "WHERE source_job_id='source'"
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE discovery_amazon_cache_indexed_jobs "
+                            "SET verification_state=? WHERE source_job_id='source'",
+                            (marker_state,),
+                        )
+                    connection.commit()
+                statements = []
+                original = self.store._new_connection
+
+                def traced_connection():
+                    connection = original()
+                    connection.set_trace_callback(statements.append)
+                    return connection
+
+                self.store._new_connection = traced_connection
+                try:
+                    cached = cache.get(self.identifiers[0])
+                finally:
+                    self.store._new_connection = original
+                self.assertEqual(cached["catalog_status"], "resolved")
+                self.assertTrue(any(
+                    "FROM discovery_listings" in sql for sql in statements
+                ))
+                with self.store._connect() as connection:
+                    revision = cache._source_revision(connection, "source")[0]
+                    connection.execute(
+                        """INSERT INTO discovery_amazon_cache_indexed_jobs
+                           (source_job_id,source_updated_at,indexed_at,
+                            materialization_version,verification_state)
+                           VALUES ('source',?,? ,?,'verified')
+                           ON CONFLICT(source_job_id) DO UPDATE SET
+                             source_updated_at=excluded.source_updated_at,
+                             indexed_at=excluded.indexed_at,
+                             materialization_version=excluded.materialization_version,
+                             verification_state=excluded.verification_state""",
+                        (revision, FRESH, CACHE_PAYLOAD_SCHEMA_VERSION),
+                    )
+                    connection.commit()
+
+    def test_failed_job_marker_forces_fee_source_fallback(self):
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE discovery_amazon_cache_indexed_jobs "
+                "SET verification_state='failed' WHERE source_job_id='source'"
+            )
+            connection.commit()
+        statements = []
+        original = self.store._new_connection
+
+        def traced_connection():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        self.store._new_connection = traced_connection
+        try:
+            fee = cache.fee("B000000000", 20)
+        finally:
+            self.store._new_connection = original
+        self.assertEqual(fee["observation_id"], "observation-modern")
+        self.assertTrue(any(
+            "FROM discovery_observations" in sql for sql in statements
+        ))
+
+    def test_mixed_marker_batch_falls_back_only_for_unverified_subset(self):
+        cache = DiscoveryAmazonCache(self.store)
+        cache.index_completed_jobs()
+        verified_identifier = valid_gtin(99)
+        self.store.create_job(
+            {"job_id": "verified-source", "status": "completed",
+             "phase": "completed", "filters": {}},
+            [{
+                "canonical_ean": verified_identifier,
+                "gtin": verified_identifier,
+                "catalog_status": "resolved",
+                "scenarios": [],
+                "amazon_listings": [{
+                    "asin": "B000VERIFIED", "reference_price": 30,
+                    "currency": "EUR", "catalog_observed_at": FRESH,
+                }],
+            }],
+        )
+        cache.index_completed_jobs()
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE discovery_amazon_cache_indexed_jobs "
+                "SET verification_state='failed' WHERE source_job_id='source'"
+            )
+            connection.commit()
+        statements = []
+        original = self.store._new_connection
+
+        def traced_connection():
+            connection = original()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        self.store._new_connection = traced_connection
+        try:
+            batch = dict(cache.get_many([
+                self.identifiers[0], verified_identifier,
+            ]))
+        finally:
+            self.store._new_connection = original
+        source_reads = [
+            sql for sql in statements if "FROM discovery_listings" in sql
+        ]
+        self.assertEqual(len(source_reads), 1)
+        self.assertIn(self.identifiers[0], source_reads[0])
+        self.assertNotIn(verified_identifier, source_reads[0])
+        self.assertEqual(
+            batch[verified_identifier]["amazon_listings"][0]["asin"],
+            "B000VERIFIED",
+        )
 
     def test_materialized_negative_and_ambiguous_preserve_order_and_taxonomy(self):
         root = Path(self.temporary.name)
