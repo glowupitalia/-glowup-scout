@@ -21,6 +21,7 @@ from discovery_jobs import DiscoveryJobRegistry, PROJECT_ROOT
 from discovery_resources import DiscoveryResourceGovernor, ResourcePause
 from notifications import send_discovery_terminal_notification
 from storage_gc import append_storage_audit_event, collect_storage_metrics
+from storage_retention import run_automatic_retention
 
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,7 @@ def export_operational_offline(
 def finalize(
     job_id: str, *, registry=None, store=None, checkpoints=None,
     governor=None, send_notification=True, output_path=None,
+    automatic_retention=run_automatic_retention,
 ) -> dict:
     """Export and notify from SQLite only; never invokes Amazon or suppliers."""
     load_env()
@@ -230,10 +232,24 @@ def finalize(
             "success": True, "storage_after": collect_storage_metrics(),
             "retention_execution": False,
         }, path=Path(registry.path).parent / "storage-workload-metrics.jsonl")
+        try:
+            retention_root = Path(registry.path).parent
+            if retention_root.name == "data":
+                retention_root = retention_root.parent
+            retention = automatic_retention(
+                trigger_event="discovery_completed", trigger_id=job_id,
+                project_root=retention_root,
+            )
+        except Exception as error:
+            logger.exception(
+                "RETENTION AUTOMATION CALLBACK FAILED | job_id=%s", job_id,
+            )
+            retention = {"status": f"RETENTION_ABORT_VERIFICATION:{type(error).__name__}"}
         logger.info(
-            "DISCOVERY FINALIZATION COMPLETED | job_id=%s export=%s notification=%s",
+            "DISCOVERY FINALIZATION COMPLETED | job_id=%s export=%s notification=%s retention=%s",
             job_id, target.name,
             (notification or {}).get("status") if isinstance(notification, dict) else "disabled",
+            retention.get("status"),
         )
         return {**state, "notification": notification}
     except ResourcePause as exc:

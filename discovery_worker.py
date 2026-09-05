@@ -39,6 +39,7 @@ from storage_gc import (
     production_retention_plan,
 )
 from storage_maintenance import MaintenanceLockUnavailable, StorageMaintenanceLock
+from storage_retention import run_automatic_retention
 
 
 logger = logging.getLogger(__name__)
@@ -344,6 +345,18 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None, maintenance_lo
         except Exception:
             logger.error(
                 "DISCOVERY NOTIFICATION FAILED | job_id=%s", job_id,
+            )
+        if result.get("status") == "completed":
+            retention_root = Path(registry.path).parent
+            if retention_root.name == "data":
+                retention_root = retention_root.parent
+            retention = run_automatic_retention(
+                trigger_event="discovery_completed", trigger_id=job_id,
+                project_root=retention_root,
+            )
+            logger.info(
+                "DISCOVERY RETENTION EVALUATED | job_id=%s status=%s",
+                job_id, retention.get("status"),
             )
         return result
     except ResourcePause as exc:

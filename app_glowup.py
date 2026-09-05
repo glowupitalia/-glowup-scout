@@ -70,6 +70,7 @@ from storage_gc import (
     evaluate_discovery_admission,
     production_retention_plan,
 )
+from storage_retention import retention_automation_status
 
 
 DISCOVERY_OPERATIONAL_SUPPLIERS = ("qogita", "umma", "abw", "qudo")
@@ -1909,6 +1910,18 @@ elif ui_state == "discovery":
                 f" · {float(storage_percent):.1f}%"
             )
         st.caption(storage_caption)
+        retention_automation = retention_automation_status()
+        automation_caption = "Retention automatica: attiva"
+        if retention_automation.get("last_cycle_completed_at"):
+            automation_caption += (
+                f" · ultimo esito {retention_automation.get('last_status') or 'unknown'}"
+            )
+            if retention_automation.get("last_job_converted"):
+                automation_caption += (
+                    f" · job {retention_automation['last_job_converted']}"
+                    f" · {float(retention_automation.get('last_logical_reclaim_bytes') or 0) / (1024 ** 3):.2f} GiB logici"
+                )
+        st.caption(automation_caption)
         if storage_state in {"PREVENTIVE", "PRESSURE", "CRITICAL", "EMERGENCY"}:
             retention_preview = discovery_retention_preview(storage_state)
             retention_summary = retention_preview.get("summary") or {}
@@ -1916,8 +1929,16 @@ elif ui_state == "discovery":
                 "Retention dry-run: "
                 f"{int(retention_summary.get('candidate_count') or 0)} candidate · "
                 f"{float(retention_summary.get('logical_reclaim_bytes') or 0) / (1024 ** 3):.2f} GiB logici · "
-                "esecuzione automatica disattivata"
+                + (
+                    "applicazione automatica conservativa abilitata"
+                    if storage_state in {"PREVENTIVE", "PRESSURE"}
+                    else "intervento manuale richiesto"
+                )
             )
+            if retention_automation.get("last_status") == "MANUAL_REVIEW_REQUIRED":
+                st.warning(
+                    "Retention: il candidato supera 1 GiB logico e richiede revisione manuale."
+                )
         if not storage_admission.get("allowed"):
             st.warning(
                 "Workload bloccato per spazio: lo spazio stimato a fine Discovery "

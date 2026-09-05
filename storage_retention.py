@@ -9,9 +9,11 @@ SQLite transaction.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -42,9 +44,14 @@ EXECUTION_PLAN_VERSION = "storage_retention_execution_plan_v2"
 APPLY_CONFIRMATION = "APPLY_FINAL_ONLY"
 DEFAULT_AUDIT_NAME = "retention-executor-audit.jsonl"
 RETENTION_CYCLE_VERSION = "storage_retention_cycle_v1"
+RETENTION_AUTOMATION_STATE_VERSION = "storage_retention_automation_state_v1"
 DEFAULT_MAX_JOBS_PER_CYCLE = 1
 DEFAULT_MAX_LOGICAL_RECLAIM_PER_CYCLE = 1024 ** 3
-RETENTION_AUTOMATION_ENABLED = False
+# Emergency kill switch: changing this single flag to False disables every
+# automatic callback without changing schema, scheduler, or the manual executor.
+RETENTION_AUTOMATION_ENABLED = True
+RETENTION_AUTOMATION_COOLDOWN_SECONDS = 60 * 60
+DEFAULT_AUTOMATION_STATE_NAME = "retention-automation-state.json"
 ACTIVE_OR_RESUMABLE_STATUSES = {
     "launching", "queued", "running", "computed", "export_pending",
     "export_running", "export_complete", "notification_pending",
@@ -137,6 +144,36 @@ def _canonical(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"state_error": "automation_state_unreadable"}
+    return value if isinstance(value, dict) else {"state_error": "automation_state_invalid"}
+
+
+def _write_json_object_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(_canonical(value) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _json_dict(value: Any) -> dict[str, Any]:
@@ -725,6 +762,7 @@ class RetentionExecutor:
         self, plan: dict[str, Any], *, apply: bool = False,
         confirmed_job_ids: Iterable[str] = (), confirmation: str | None = None,
         lock_timeout_seconds: float = 0.0,
+        actor: str = "manual", trigger: str = "manual",
     ) -> dict[str, Any]:
         if not apply:
             return self.preview(plan)
@@ -744,11 +782,16 @@ class RetentionExecutor:
                 for expected in candidates:
                     self._assert_no_active_jobs()
                     self._assert_plan_watermark_current(plan)
-                    results.append(self._apply_one(plan, expected))
+                    results.append(
+                        self._apply_one(
+                            plan, expected, actor=actor, trigger=trigger,
+                        )
+                    )
         except MaintenanceLockUnavailable as error:
             self._audit(
                 "RETENTION_BLOCKED_MAINTENANCE_LOCK",
                 plan_sha256=plan.get("plan_sha256"), error=str(error),
+                actor=actor, trigger=trigger,
             )
             raise RetentionAbort(str(error)) from error
         except RetentionAbort as error:
@@ -762,13 +805,14 @@ class RetentionExecutor:
             )
             self._audit(
                 outcome, plan_sha256=plan.get("plan_sha256"), error=message,
+                actor=actor, trigger=trigger,
             )
             raise
         except Exception as error:
             self._audit(
                 "RETENTION_ABORT_VERIFICATION",
                 plan_sha256=plan.get("plan_sha256"),
-                error=f"{type(error).__name__}:{error}",
+                error=f"{type(error).__name__}:{error}", actor=actor, trigger=trigger,
             )
             raise
         return {
@@ -779,7 +823,10 @@ class RetentionExecutor:
             "vacuum_operations": 0, "external_file_operations": 0,
         }
 
-    def _apply_one(self, plan: dict[str, Any], expected: dict[str, Any]) -> dict[str, Any]:
+    def _apply_one(
+        self, plan: dict[str, Any], expected: dict[str, Any], *,
+        actor: str = "manual", trigger: str = "manual",
+    ) -> dict[str, Any]:
         job_id = str(expected["job_id"])
         started = time.monotonic()
         # Idempotent replay is recognized before planner eligibility is re-evaluated.
@@ -867,7 +914,7 @@ class RetentionExecutor:
             audit = {
                 "applied_at": _now(), "executor_version": EXECUTOR_VERSION,
                 "plan_version": plan["version"], "plan_sha256": plan["plan_sha256"],
-                "actor": "manual", "rows_removed": removed,
+                "actor": actor, "trigger": trigger, "rows_removed": removed,
                 "logical_reclaim_estimate": pre["logical_bytes_remove"],
                 "planner_reclaim_estimate": expected["expected_estimated_reclaim_bytes"],
                 "pre_hashes": {
@@ -943,7 +990,8 @@ class RetentionExecutor:
         except BaseException as error:
             connection.rollback()
             append_storage_audit_event({
-                "event": "retention_execution", "actor": "manual", "job_id": job_id,
+                "event": "retention_execution", "actor": actor,
+                "trigger": trigger, "job_id": job_id,
                 "outcome": "RETENTION_ABORT_VERIFICATION",
                 "plan_sha256": plan.get("plan_sha256"), "result": "rollback",
                 "error": f"{type(error).__name__}:{error}",
@@ -978,7 +1026,8 @@ class RetentionExecutor:
             "vacuum_operations": 0, "external_file_operations": 0,
         }
         audit_persisted = append_storage_audit_event({
-            "event": "retention_execution", "actor": "manual", "job_id": job_id,
+            "event": "retention_execution", "actor": actor,
+            "trigger": trigger, "job_id": job_id,
             "outcome": "RETENTION_APPLIED",
             "plan_sha256": plan["plan_sha256"], "result": "applied",
             "rows_removed": removed, "logical_bytes_removed": pre["logical_bytes_remove"],
@@ -997,6 +1046,7 @@ def run_retention_cycle(
     apply: bool = False,
     limits: RetentionCycleLimits | None = None,
     metrics_provider=None,
+    trigger: str = "automatic",
 ) -> dict[str, Any]:
     """Future bounded cycle entry point; disabled and dry-run by default.
 
@@ -1015,7 +1065,7 @@ def run_retention_cycle(
             "max_logical_reclaim_per_cycle": limits.max_logical_reclaim_per_cycle,
         },
         "results": [], "jobs_applied": 0, "logical_reclaim_applied": 0,
-        "automatic_execution_configured": False,
+        "automatic_execution_configured": bool(enabled), "trigger": trigger,
     }
     if not enabled:
         return {**base, "status": "RETENTION_AUTOMATION_DISABLED"}
@@ -1025,10 +1075,16 @@ def run_retention_cycle(
     state = str(watermark.get("state") or "UNKNOWN")
     if not initial.get("reliable") or not watermark.get("reliable"):
         return {**base, "status": "RETENTION_ABORT_VERIFICATION", "reason": "storage_unknown"}
+    if state == "NORMAL":
+        return {
+            **base, "status": "RETENTION_NOOP_NORMAL", "watermark": state,
+            "stop_reason": "normal_watermark_no_automatic_retention",
+        }
     if state not in {"PREVENTIVE", "PRESSURE"}:
         return {
             **base, "status": "NO_AUTOMATIC_POLICY_FOR_WATERMARK",
             "watermark": state,
+            "stop_reason": "critical_or_emergency_requires_manual_intervention",
         }
 
     if not apply:
@@ -1062,16 +1118,29 @@ def run_retention_cycle(
         # Regenerate the authoritative planner after every measurement/job.
         plan = executor.build_plan(current_state)
         candidates = plan.get("candidates") or []
+        base["planner_policy"] = plan.get("policy") or (
+            "E_KEEP_GLOBAL_10_SCOPE_1"
+            if current_state == "PREVENTIVE" else "D_KEEP_GLOBAL_5_SCOPE_1"
+        )
+        base["candidate_count"] = len(candidates)
+        base["candidate_job_ids"] = [row.get("job_id") for row in candidates]
         if not candidates:
             base["status"] = "NO_ELIGIBLE_CANDIDATES"
             break
         candidate = candidates[0]
-        logical = int((candidate.get("manifest") or {}).get("logical_bytes_remove") or 0)
+        logical = max(
+            int((candidate.get("manifest") or {}).get("logical_bytes_remove") or 0),
+            int(candidate.get("expected_estimated_reclaim_bytes") or 0),
+        )
         if base["logical_reclaim_applied"] + logical > limits.max_logical_reclaim_per_cycle:
-            base["status"] = "RETENTION_CYCLE_LIMIT_REACHED"
+            base["status"] = "MANUAL_REVIEW_REQUIRED"
+            base["stop_reason"] = "candidate_exceeds_automatic_logical_reclaim_limit"
+            base["candidate_job_id"] = candidate.get("job_id")
+            base["candidate_logical_reclaim_bytes"] = logical
             base["limit"] = "max_logical_reclaim_per_cycle"
             executor._audit(
                 base["status"], limit=base["limit"], job_id=candidate.get("job_id"),
+                logical_reclaim_bytes=logical, trigger=trigger,
             )
             break
         job_id = str(candidate["job_id"])
@@ -1080,6 +1149,7 @@ def run_retention_cycle(
             outcome = executor.apply_plan(
                 one_job_plan, apply=True, confirmation=APPLY_CONFIRMATION,
                 confirmed_job_ids=[job_id],
+                actor="automatic", trigger=trigger,
             )
         except Exception as error:
             base["status"] = "RETENTION_ABORT_VERIFICATION"
@@ -1105,6 +1175,197 @@ def run_retention_cycle(
             break
         base["last_storage_measurement"] = metrics_provider()
     return base
+
+
+def retention_automation_status(
+    project_root: str | Path = PROJECT_ROOT,
+) -> dict[str, Any]:
+    """Return the bounded automation state without triggering retention."""
+    root = Path(project_root).resolve()
+    state = _read_json_object(root / "data" / DEFAULT_AUTOMATION_STATE_NAME)
+    return {
+        "version": RETENTION_AUTOMATION_STATE_VERSION,
+        **state,
+        "enabled": RETENTION_AUTOMATION_ENABLED,
+        "cooldown_seconds": RETENTION_AUTOMATION_COOLDOWN_SECONDS,
+        "max_jobs_per_retention_cycle": DEFAULT_MAX_JOBS_PER_CYCLE,
+        "max_logical_reclaim_per_cycle": DEFAULT_MAX_LOGICAL_RECLAIM_PER_CYCLE,
+    }
+
+
+def run_automatic_retention(
+    *, trigger_event: str, trigger_id: str | None = None,
+    project_root: str | Path = PROJECT_ROOT,
+    enabled: bool = RETENTION_AUTOMATION_ENABLED,
+    cooldown_seconds: int = RETENTION_AUTOMATION_COOLDOWN_SECONDS,
+    executor: RetentionExecutor | None = None,
+    metrics_provider=None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Run one conservative, event-driven automatic evaluation.
+
+    The single-record state is protected by a kernel lock, so repeated
+    completion callbacks cannot race or retry the same cycle continuously.
+    No caller invokes this function on a timer.
+    """
+    root = Path(project_root).resolve()
+    data = root / "data"
+    state_path = data / DEFAULT_AUTOMATION_STATE_NAME
+    automation_lock = StorageMaintenanceLock(
+        state_path.with_name(state_path.name + ".lock")
+    )
+    executor = executor or RetentionExecutor(root)
+    metrics_provider = metrics_provider or executor.metrics_provider
+    observed_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    started_at = observed_now.isoformat().replace("+00:00", "Z")
+    cycle_started_monotonic = time.monotonic()
+    if not enabled:
+        return {
+            "status": "RETENTION_AUTOMATION_DISABLED", "enabled": False,
+            "writes_performed": 0, "trigger_event": trigger_event,
+        }
+    try:
+        with automation_lock.retention_apply_guard():
+            previous = _read_json_object(state_path)
+            if previous.get("state_error"):
+                return {
+                    "status": "RETENTION_ABORT_VERIFICATION", "enabled": True,
+                    "stop_reason": previous["state_error"], "writes_performed": 0,
+                    "trigger_event": trigger_event,
+                }
+            last_started = _parse_timestamp(previous.get("last_cycle_started_at"))
+            elapsed = (
+                (observed_now - last_started).total_seconds()
+                if last_started is not None else None
+            )
+            if elapsed is not None and elapsed < max(0, int(cooldown_seconds)):
+                return {
+                    "status": "RETENTION_AUTOMATION_COOLDOWN", "enabled": True,
+                    "writes_performed": 0, "trigger_event": trigger_event,
+                    "trigger_id": trigger_id,
+                    "retry_after_seconds": max(0, int(cooldown_seconds - elapsed)),
+                }
+
+            storage_before = metrics_provider()
+            watermark_before = str(
+                ((storage_before.get("watermark") or {}).get("state") or "UNKNOWN")
+            )
+            automatic_trigger = f"automatic_{watermark_before.casefold()}"
+            reservation = {
+                "version": RETENTION_AUTOMATION_STATE_VERSION,
+                "enabled": True,
+                "last_cycle_started_at": started_at,
+                "last_trigger_event": str(trigger_event),
+                "last_trigger_id": str(trigger_id or ""),
+                "last_trigger": automatic_trigger,
+                "last_status": "RETENTION_CYCLE_STARTED",
+            }
+            _write_json_object_atomic(state_path, reservation)
+            audit_started = append_storage_audit_event({
+                "event": "retention_automation_cycle",
+                "actor": "automatic", "trigger": automatic_trigger,
+                "trigger_event": trigger_event, "trigger_id": trigger_id,
+                "outcome": "RETENTION_CYCLE_STARTED",
+                "watermark_pre": watermark_before,
+                "storage_before": storage_before,
+                "retention_execution": False,
+            }, path=executor.audit_path)
+            if not audit_started:
+                result = {
+                    "status": "RETENTION_ABORT_VERIFICATION", "enabled": True,
+                    "stop_reason": "critical_audit_write_failed_before_cycle",
+                    "writes_performed": 0,
+                }
+            else:
+                result = run_retention_cycle(
+                    executor=executor, enabled=True, apply=True,
+                    limits=RetentionCycleLimits(), metrics_provider=metrics_provider,
+                    trigger=automatic_trigger,
+                )
+
+            storage_after = metrics_provider()
+            watermark_after = str(
+                ((storage_after.get("watermark") or {}).get("state") or "UNKNOWN")
+            )
+            applied = [
+                row for row in (result.get("results") or [])
+                if row.get("status") == "APPLIED"
+            ]
+            last_applied = applied[-1] if applied else {}
+            completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            compact = {
+                **reservation,
+                "last_cycle_completed_at": completed_at,
+                "last_status": result.get("status"),
+                "last_stop_reason": result.get("stop_reason") or result.get("reason"),
+                "last_watermark_pre": watermark_before,
+                "last_watermark_post": watermark_after,
+                "last_policy": (
+                    "E_KEEP_GLOBAL_10_SCOPE_1" if watermark_before == "PREVENTIVE"
+                    else "D_KEEP_GLOBAL_5_SCOPE_1" if watermark_before == "PRESSURE"
+                    else "NONE"
+                ),
+                "last_candidate_job_id": result.get("candidate_job_id"),
+                "last_job_converted": last_applied.get("job_id"),
+                "last_logical_reclaim_bytes": int(
+                    last_applied.get("logical_bytes_removed") or 0
+                ),
+                "last_freelist_before_bytes": last_applied.get("freelist_bytes_before"),
+                "last_freelist_after_bytes": last_applied.get("freelist_bytes_after"),
+                "last_jobs_applied": int(result.get("jobs_applied") or 0),
+                "last_elapsed_seconds": time.monotonic() - cycle_started_monotonic,
+            }
+            _write_json_object_atomic(state_path, compact)
+            audit_finished = append_storage_audit_event({
+                "event": "retention_automation_cycle",
+                "actor": "automatic", "trigger": automatic_trigger,
+                "trigger_event": trigger_event, "trigger_id": trigger_id,
+                "outcome": result.get("status"),
+                "stop_reason": result.get("stop_reason") or result.get("reason"),
+                "watermark_pre": watermark_before,
+                "watermark_post": watermark_after,
+                "planner_policy": compact["last_policy"],
+                "candidate_count": int(result.get("candidate_count") or 0),
+                "candidate_job_ids": result.get("candidate_job_ids") or [],
+                "candidate_job_id": (
+                    result.get("candidate_job_id") or last_applied.get("job_id")
+                ),
+                "logical_reclaim_bytes": compact["last_logical_reclaim_bytes"],
+                "elapsed_seconds": compact["last_elapsed_seconds"],
+                "storage_before": storage_before, "storage_after": storage_after,
+                "retention_execution": bool(applied),
+            }, path=executor.audit_path)
+            if not audit_finished:
+                result = {
+                    **result,
+                    "status": "RETENTION_ABORT_VERIFICATION",
+                    "stop_reason": "critical_cycle_audit_write_failed",
+                }
+                compact.update({
+                    "last_status": result["status"],
+                    "last_stop_reason": result["stop_reason"],
+                })
+                _write_json_object_atomic(state_path, compact)
+            return {
+                **result, "enabled": True, "trigger": automatic_trigger,
+                "trigger_event": trigger_event, "trigger_id": trigger_id,
+                "audit_persisted": bool(audit_started and audit_finished),
+                "automation_state": compact,
+            }
+    except MaintenanceLockUnavailable as error:
+        return {
+            "status": "RETENTION_BLOCKED_MAINTENANCE_LOCK", "enabled": True,
+            "stop_reason": str(error), "writes_performed": 0,
+            "trigger_event": trigger_event, "trigger_id": trigger_id,
+        }
+    except Exception as error:
+        logger.exception("RETENTION AUTOMATION ABORTED")
+        return {
+            "status": "RETENTION_ABORT_VERIFICATION", "enabled": True,
+            "stop_reason": f"{type(error).__name__}:{error}",
+            "writes_performed": 0, "trigger_event": trigger_event,
+            "trigger_id": trigger_id,
+        }
 
 
 def _load_plan(path: Path) -> dict[str, Any]:

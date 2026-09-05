@@ -347,16 +347,17 @@ class FinalizationTests(unittest.TestCase):
 
     def test_finalizer_is_restart_safe_and_does_not_rewrite_valid_export(self):
         target = self.root / "final.xlsx"
+        retention = Mock(return_value={"status": "RETENTION_NOOP_NORMAL"})
         first = finalize(
             "job", registry=self.registry, store=self.store,
             checkpoints=self.checkpoints, send_notification=False,
-            output_path=target,
+            output_path=target, automatic_retention=retention,
         )
         first_mtime = target.stat().st_mtime_ns
         second = finalize(
             "job", registry=self.registry, store=self.store,
             checkpoints=self.checkpoints, send_notification=False,
-            output_path=target,
+            output_path=target, automatic_retention=retention,
         )
         self.assertEqual(first["export_state"]["sha256"], second["export_state"]["sha256"])
         self.assertEqual(first["operational_export"], first["export_state"])
@@ -370,6 +371,10 @@ class FinalizationTests(unittest.TestCase):
         self.assertTrue(contract["terminal_summary_valid"])
         compact = self.checkpoints.load("job")
         self.assertEqual(compact["retention_mode"], "full")
+        self.assertEqual(retention.call_count, 2)
+        self.assertEqual(
+            retention.call_args.kwargs["trigger_event"], "discovery_completed",
+        )
 
     def test_resource_pause_is_export_specific_and_resumable(self):
         snapshot = ResourceSnapshot(
