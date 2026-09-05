@@ -1093,6 +1093,22 @@ def _render_discovery_runtime(job_id):
         ):
             _start_discovery_worker(state)
             st.rerun(scope="app")
+    elif runtime["status"] == "maintenance_blocked":
+        state = _load_authoritative_discovery_state(
+            runtime["job_id"], runtime=runtime,
+        )
+        st.warning("Avvio Discovery in attesa della manutenzione storage")
+        st.caption(
+            "Il worker non ha effettuato il claim. Il job resta riprendibile "
+            "e non è classificato come errore Discovery."
+        )
+        if st.button(
+            "Riprova avvio Discovery",
+            key="resume_storage_maintenance",
+            type="primary",
+        ):
+            _start_discovery_worker(state)
+            st.rerun(scope="app")
     elif runtime["status"] in {"resource_paused", "export_resource_paused"}:
         state = _load_authoritative_discovery_state(
             runtime["job_id"], runtime=runtime,
@@ -1157,14 +1173,21 @@ if ui_state == "home":
             storage_blocked = (
                 latest_discovery.get("status") == "admission_blocked_storage"
             )
+            maintenance_blocked = (
+                latest_discovery.get("status") == "maintenance_blocked"
+            )
             st.subheader(
                 "WORKLOAD BLOCCATO PER SPAZIO" if storage_blocked
+                else "AVVIO IN ATTESA DELLA MANUTENZIONE STORAGE" if maintenance_blocked
                 else "DISCOVERY SOSPESA"
             )
             st.caption(
                 "Il job non è stato avviato. Aprendolo, lo spazio verrà rivalutato "
                 "dal worker prima di qualsiasi claim."
                 if storage_blocked else
+                "Il claim non è avvenuto mentre la retention aveva il lock esclusivo. "
+                "Il job resta riprendibile."
+                if maintenance_blocked else
                 "Il job persistito può essere aperto e ripreso senza creare un nuovo campione."
             )
             if st.button(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -11,6 +12,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from storage_maintenance import MaintenanceLockUnavailable, StorageMaintenanceLock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -28,6 +31,7 @@ RESUMABLE_CHECKPOINT_STATUSES = {
     "qogita_refresh_failed", "supplier_preparation_failed",
     "resource_paused",
     "admission_blocked_storage",
+    "maintenance_blocked",
     "computed", "export_pending", "export_running", "export_resource_paused",
     "export_complete", "notification_pending",
 }
@@ -37,6 +41,8 @@ TERMINAL_STATUSES = {
 STATE_SOURCE_AUTHORITY = {
     "legacy": 0, "compact": 1, "incremental": 2, "registry": 3,
 }
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA = """
@@ -198,36 +204,43 @@ class DiscoveryJobRegistry:
         result["resumable"] = bool(result.get("resumable"))
         return result
 
-    def register_checkpoint(self, state: dict[str, Any]):
-        self.initialize()
+    def register_checkpoint(self, state: dict[str, Any], *, maintenance_lock=None):
         now = utc_now()
         checkpoint_path = str(
             PROJECT_ROOT / "data" / "discovery_jobs" / f"{state['job_id']}.json"
         )
-        with self._connect() as connection:
-            connection.execute(
-                """INSERT INTO discovery_job_runtime
-                   (job_id,status,phase,started_at,updated_at,completed_at,budget,
-                    progress_current,progress_total,resumable,error,worker_pid,
-                    lease_expires_at,selected_suppliers_json,filters_json,checkpoint_path)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(job_id) DO UPDATE SET
-                     phase=excluded.phase, started_at=COALESCE(discovery_job_runtime.started_at,excluded.started_at),
-                     budget=excluded.budget, selected_suppliers_json=excluded.selected_suppliers_json,
-                     filters_json=excluded.filters_json, checkpoint_path=excluded.checkpoint_path,
-                     resumable=excluded.resumable, updated_at=excluded.updated_at""",
-                (
-                    state["job_id"], "resumable", state.get("phase") or "initialized",
-                    state.get("started_at"), now, state.get("completed_at"),
-                    str(state.get("run_budget") or "all"),
-                    int(state.get("progress_current") or state.get("rotation_analyzed_this_run") or 0),
-                    int(state.get("progress_total") or state.get("sampled_identifier_count") or 0),
-                    1, None, None, None,
-                    json.dumps(state.get("selected_suppliers") or []),
-                    json.dumps(state.get("filters") or {}, sort_keys=True), checkpoint_path,
-                ),
-            )
-            connection.commit()
+        maintenance_lock = maintenance_lock or StorageMaintenanceLock(
+            Path(self.path).parent / "discovery-maintenance.lock"
+        )
+        # Registration itself makes a job resumable and therefore visible to
+        # retention.  Guard that commit so it cannot appear after retention's
+        # last active-workload check.
+        with maintenance_lock.discovery_start_guard():
+            self.initialize()
+            with self._connect() as connection:
+                connection.execute(
+                    """INSERT INTO discovery_job_runtime
+                       (job_id,status,phase,started_at,updated_at,completed_at,budget,
+                        progress_current,progress_total,resumable,error,worker_pid,
+                        lease_expires_at,selected_suppliers_json,filters_json,checkpoint_path)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(job_id) DO UPDATE SET
+                         phase=excluded.phase, started_at=COALESCE(discovery_job_runtime.started_at,excluded.started_at),
+                         budget=excluded.budget, selected_suppliers_json=excluded.selected_suppliers_json,
+                         filters_json=excluded.filters_json, checkpoint_path=excluded.checkpoint_path,
+                         resumable=excluded.resumable, updated_at=excluded.updated_at""",
+                    (
+                        state["job_id"], "resumable", state.get("phase") or "initialized",
+                        state.get("started_at"), now, state.get("completed_at"),
+                        str(state.get("run_budget") or "all"),
+                        int(state.get("progress_current") or state.get("rotation_analyzed_this_run") or 0),
+                        int(state.get("progress_total") or state.get("sampled_identifier_count") or 0),
+                        1, None, None, None,
+                        json.dumps(state.get("selected_suppliers") or []),
+                        json.dumps(state.get("filters") or {}, sort_keys=True), checkpoint_path,
+                    ),
+                )
+                connection.commit()
 
     def get(self, job_id: str):
         self.initialize()
@@ -508,6 +521,22 @@ class DiscoveryJobRegistry:
             )
             connection.commit()
 
+    def maintenance_blocked(self, job_id: str, *, reason: str) -> None:
+        """Leave a not-yet-claimed job retry-safe while retention owns the lock."""
+        self.initialize()
+        observed = utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE discovery_job_runtime
+                      SET status='maintenance_blocked',phase='maintenance_blocked',
+                          resumable=1,error=?,updated_at=?,worker_pid=NULL,
+                          lease_expires_at=NULL
+                    WHERE job_id=?""",
+                (str(reason), observed, job_id),
+            )
+            connection.commit()
+
     def update_recovery_progress(
         self, job_id: str, *, phase: str, current: int, total: int,
     ):
@@ -543,34 +572,51 @@ class DiscoveryJobRegistry:
                 )
             connection.commit()
 
-    def launch(self, job_id: str) -> int:
-        self.reconcile()
-        existing = self.get(job_id)
-        if not existing:
-            raise ValueError("Discovery job is not registered")
-        active = self.latest_active()
-        if active:
-            if active["job_id"] == job_id:
-                raise RuntimeError("Discovery job is already running")
-            raise RuntimeError(f"Another Discovery job is running: {active['job_id']}")
-        launch_deadline = (
-            datetime.now(timezone.utc) + timedelta(seconds=60)
-        ).isoformat().replace("+00:00", "Z")
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            concurrent = connection.execute(
-                "SELECT job_id FROM discovery_job_runtime "
-                "WHERE status IN ('launching','running') LIMIT 1"
-            ).fetchone()
-            if concurrent:
-                connection.rollback()
-                raise RuntimeError(f"Discovery job is already active: {concurrent['job_id']}")
-            connection.execute(
-                """UPDATE discovery_job_runtime SET status='launching',worker_pid=NULL,
-                   updated_at=?,lease_expires_at=? WHERE job_id=?""",
-                (utc_now(), launch_deadline, job_id),
+    def launch(self, job_id: str, *, maintenance_lock=None) -> int:
+        maintenance_lock = maintenance_lock or StorageMaintenanceLock(
+            Path(self.path).parent / "discovery-maintenance.lock"
+        )
+        try:
+            with maintenance_lock.discovery_start_guard():
+                self.reconcile()
+                existing = self.get(job_id)
+                if not existing:
+                    raise ValueError("Discovery job is not registered")
+                active = self.latest_active()
+                if active:
+                    if active["job_id"] == job_id:
+                        raise RuntimeError("Discovery job is already running")
+                    raise RuntimeError(f"Another Discovery job is running: {active['job_id']}")
+                launch_deadline = (
+                    datetime.now(timezone.utc) + timedelta(seconds=60)
+                ).isoformat().replace("+00:00", "Z")
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    concurrent = connection.execute(
+                        "SELECT job_id FROM discovery_job_runtime "
+                        "WHERE status IN ('launching','running') LIMIT 1"
+                    ).fetchone()
+                    if concurrent:
+                        connection.rollback()
+                        raise RuntimeError(
+                            f"Discovery job is already active: {concurrent['job_id']}"
+                        )
+                    connection.execute(
+                        """UPDATE discovery_job_runtime SET status='launching',worker_pid=NULL,
+                           updated_at=?,lease_expires_at=? WHERE job_id=?""",
+                        (utc_now(), launch_deadline, job_id),
+                    )
+                    connection.commit()
+        except MaintenanceLockUnavailable as error:
+            if self.get(job_id):
+                self.maintenance_blocked(job_id, reason=str(error))
+            logger.warning(
+                "DISCOVERY LAUNCH BLOCKED BY RETENTION | job_id=%s reason=%s",
+                job_id, error,
             )
-            connection.commit()
+            raise RuntimeError(
+                f"Discovery start blocked by storage maintenance: {error}"
+            ) from error
         log_dir = DEFAULT_LOG_DIR
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"discovery-{job_id}.log"

@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import sqlite3
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -32,12 +34,17 @@ from storage_gc import (
     final_only_contract_eligibility,
     production_retention_plan,
 )
+from storage_maintenance import MaintenanceLockUnavailable, StorageMaintenanceLock
 
 
-EXECUTOR_VERSION = "storage_retention_executor_v1"
-EXECUTION_PLAN_VERSION = "storage_retention_execution_plan_v1"
+EXECUTOR_VERSION = "storage_retention_executor_v2"
+EXECUTION_PLAN_VERSION = "storage_retention_execution_plan_v2"
 APPLY_CONFIRMATION = "APPLY_FINAL_ONLY"
 DEFAULT_AUDIT_NAME = "retention-executor-audit.jsonl"
+RETENTION_CYCLE_VERSION = "storage_retention_cycle_v1"
+DEFAULT_MAX_JOBS_PER_CYCLE = 1
+DEFAULT_MAX_LOGICAL_RECLAIM_PER_CYCLE = 1024 ** 3
+RETENTION_AUTOMATION_ENABLED = False
 ACTIVE_OR_RESUMABLE_STATUSES = {
     "launching", "queued", "running", "computed", "export_pending",
     "export_running", "export_complete", "notification_pending",
@@ -100,6 +107,22 @@ TABLE_SPECS = {
 
 class RetentionAbort(RuntimeError):
     """A fail-closed plan or verification failure."""
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RetentionCycleLimits:
+    version: str = RETENTION_CYCLE_VERSION
+    max_jobs_per_retention_cycle: int = DEFAULT_MAX_JOBS_PER_CYCLE
+    max_logical_reclaim_per_cycle: int = DEFAULT_MAX_LOGICAL_RECLAIM_PER_CYCLE
+
+    def __post_init__(self):
+        if self.max_jobs_per_retention_cycle <= 0:
+            raise ValueError("max_jobs_per_retention_cycle must be positive")
+        if self.max_logical_reclaim_per_cycle <= 0:
+            raise ValueError("max_logical_reclaim_per_cycle must be positive")
 
 
 def _now() -> str:
@@ -394,13 +417,43 @@ def _file_manifest(path: str | None) -> dict[str, Any] | None:
 
 
 class RetentionExecutor:
-    def __init__(self, project_root: str | Path = PROJECT_ROOT):
+    def __init__(
+        self, project_root: str | Path = PROJECT_ROOT, *, maintenance_lock=None,
+        metrics_provider=None,
+    ):
         self.root = Path(project_root).resolve()
         data = self.root / "data"
         self.incremental_path = data / "discovery_incremental.sqlite3"
         self.runtime_path = data / "discovery_jobs.sqlite3"
         self.rotation_path = data / "discovery_rotation.sqlite3"
         self.audit_path = data / DEFAULT_AUDIT_NAME
+        self.maintenance_lock = maintenance_lock or StorageMaintenanceLock(
+            data / "discovery-maintenance.lock"
+        )
+        self.metrics_provider = metrics_provider or (lambda: collect_storage_metrics(self.root))
+
+    def _audit(self, outcome: str, **details: Any) -> bool:
+        return append_storage_audit_event({
+            "event": "retention_coordination", "outcome": outcome,
+            "retention_execution": outcome == "RETENTION_APPLIED", **details,
+        }, path=self.audit_path)
+
+    def _observed_storage(self) -> dict[str, Any]:
+        metrics = self.metrics_provider()
+        watermark = metrics.get("watermark") or {}
+        if not metrics.get("reliable") or not watermark.get("reliable"):
+            raise RetentionAbort("storage_metrics_unreliable")
+        return metrics
+
+    def _assert_plan_watermark_current(self, plan: dict[str, Any]) -> dict[str, Any]:
+        metrics = self._observed_storage()
+        observed = str((metrics.get("watermark") or {}).get("state") or "UNKNOWN")
+        expected = str(plan.get("observed_watermark_state") or "UNKNOWN")
+        if observed != expected:
+            raise RetentionAbort(
+                f"watermark_changed_while_waiting:expected={expected}:actual={observed}"
+            )
+        return metrics
 
     def _active_jobs(self) -> list[dict[str, Any]]:
         with _open_readonly(self.runtime_path) as connection:
@@ -590,6 +643,7 @@ class RetentionExecutor:
     def build_plan(
         self, watermark_state: str, *, job_ids: Iterable[str] | None = None,
     ) -> dict[str, Any]:
+        storage = self._observed_storage()
         planner = production_retention_plan(watermark_state, self.root)
         requested = {str(value) for value in (job_ids or []) if value}
         candidates = [
@@ -609,6 +663,8 @@ class RetentionExecutor:
             "policy": planner.get("policy"),
             "inventory_reliable": bool(planner.get("inventory_reliable")),
             "inventory_errors": planner.get("inventory_errors") or [],
+            "observed_watermark_state": storage["watermark"]["state"],
+            "observed_watermark_version": storage["watermark"].get("version"),
             "candidates": [self._candidate_snapshot(row) for row in candidates],
             "execution": False,
         }
@@ -668,6 +724,7 @@ class RetentionExecutor:
     def apply_plan(
         self, plan: dict[str, Any], *, apply: bool = False,
         confirmed_job_ids: Iterable[str] = (), confirmation: str | None = None,
+        lock_timeout_seconds: float = 0.0,
     ) -> dict[str, Any]:
         if not apply:
             return self.preview(plan)
@@ -676,15 +733,49 @@ class RetentionExecutor:
         candidate_ids = {str(row.get("job_id")) for row in candidates}
         if confirmation != APPLY_CONFIRMATION or set(confirmed_job_ids) != candidate_ids:
             raise RetentionAbort("explicit_apply_confirmation_required_for_every_job")
-        self._assert_no_active_jobs()
-        results = []
-        for expected in candidates:
-            self._assert_no_active_jobs()
-            results.append(self._apply_one(plan, expected))
+        try:
+            with self.maintenance_lock.retention_apply_guard(
+                timeout_seconds=lock_timeout_seconds,
+            ):
+                # These checks happen while Discovery start/claim is excluded.
+                self._assert_no_active_jobs()
+                storage_before = self._assert_plan_watermark_current(plan)
+                results = []
+                for expected in candidates:
+                    self._assert_no_active_jobs()
+                    self._assert_plan_watermark_current(plan)
+                    results.append(self._apply_one(plan, expected))
+        except MaintenanceLockUnavailable as error:
+            self._audit(
+                "RETENTION_BLOCKED_MAINTENANCE_LOCK",
+                plan_sha256=plan.get("plan_sha256"), error=str(error),
+            )
+            raise RetentionAbort(str(error)) from error
+        except RetentionAbort as error:
+            message = str(error)
+            outcome = (
+                "RETENTION_BLOCKED_ACTIVE_WORKLOAD"
+                if message.startswith("active_or_resumable_discovery_present")
+                else "RETENTION_ABORT_STALE_PLAN"
+                if "stale" in message or "changed_while_waiting" in message
+                else "RETENTION_ABORT_VERIFICATION"
+            )
+            self._audit(
+                outcome, plan_sha256=plan.get("plan_sha256"), error=message,
+            )
+            raise
+        except Exception as error:
+            self._audit(
+                "RETENTION_ABORT_VERIFICATION",
+                plan_sha256=plan.get("plan_sha256"),
+                error=f"{type(error).__name__}:{error}",
+            )
+            raise
         return {
             "mode": "apply", "plan_sha256": plan["plan_sha256"],
             "results": results,
             "writes_performed": sum(row["status"] == "APPLIED" for row in results),
+            "storage_before": storage_before,
             "vacuum_operations": 0, "external_file_operations": 0,
         }
 
@@ -700,7 +791,11 @@ class RetentionExecutor:
         if str(metadata.get("retention_mode") or "full").casefold() == RETENTION_MODE_FINAL_ONLY:
             audit = metadata.get("retention_execution_audit") or {}
             if audit.get("plan_sha256") == plan["plan_sha256"]:
-                return {"job_id": job_id, "status": "NOOP_ALREADY_APPLIED", "rows_removed": {}}
+                logger.info("RETENTION_NOOP | job_id=%s", job_id)
+                return {
+                    "job_id": job_id, "status": "NOOP_ALREADY_APPLIED",
+                    "audit_outcome": "RETENTION_NOOP", "rows_removed": {},
+                }
             raise RetentionAbort(f"job_already_final_only_with_different_plan:{job_id}")
 
         current_plan = production_retention_plan(plan["watermark_state"], self.root)
@@ -849,6 +944,7 @@ class RetentionExecutor:
             connection.rollback()
             append_storage_audit_event({
                 "event": "retention_execution", "actor": "manual", "job_id": job_id,
+                "outcome": "RETENTION_ABORT_VERIFICATION",
                 "plan_sha256": plan.get("plan_sha256"), "result": "rollback",
                 "error": f"{type(error).__name__}:{error}",
                 "elapsed_seconds": time.monotonic() - started,
@@ -881,15 +977,134 @@ class RetentionExecutor:
             ),
             "vacuum_operations": 0, "external_file_operations": 0,
         }
-        append_storage_audit_event({
+        audit_persisted = append_storage_audit_event({
             "event": "retention_execution", "actor": "manual", "job_id": job_id,
+            "outcome": "RETENTION_APPLIED",
             "plan_sha256": plan["plan_sha256"], "result": "applied",
             "rows_removed": removed, "logical_bytes_removed": pre["logical_bytes_remove"],
             "elapsed_seconds": time.monotonic() - started,
             "storage_before": pre_sizes, "storage_after": post_sizes,
             "retention_execution": True,
         }, path=self.audit_path)
+        result["audit_outcome"] = "RETENTION_APPLIED"
+        result["audit_persisted"] = audit_persisted
         return result
+
+
+def run_retention_cycle(
+    *, executor: RetentionExecutor | None = None,
+    enabled: bool = RETENTION_AUTOMATION_ENABLED,
+    apply: bool = False,
+    limits: RetentionCycleLimits | None = None,
+    metrics_provider=None,
+) -> dict[str, Any]:
+    """Future bounded cycle entry point; disabled and dry-run by default.
+
+    No scheduler calls this function.  Every applied job gets a freshly
+    generated one-job plan, its own coordinated transaction, and a real
+    storage remeasurement before the next candidate is considered.
+    """
+    limits = limits or RetentionCycleLimits()
+    executor = executor or RetentionExecutor()
+    metrics_provider = metrics_provider or executor.metrics_provider
+    base = {
+        "version": RETENTION_CYCLE_VERSION,
+        "enabled": bool(enabled), "apply": bool(apply),
+        "limits": {
+            "max_jobs_per_retention_cycle": limits.max_jobs_per_retention_cycle,
+            "max_logical_reclaim_per_cycle": limits.max_logical_reclaim_per_cycle,
+        },
+        "results": [], "jobs_applied": 0, "logical_reclaim_applied": 0,
+        "automatic_execution_configured": False,
+    }
+    if not enabled:
+        return {**base, "status": "RETENTION_AUTOMATION_DISABLED"}
+
+    initial = metrics_provider()
+    watermark = initial.get("watermark") or {}
+    state = str(watermark.get("state") or "UNKNOWN")
+    if not initial.get("reliable") or not watermark.get("reliable"):
+        return {**base, "status": "RETENTION_ABORT_VERIFICATION", "reason": "storage_unknown"}
+    if state not in {"PREVENTIVE", "PRESSURE"}:
+        return {
+            **base, "status": "NO_AUTOMATIC_POLICY_FOR_WATERMARK",
+            "watermark": state,
+        }
+
+    if not apply:
+        plan = executor.build_plan(state)
+        return {
+            **base, "status": "DRY_RUN", "watermark": state,
+            "plan": plan, "preview": executor.preview(plan),
+        }
+
+    while True:
+        measured = metrics_provider()
+        current_watermark = measured.get("watermark") or {}
+        current_state = str(current_watermark.get("state") or "UNKNOWN")
+        if not measured.get("reliable") or not current_watermark.get("reliable"):
+            base["status"] = "RETENTION_ABORT_VERIFICATION"
+            base["reason"] = "storage_unknown_after_remeasure"
+            break
+        if current_state == "NORMAL":
+            base["status"] = "STORAGE_PRESSURE_RESOLVED"
+            break
+        if current_state not in {"PREVENTIVE", "PRESSURE"}:
+            base["status"] = "NO_AUTOMATIC_POLICY_FOR_WATERMARK"
+            base["watermark"] = current_state
+            break
+        if base["jobs_applied"] >= limits.max_jobs_per_retention_cycle:
+            base["status"] = "RETENTION_CYCLE_LIMIT_REACHED"
+            base["limit"] = "max_jobs_per_retention_cycle"
+            executor._audit(base["status"], limit=base["limit"])
+            break
+
+        # Regenerate the authoritative planner after every measurement/job.
+        plan = executor.build_plan(current_state)
+        candidates = plan.get("candidates") or []
+        if not candidates:
+            base["status"] = "NO_ELIGIBLE_CANDIDATES"
+            break
+        candidate = candidates[0]
+        logical = int((candidate.get("manifest") or {}).get("logical_bytes_remove") or 0)
+        if base["logical_reclaim_applied"] + logical > limits.max_logical_reclaim_per_cycle:
+            base["status"] = "RETENTION_CYCLE_LIMIT_REACHED"
+            base["limit"] = "max_logical_reclaim_per_cycle"
+            executor._audit(
+                base["status"], limit=base["limit"], job_id=candidate.get("job_id"),
+            )
+            break
+        job_id = str(candidate["job_id"])
+        one_job_plan = executor.build_plan(current_state, job_ids=[job_id])
+        try:
+            outcome = executor.apply_plan(
+                one_job_plan, apply=True, confirmation=APPLY_CONFIRMATION,
+                confirmed_job_ids=[job_id],
+            )
+        except Exception as error:
+            base["status"] = "RETENTION_ABORT_VERIFICATION"
+            base["reason"] = f"{type(error).__name__}:{error}"
+            break
+        result = (outcome.get("results") or [{}])[0]
+        base["results"].append(result)
+        if result.get("status") == "APPLIED":
+            base["jobs_applied"] += 1
+            base["logical_reclaim_applied"] += int(result.get("logical_bytes_removed") or 0)
+            if not result.get("audit_persisted", True):
+                base["status"] = "RETENTION_ABORT_VERIFICATION"
+                base["reason"] = "critical_audit_write_failed"
+                break
+        elif result.get("status") == "NOOP_ALREADY_APPLIED":
+            # A NOOP consumes neither job nor byte budget.  Stop instead of
+            # risking a planner loop around an already-applied candidate.
+            base["status"] = "RETENTION_NOOP"
+            break
+        else:
+            base["status"] = "RETENTION_ABORT_VERIFICATION"
+            base["reason"] = f"unexpected_result:{result.get('status')}"
+            break
+        base["last_storage_measurement"] = metrics_provider()
+    return base
 
 
 def _load_plan(path: Path) -> dict[str, Any]:

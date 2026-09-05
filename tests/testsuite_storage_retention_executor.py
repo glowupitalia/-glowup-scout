@@ -1,7 +1,10 @@
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -21,6 +24,7 @@ from storage_retention import (
     _incremental_manifest,
     main,
 )
+from storage_maintenance import StorageMaintenanceLock
 
 
 JOB_ID = "eligible-job"
@@ -39,6 +43,7 @@ class RetentionExecutorTests(unittest.TestCase):
         self.incremental = self.data / "discovery_incremental.sqlite3"
         self.runtime = self.data / "discovery_jobs.sqlite3"
         self.rotation = self.data / "discovery_rotation.sqlite3"
+        self.supplier = self.data / "supplier_catalog.sqlite3"
         self.export = self.data / "discovery_jobs" / f"{JOB_ID}.operational.xlsx"
         self.export.parent.mkdir()
         self.export.write_bytes(b"operational")
@@ -48,6 +53,8 @@ class RetentionExecutorTests(unittest.TestCase):
         DiscoveryJobRegistry(self.runtime).initialize()
         NotificationOutbox(self.runtime).initialize()
         DiscoveryRotationStore(self.rotation).initialize()
+        with sqlite3.connect(self.supplier) as connection:
+            connection.execute("CREATE TABLE storage_fixture(value TEXT)")
         self._populate()
         self.executor = RetentionExecutor(self.root)
         self.planner_patch = patch(
@@ -240,7 +247,11 @@ class RetentionExecutorTests(unittest.TestCase):
     def test_dry_run_is_default_and_performs_zero_writes(self):
         plan = self.plan()
         before = file_digest(self.incremental)
-        result = self.executor.apply_plan(plan)
+        # Preview never participates in maintenance exclusion and therefore
+        # cannot delay a concurrent Discovery start/claim.
+        lock = StorageMaintenanceLock(self.data / "discovery-maintenance.lock")
+        with lock.discovery_start_guard():
+            result = self.executor.apply_plan(plan)
         self.assertEqual(result["mode"], "dry-run")
         self.assertEqual(result["writes_performed"], 0)
         self.assertEqual(result["results"][0]["status"], "ELIGIBLE")
@@ -335,6 +346,8 @@ class RetentionExecutorTests(unittest.TestCase):
             connection.commit()
         with self.assertRaisesRegex(RetentionAbort, "active_or_resumable"):
             self.apply(plan)
+        audit = json.loads(self.executor.audit_path.read_text().splitlines()[-1])
+        self.assertEqual(audit["outcome"], "RETENTION_BLOCKED_ACTIVE_WORKLOAD")
 
     def test_invalid_summary_is_blocked(self):
         with sqlite3.connect(self.incremental) as connection:
@@ -413,6 +426,12 @@ class RetentionExecutorTests(unittest.TestCase):
         self.assertEqual(file_digest(self.incremental), before)
         self.assertEqual(self.store.counts(JOB_ID)["items"], 2)
         self.assertEqual(self.store.terminal_summary_status(JOB_ID)["retention_mode"], "full")
+        audit = [
+            json.loads(line) for line in self.executor.audit_path.read_text().splitlines()
+        ]
+        self.assertTrue(any(
+            row.get("outcome") == "RETENTION_ABORT_VERIFICATION" for row in audit
+        ))
 
     def test_db1e11_is_always_blocked(self):
         blocked_id = "db1e11b8d6294342b811a343ca4a4142"
@@ -474,6 +493,103 @@ class RetentionExecutorTests(unittest.TestCase):
             ]), 0)
         self.assertIn('"mode": "dry-run"', output.getvalue())
         self.assertEqual(file_digest(self.incremental), before)
+
+    def test_plan_becoming_stale_while_waiting_for_lock_aborts_after_acquisition(self):
+        plan = self.plan()
+        lock = StorageMaintenanceLock(self.data / "discovery-maintenance.lock")
+        self.executor.maintenance_lock = lock
+        outcome = {}
+
+        def apply_after_wait():
+            try:
+                self.executor.apply_plan(
+                    plan, apply=True, confirmation=APPLY_CONFIRMATION,
+                    confirmed_job_ids=[JOB_ID], lock_timeout_seconds=1,
+                )
+            except Exception as error:  # assertion captures the worker outcome
+                outcome["error"] = error
+
+        with lock.discovery_start_guard():
+            worker = threading.Thread(target=apply_after_wait)
+            worker.start()
+            time.sleep(0.05)
+            with sqlite3.connect(self.incremental) as connection:
+                connection.execute(
+                    "UPDATE discovery_amazon_cache_indexed_jobs "
+                    "SET source_updated_at='changed-while-waiting' WHERE source_job_id=?",
+                    (JOB_ID,),
+                )
+                connection.commit()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(outcome.get("error"), RetentionAbort)
+        self.assertIn("stale_or_ineligible_plan", str(outcome["error"]))
+        self.assertEqual(
+            self.store.summary(JOB_ID)["retention_mode"], "full",
+        )
+
+    def test_watermark_change_while_waiting_for_lock_is_rechecked(self):
+        plan = self.plan()
+        state = {"value": "NORMAL"}
+
+        def observed_metrics():
+            value = state["value"]
+            return {
+                "reliable": True,
+                "watermark": {"reliable": True, "state": value, "version": "v1"},
+            }
+
+        lock = StorageMaintenanceLock(self.data / "discovery-maintenance.lock")
+        self.executor.maintenance_lock = lock
+        self.executor.metrics_provider = observed_metrics
+        outcome = {}
+
+        def apply_after_wait():
+            try:
+                self.executor.apply_plan(
+                    plan, apply=True, confirmation=APPLY_CONFIRMATION,
+                    confirmed_job_ids=[JOB_ID], lock_timeout_seconds=1,
+                )
+            except Exception as error:  # assertion captures the worker outcome
+                outcome["error"] = error
+
+        with lock.discovery_start_guard():
+            worker = threading.Thread(target=apply_after_wait)
+            worker.start()
+            time.sleep(0.05)
+            state["value"] = "PRESSURE"
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(outcome.get("error"), RetentionAbort)
+        self.assertIn("watermark_changed_while_waiting", str(outcome["error"]))
+        self.assertEqual(self.store.summary(JOB_ID)["retention_mode"], "full")
+
+    def test_discovery_claim_wins_then_retention_aborts_without_apply(self):
+        plan = self.plan()
+        lock = StorageMaintenanceLock(self.data / "discovery-maintenance.lock")
+        self.executor.maintenance_lock = lock
+        registry = DiscoveryJobRegistry(self.runtime)
+        outcome = {}
+
+        def apply_after_claim():
+            try:
+                self.executor.apply_plan(
+                    plan, apply=True, confirmation=APPLY_CONFIRMATION,
+                    confirmed_job_ids=[JOB_ID], lock_timeout_seconds=1,
+                )
+            except Exception as error:
+                outcome["error"] = error
+
+        with lock.discovery_start_guard():
+            self.assertTrue(registry.claim(JOB_ID, pid=os.getpid()))
+            worker = threading.Thread(target=apply_after_claim)
+            worker.start()
+            time.sleep(0.05)
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(outcome.get("error"), RetentionAbort)
+        self.assertIn("active_or_resumable_discovery_present", str(outcome["error"]))
+        self.assertEqual(self.store.summary(JOB_ID)["retention_mode"], "full")
 
 
 if __name__ == "__main__":

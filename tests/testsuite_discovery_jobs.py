@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -10,6 +11,7 @@ from streamlit.testing.v1 import AppTest
 from discovery import DiscoveryCheckpointStore, default_filters
 from discovery_jobs import DiscoveryJobRegistry, reconcile_discovery_state
 from notifications import DEFAULT_RECIPIENT
+from storage_maintenance import MaintenanceLockUnavailable, StorageMaintenanceLock
 from supplier_catalog import SupplierCatalogStore
 
 
@@ -184,6 +186,45 @@ class DiscoveryJobRegistryTests(unittest.TestCase):
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
             with self.assertRaisesRegex(RuntimeError, "already"):
                 self.registry.launch(state["job_id"])
+
+    def test_registration_fails_closed_while_retention_is_exclusive(self):
+        state = self.state()
+        lock = StorageMaintenanceLock(self.root / "discovery-maintenance.lock")
+        with lock.retention_apply_guard():
+            with self.assertRaises(MaintenanceLockUnavailable):
+                self.registry.register_checkpoint(state, maintenance_lock=lock)
+        self.assertIsNone(self.registry.get(state["job_id"]))
+
+    def test_launch_is_retry_safe_when_retention_is_exclusive(self):
+        state = self.state()
+        lock = StorageMaintenanceLock(self.root / "discovery-maintenance.lock")
+        self.registry.register_checkpoint(state, maintenance_lock=lock)
+        with lock.retention_apply_guard():
+            with self.assertRaisesRegex(RuntimeError, "blocked by storage maintenance"):
+                self.registry.launch(state["job_id"], maintenance_lock=lock)
+        runtime = self.registry.get(state["job_id"])
+        self.assertEqual(runtime["status"], "maintenance_blocked")
+        self.assertTrue(runtime["resumable"])
+        self.assertIsNone(runtime["worker_pid"])
+
+    def test_two_simultaneous_worker_claims_have_one_winner(self):
+        state = self.state()
+        lock = StorageMaintenanceLock(self.root / "discovery-maintenance.lock")
+        self.registry.register_checkpoint(state, maintenance_lock=lock)
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def claim():
+            barrier.wait()
+            with lock.discovery_start_guard():
+                outcomes.append(self.registry.claim(state["job_id"], pid=os.getpid()))
+
+        workers = [threading.Thread(target=claim) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(2)
+        self.assertEqual(sorted(outcomes), [False, True])
 
 
 class DiscoveryProgressTests(unittest.TestCase):

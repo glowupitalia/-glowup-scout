@@ -118,6 +118,28 @@ class AdmissionTests(unittest.TestCase):
         qogita = evaluate_qogita_window_admission(metrics=metrics(44, freelist_gib=5))
         self.assertEqual(qogita["discovery_freelist_credit_bytes"], 0)
 
+    def test_discovery_freelist_offsets_only_discovery_database_growth(self):
+        without_freelist = evaluate_discovery_admission(
+            ["abw", "umma", "qudo"], metrics=metrics(50, freelist_gib=0),
+        )
+        with_freelist = evaluate_discovery_admission(
+            ["abw", "umma", "qudo"], metrics=metrics(50, freelist_gib=1.039),
+        )
+        credit = with_freelist["discovery_freelist_credit_bytes"]
+        self.assertEqual(
+            without_freelist["required_filesystem_headroom_bytes"]
+            - with_freelist["required_filesystem_headroom_bytes"],
+            credit,
+        )
+        self.assertEqual(
+            without_freelist["estimate"]["export_headroom_bytes"],
+            with_freelist["estimate"]["export_headroom_bytes"],
+        )
+        self.assertEqual(
+            without_freelist["estimate"]["wal_headroom_bytes"],
+            with_freelist["estimate"]["wal_headroom_bytes"],
+        )
+
     def test_small_and_qogita_window_admission(self):
         self.assertTrue(evaluate_discovery_admission(
             ["qogita"], "korean_beauty", metrics=metrics(30),
@@ -180,6 +202,18 @@ class RetentionPlannerTests(unittest.TestCase):
         self.assertTrue(all(
             row["classification"] != "FINAL_ONLY_ELIGIBLE" for row in plan["jobs"]
         ))
+
+    def test_already_final_only_is_never_a_cycle_candidate(self):
+        jobs = [eligible_job(number) for number in range(1, 8)]
+        jobs[0]["retention_mode"] = "final_only"
+        plan = plan_discovery_retention(jobs, "PRESSURE")
+        row = next(value for value in plan["jobs"] if value["job_id"] == "job-01")
+        self.assertEqual(row["classification"], "KEEP_BLOCKED")
+        self.assertIn("storage_mode_not_full", row["reasons"])
+        self.assertNotIn("job-01", {
+            value["job_id"] for value in plan["jobs"]
+            if value["classification"] == "FINAL_ONLY_ELIGIBLE"
+        })
 
 
 class IntegrationTests(unittest.TestCase):
@@ -275,6 +309,40 @@ class IntegrationTests(unittest.TestCase):
         registry.admission_blocked.assert_called_once()
         registry.claim.assert_not_called()
         audit.assert_called_once()
+
+    @patch("discovery_worker.append_storage_audit_event")
+    @patch("discovery_worker.evaluate_discovery_admission")
+    @patch("discovery_worker.collect_storage_metrics")
+    @patch("discovery_worker.load_env")
+    def test_worker_gate_blocks_claim_while_retention_holds_exclusive_lock(
+        self, load_env, collect, evaluate, audit,
+    ):
+        from discovery_worker import execute
+        from storage_maintenance import StorageMaintenanceLock
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = StorageMaintenanceLock(root / "maintenance.lock")
+            registry = MagicMock()
+            registry.path = root / "runtime.sqlite3"
+            registry.get.return_value = {"selected_suppliers": ["qogita"]}
+            checkpoint = MagicMock()
+            checkpoint.state_path.return_value = root / "missing-state.json"
+            checkpoint.path.return_value = root / "missing-checkpoint.json"
+            collect.return_value = metrics(50)
+            evaluate.return_value = {
+                "allowed": True, "status": "admitted", "reason": "headroom_ok",
+                "watermark": {"state": "NORMAL"},
+            }
+            with lock.retention_apply_guard():
+                result = execute(
+                    "job", registry=registry, checkpoint_store=checkpoint,
+                    maintenance_lock=lock,
+                )
+            self.assertEqual(result["status"], "maintenance_blocked")
+            registry.claim.assert_not_called()
+            registry.maintenance_blocked.assert_called_once()
+            self.assertEqual(audit.call_args.args[0]["outcome"], "DISCOVERY_BLOCKED_RETENTION")
 
     def test_weekly_block_is_not_supplier_failure_and_next_step_is_evaluated(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -38,6 +38,7 @@ from storage_gc import (
     evaluate_discovery_admission,
     production_retention_plan,
 )
+from storage_maintenance import MaintenanceLockUnavailable, StorageMaintenanceLock
 
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,7 @@ def get_access_token():
     return response.json()["access_token"]
 
 
-def execute(job_id: str, *, registry=None, checkpoint_store=None):
+def execute(job_id: str, *, registry=None, checkpoint_store=None, maintenance_lock=None):
     load_env()
     registry = registry or DiscoveryJobRegistry()
     checkpoint_store = checkpoint_store or DiscoveryCheckpointStore()
@@ -133,8 +134,33 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None):
         "decision": admission, "storage_before": storage_before,
         "retention_execution": False,
     }, path=Path(registry.path).parent / "storage-workload-metrics.jsonl")
-    if not registry.claim(job_id, pid=pid):
-        raise RuntimeError(f"Discovery job {job_id} is already owned by another worker")
+    maintenance_lock = maintenance_lock or StorageMaintenanceLock(
+        Path(registry.path).parent / "discovery-maintenance.lock"
+    )
+    try:
+        # Retention holds the exclusive counterpart from its last active-job
+        # check through COMMIT.  Keeping this shared guard until claim() commits
+        # closes the check/start TOCTOU window.
+        with maintenance_lock.discovery_start_guard():
+            if not registry.claim(job_id, pid=pid):
+                raise RuntimeError(f"Discovery job {job_id} is already owned by another worker")
+    except MaintenanceLockUnavailable as error:
+        reason = str(error)
+        registry.maintenance_blocked(job_id, reason=reason)
+        append_storage_audit_event({
+            "event": "discovery_start_coordination",
+            "outcome": "DISCOVERY_BLOCKED_RETENTION",
+            "workload_id": job_id, "reason": reason,
+            "retention_execution": False,
+        }, path=Path(registry.path).parent / "storage-workload-metrics.jsonl")
+        logger.warning(
+            "DISCOVERY START BLOCKED BY RETENTION | job_id=%s reason=%s",
+            job_id, reason,
+        )
+        return {
+            "job_id": job_id, "status": "maintenance_blocked",
+            "phase": "maintenance_blocked", "reason": reason,
+        }
     incremental_store = DiscoveryIncrementalStore()
     amazon_cache = DiscoveryAmazonCache(incremental_store)
     resource_governor = DiscoveryResourceGovernor(database_path=incremental_store.path)
