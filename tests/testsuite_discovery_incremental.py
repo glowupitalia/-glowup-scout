@@ -7,6 +7,7 @@ import tracemalloc
 import unittest
 import requests
 from pathlib import Path
+from unittest.mock import patch
 
 from discovery_incremental import (
     DiscoveryIncrementalStore,
@@ -226,6 +227,137 @@ class IncrementalStoreTests(unittest.TestCase):
         pending = self.store.pending_catalog_batch("job", 20)
         self.assertEqual([row["product_key"] for row in pending], ["product-3"])
         self.assertEqual(self.store.summary("job")["catalog_completed_count"], 2)
+
+    def test_catalog_commit_counts_only_the_current_batch(self):
+        statements = []
+        original_new_connection = self.store._new_connection
+
+        def traced_connection():
+            connection = original_new_connection()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        self.store.create_job(
+            {"job_id": "bounded", "filters": {}, "phase": "suppliers_loaded"},
+            [candidate(index) for index in range(1, 101)],
+        )
+        batch = self.store.pending_catalog_batch("bounded", 20)
+        for row in batch:
+            row["catalog_status"] = "not_found"
+        statements.clear()
+        with patch.object(
+            self.store, "_new_connection", side_effect=traced_connection,
+        ):
+            summary = self.store.commit_catalog_batch(
+                "bounded", batch, batch_number=1,
+            )
+        sql = "\n".join(statements).lower()
+        self.assertEqual(summary["catalog_completed_count"], 20)
+        self.assertEqual(summary["catalog_pending_count"], 80)
+        self.assertIn("canonical_identifier in (", sql)
+        self.assertNotIn("select count(*) from discovery_job_items", sql)
+        self.assertNotIn("select count(*) from discovery_purchase_scenarios", sql)
+
+    def test_pricing_queue_is_indexed_bounded_and_deterministic(self):
+        rows = []
+        for index in range(1, 31):
+            row = candidate(index, "resolved", 1)
+            row["amazon_listings"][0]["evaluation_status"] = "bsr_passed"
+            if index <= 25:
+                row["amazon_listings"][0]["pricing_status"] = "success"
+            rows.append(row)
+        self.store.create_job(
+            {"job_id": "pricing", "filters": {}, "phase": "bsr_filtered"}, rows,
+        )
+        expected = [f"ASIN{index:06d}0" for index in range(26, 31)]
+        self.assertEqual(self.store.pending_pricing_asins("pricing", 20), expected)
+        with self.store._connect() as connection:
+            plan = " ".join(str(value) for row in connection.execute(
+                """EXPLAIN QUERY PLAN SELECT asin FROM discovery_listings
+                   WHERE job_id=?
+                     AND json_extract(listing_json,'$.evaluation_status')='bsr_passed'
+                     AND COALESCE(json_extract(listing_json,'$.pricing_status'),'')=''
+                   GROUP BY asin ORDER BY asin LIMIT ?""",
+                ("pricing", 20),
+            ) for value in row).lower()
+        self.assertIn("idx_discovery_listings_pricing_queue", plan)
+
+    def test_pricing_commit_updates_duplicate_asin_once_and_resume_skips_it(self):
+        rows = [candidate(1, "resolved", 1), candidate(2, "resolved", 1)]
+        for row in rows:
+            row["amazon_listings"][0].update(
+                {"asin": "SHARED", "evaluation_status": "bsr_passed"}
+            )
+        self.store.create_job(
+            {"job_id": "pricing", "filters": {}, "phase": "bsr_filtered"}, rows,
+        )
+        self.assertEqual(self.store.pending_pricing_asins("pricing", 20), ["SHARED"])
+        updated = self.store.commit_pricing_results("pricing", {
+            "SHARED": {"pricing_status": "unavailable", "reference_price": None},
+        })
+        self.assertEqual(updated, 2)
+        self.assertEqual(self.store.pending_pricing_asins("pricing", 20), [])
+        self.assertEqual(self.store.commit_pricing_results("pricing", {
+            "SHARED": {"pricing_status": "success", "reference_price": 99},
+        }), 0)
+
+    def test_pricing_resume_reconciles_partially_committed_shared_asin_locally(self):
+        rows = [candidate(1, "resolved", 1), candidate(2, "resolved", 1)]
+        for row in rows:
+            row["amazon_listings"][0].update(
+                {"asin": "SHARED", "evaluation_status": "bsr_passed"}
+            )
+        rows[0]["amazon_listings"][0].update({
+            "pricing_status": "success", "reference_price": 12.34,
+            "fba_sellers": 2, "total_sellers": 3,
+        })
+        self.store.create_job(
+            {"job_id": "pricing-reconcile", "filters": {}, "phase": "bsr_filtered"},
+            rows,
+        )
+
+        self.assertEqual(
+            self.store.pending_pricing_asins("pricing-reconcile", 20), [],
+        )
+        self.assertEqual(
+            self.store.reconcile_pricing_duplicates("pricing-reconcile", 20), 1,
+        )
+        hydrated = list(self.store.iter_candidates("pricing-reconcile"))
+        shared = [row["amazon_listings"][0] for row in hydrated]
+        self.assertEqual([row["pricing_status"] for row in shared], ["success", "success"])
+        self.assertEqual([row["reference_price"] for row in shared], [12.34, 12.34])
+        self.assertEqual(
+            self.store.reconcile_pricing_duplicates("pricing-reconcile", 20), 0,
+        )
+
+    def test_fee_queue_uses_terminal_state_and_indexed_limit(self):
+        self.store.create_job(
+            {"job_id": "fees", "filters": {}, "phase": "competition_filtered"},
+            [candidate(1)],
+        )
+        observations = [
+            {"observation_id": f"observation-{index:03d}", "asin": f"A{index}"}
+            for index in range(30)
+        ]
+        for index, observation in enumerate(observations):
+            if index < 25:
+                observation["fee_status"] = "valid"
+        self.store.upsert_observations("fees", observations)
+        pending = self.store.pending_observations("fees", 3)
+        self.assertEqual(
+            [row["observation_id"] for row in pending],
+            ["observation-025", "observation-026", "observation-027"],
+        )
+        with self.store._connect() as connection:
+            plan = " ".join(str(value) for row in connection.execute(
+                """EXPLAIN QUERY PLAN SELECT observation_json
+                   FROM discovery_observations WHERE job_id=? AND CASE WHEN
+                   COALESCE(json_extract(observation_json,'$.fee_status'),'')
+                   IN ('','fee_pending','retryable_error') THEN 1 ELSE 0 END=1
+                   ORDER BY observation_id LIMIT ?""",
+                ("fees", 3),
+            ) for value in row).lower()
+        self.assertIn("idx_discovery_observations_fee_queue", plan)
 
     def test_crash_before_commit_repeats_only_inflight_batch(self):
         self.store.create_job(
@@ -611,6 +743,39 @@ class IncrementalStoreTests(unittest.TestCase):
         self.assertEqual(calls, [candidate(2)["gtin"]])
         self.assertEqual(rotation.commits[0], {candidate(1)["gtin"]: "not_found"})
         self.assertEqual(rotation.commits[1], {candidate(2)["gtin"]: "not_found"})
+
+    def test_resume_from_pricing_does_not_regress_to_catalog_filtering(self):
+        filters = {
+            "bsr_min": 1, "bsr_max": 30_000,
+            "max_fba_sellers": 15, "max_total_sellers": 25,
+            "minimum_margin": 10,
+        }
+        self.store.create_job(
+            {"job_id": "pricing-resume", "filters": filters, "phase": "bsr_filtered"},
+            [candidate(1, "not_found")],
+        )
+        phases = []
+        result = run_incremental_discovery(
+            "pricing-resume", store=self.store, metadata_store=self.checkpoints,
+            catalog_batch=lambda *_: self.fail("Catalog must not be called"),
+            pricing_batch=lambda *_: self.fail("Pricing must not be called"),
+            fees_batch=lambda *_: self.fail("Fees must not be called"),
+            token_provider=object(), sleep_func=lambda *_: None,
+            progress=lambda phase, _state: phases.append(phase),
+            resource_governor=DiscoveryResourceGovernor(
+                policy=ResourcePolicy(
+                    rss_soft_bytes=10**15, rss_hard_bytes=10**16,
+                    available_soft_bytes=0, available_hard_bytes=0,
+                    disk_free_hard_bytes=0, wal_soft_bytes=10**15,
+                    wal_hard_bytes=10**16,
+                    write_rate_soft_bytes_per_second=10**15,
+                    write_rate_hard_bytes_per_second=10**16,
+                ),
+                database_path=self.store.path, sleep_func=lambda *_: None,
+            ),
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertNotIn("catalog_filtering", phases)
 
     def test_catalog_incomplete_stops_and_is_retried_once_on_resume(self):
         filters = {

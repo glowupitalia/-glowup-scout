@@ -2012,6 +2012,7 @@ def run_discovery(
                         row.get("catalog_status")
                         for row in state.get("candidates") or []
                     },
+                    include_summary=True,
                 ))
             pending = [row for row in state["candidates"] if not row.get("catalog_status")]
             catalog_total = len(state["candidates"])
@@ -2040,6 +2041,7 @@ def run_discovery(
                             row.get("catalog_status")
                             for row in batch
                         },
+                        include_summary=True,
                     ))
                     checkpoint_store.save(state)
                 if progress:
@@ -2065,6 +2067,7 @@ def run_discovery(
                         row.get("catalog_status")
                         for row in state.get("candidates") or []
                     },
+                    include_summary=True,
                 ))
             _checkpoint(checkpoint_store, state, "catalog_complete", progress=progress)
 

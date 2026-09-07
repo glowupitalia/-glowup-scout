@@ -156,6 +156,20 @@ CREATE INDEX IF NOT EXISTS idx_discovery_items_catalog_pending
 ON discovery_job_items(job_id, catalog_status, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_discovery_listings_asin
 ON discovery_listings(job_id, asin);
+CREATE INDEX IF NOT EXISTS idx_discovery_listings_pricing_queue
+ON discovery_listings(
+    job_id,
+    json_extract(listing_json,'$.evaluation_status'),
+    COALESCE(json_extract(listing_json,'$.pricing_status'),''),
+    asin
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_observations_fee_queue
+ON discovery_observations(
+    job_id,
+    CASE WHEN COALESCE(json_extract(observation_json,'$.fee_status'),'')
+      IN ('','fee_pending','retryable_error') THEN 1 ELSE 0 END,
+    observation_id
+);
 CREATE INDEX IF NOT EXISTS idx_discovery_scenarios_supplier
 ON discovery_purchase_scenarios(job_id,supplier,canonical_identifier);
 CREATE INDEX IF NOT EXISTS idx_discovery_taxonomy_node_identifier
@@ -773,6 +787,16 @@ class DiscoveryIncrementalStore:
             if owns:
                 connection.close()
 
+    def job_phase(self, job_id: str) -> str:
+        """Read the phase without rebuilding the full persisted summary."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT phase FROM discovery_incremental_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+        if not row:
+            raise KeyError(job_id)
+        return str(row["phase"])
+
     def _terminal_summary_payload(
         self, job_id: str, *, connection, state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -1230,6 +1254,27 @@ class DiscoveryIncrementalStore:
         rows = list(candidates)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                """SELECT status,selected_count,catalog_completed_count
+                   FROM discovery_incremental_jobs WHERE job_id=?""", (job_id,),
+            ).fetchone()
+            if not job:
+                raise KeyError(job_id)
+            identifiers = [
+                str(candidate.get("canonical_ean") or candidate.get("gtin") or "")
+                for candidate in rows
+            ]
+            placeholders = ",".join("?" for _ in identifiers)
+            prior_statuses = {
+                str(row["canonical_identifier"]): row["catalog_status"]
+                for row in connection.execute(
+                    f"""SELECT canonical_identifier,catalog_status
+                          FROM discovery_job_items
+                         WHERE job_id=? AND canonical_identifier IN ({placeholders})""",
+                    (job_id, *identifiers),
+                )
+            } if identifiers else {}
+            completed_delta = 0
             for candidate in rows:
                 identifier = str(
                     candidate.get("canonical_ean") or candidate.get("gtin") or ""
@@ -1237,6 +1282,11 @@ class DiscoveryIncrementalStore:
                 status = str(candidate.get("catalog_status") or "")
                 if not status:
                     raise ValueError(f"Catalog result missing for {identifier}")
+                if identifier not in prior_statuses:
+                    raise ValueError(f"Catalog selection missing for {identifier}")
+                was_terminal = str(prior_statuses[identifier] or "") in TERMINAL_CATALOG_STATUSES
+                is_terminal = status in TERMINAL_CATALOG_STATUSES
+                completed_delta += int(is_terminal) - int(was_terminal)
                 connection.execute(
                     """INSERT INTO discovery_catalog_results
                        (job_id,canonical_identifier,catalog_status,diagnostics_json,updated_at)
@@ -1271,25 +1321,29 @@ class DiscoveryIncrementalStore:
                     (_dump(product), status, observed, job_id, identifier),
                 )
             self._replace_classification_projection_batch(connection, job_id, rows)
-            completed = connection.execute(
-                """SELECT COUNT(*) FROM discovery_job_items
-                   WHERE job_id=? AND catalog_status IN ('resolved','ambiguous','not_found','invalid_identifier')""",
-                (job_id,),
-            ).fetchone()[0]
-            total = connection.execute(
-                "SELECT COUNT(*) FROM discovery_job_items WHERE job_id=?", (job_id,)
-            ).fetchone()[0]
+            completed = int(job["catalog_completed_count"]) + completed_delta
+            total = int(job["selected_count"])
+            phase = "catalog_complete" if completed == total else "suppliers_loaded"
             connection.execute(
                 """UPDATE discovery_incremental_jobs SET catalog_completed_count=?,
                    last_completed_batch=?,phase=?,updated_at=? WHERE job_id=?""",
                 (
                     completed, int(batch_number),
-                    "catalog_complete" if completed == total else "suppliers_loaded",
+                    phase,
                     observed, job_id,
                 ),
             )
             connection.commit()
-        return self.summary(job_id)
+        return {
+            "job_id": job_id,
+            "status": str(job["status"]),
+            "phase": phase,
+            "selected_count": total,
+            "catalog_completed_count": completed,
+            "catalog_pending_count": max(0, total - completed),
+            "last_completed_batch": int(batch_number),
+            "updated_at": observed,
+        }
 
     def update_candidates(
         self, job_id: str, candidates: Iterable[dict[str, Any]], *,
@@ -1477,17 +1531,121 @@ class DiscoveryIncrementalStore:
     def pending_observations(self, job_id: str, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT observation_json FROM discovery_observations WHERE job_id=?",
-                (job_id,),
+                """SELECT observation_json FROM discovery_observations
+                   WHERE job_id=? AND CASE WHEN COALESCE(
+                     json_extract(observation_json,'$.fee_status'),'')
+                     IN ('','fee_pending','retryable_error') THEN 1 ELSE 0 END=1
+                   ORDER BY observation_id LIMIT ?""",
+                (job_id, int(limit)),
             ).fetchall()
-        pending = []
-        for row in rows:
-            value = json.loads(row[0])
-            if value.get("fee_status") in {None, "", "fee_pending", "retryable_error"}:
-                pending.append(value)
-                if len(pending) >= limit:
-                    break
-        return pending
+        return [json.loads(row[0]) for row in rows]
+
+    def pending_pricing_asins(self, job_id: str, limit: int = 20) -> list[str]:
+        """Return the next deterministic unique pending ASIN batch via its index."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT asin FROM discovery_listings
+                   WHERE job_id=?
+                     AND json_extract(listing_json,'$.evaluation_status')='bsr_passed'
+                     AND COALESCE(json_extract(listing_json,'$.pricing_status'),'')=''
+                     AND NOT EXISTS (
+                       SELECT 1 FROM discovery_listings completed
+                        WHERE completed.job_id=discovery_listings.job_id
+                          AND completed.asin=discovery_listings.asin
+                          AND COALESCE(json_extract(
+                            completed.listing_json,'$.pricing_status'),'')<>''
+                     )
+                   GROUP BY asin ORDER BY asin LIMIT ?""",
+                (job_id, int(limit)),
+            ).fetchall()
+        return [str(row[0]) for row in rows if row[0]]
+
+    def reconcile_pricing_duplicates(self, job_id: str, limit: int = 20) -> int:
+        """Copy an already committed ASIN result to pending duplicate listings."""
+        pricing_fields = (
+            "pricing_status", "fba_sellers", "total_sellers", "seller_count_source",
+            "reference_price", "price_source", "min_fba_price", "min_fbm_price",
+        )
+        observed = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """SELECT pending.canonical_identifier,pending.asin,
+                          pending.listing_json,
+                          (SELECT completed.listing_json
+                             FROM discovery_listings completed
+                            WHERE completed.job_id=pending.job_id
+                              AND completed.asin=pending.asin
+                              AND COALESCE(json_extract(
+                                completed.listing_json,'$.pricing_status'),'')<>''
+                            ORDER BY completed.canonical_identifier LIMIT 1) source_json
+                     FROM discovery_listings pending
+                    WHERE pending.job_id=?
+                      AND json_extract(
+                        pending.listing_json,'$.evaluation_status')='bsr_passed'
+                      AND COALESCE(json_extract(
+                        pending.listing_json,'$.pricing_status'),'')=''
+                      AND EXISTS (
+                        SELECT 1 FROM discovery_listings completed
+                         WHERE completed.job_id=pending.job_id
+                           AND completed.asin=pending.asin
+                           AND COALESCE(json_extract(
+                             completed.listing_json,'$.pricing_status'),'')<>''
+                      )
+                    ORDER BY pending.asin,pending.canonical_identifier LIMIT ?""",
+                (job_id, int(limit)),
+            ).fetchall()
+            for row in rows:
+                pending = json.loads(row["listing_json"])
+                source = json.loads(row["source_json"])
+                for field in pricing_fields:
+                    if field in source:
+                        pending[field] = source[field]
+                connection.execute(
+                    """UPDATE discovery_listings SET listing_json=?,updated_at=?
+                        WHERE job_id=? AND canonical_identifier=? AND asin=?
+                          AND COALESCE(json_extract(
+                            listing_json,'$.pricing_status'),'')=''""",
+                    (
+                        _dump(pending), observed, job_id,
+                        str(row["canonical_identifier"]), str(row["asin"]),
+                    ),
+                )
+            connection.commit()
+        return len(rows)
+
+    def commit_pricing_results(
+        self, job_id: str, updates_by_asin: dict[str, dict[str, Any]],
+    ) -> int:
+        """Persist one Pricing response for every pending occurrence of its ASIN."""
+        asins = sorted(str(value) for value in updates_by_asin if value)
+        if not asins:
+            return 0
+        placeholders = ",".join("?" for _ in asins)
+        observed = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                f"""SELECT canonical_identifier,asin,listing_json
+                       FROM discovery_listings
+                      WHERE job_id=? AND asin IN ({placeholders})
+                        AND json_extract(listing_json,'$.evaluation_status')='bsr_passed'
+                        AND COALESCE(json_extract(listing_json,'$.pricing_status'),'')=''""",
+                (job_id, *asins),
+            ).fetchall()
+            for row in rows:
+                listing = json.loads(row["listing_json"])
+                listing.update(updates_by_asin[str(row["asin"])])
+                connection.execute(
+                    """UPDATE discovery_listings SET listing_json=?,updated_at=?
+                       WHERE job_id=? AND canonical_identifier=? AND asin=?""",
+                    (
+                        _dump(listing), observed, job_id,
+                        str(row["canonical_identifier"]), str(row["asin"]),
+                    ),
+                )
+            connection.commit()
+        return len(rows)
 
     def observations_for_candidate(self, job_id: str, candidate: dict[str, Any]) -> dict[str, dict[str, Any]]:
         ids = {

@@ -46,6 +46,7 @@ def main(argv=None):
     )
     rotation = DiscoveryRotationStore().commit_catalog_results(
         metadata["job_id"], store.definitive_catalog_statuses(metadata["job_id"]),
+        include_summary=True,
     )
     DiscoveryJobRegistry().update_recovery_progress(
         metadata["job_id"], phase="catalog",

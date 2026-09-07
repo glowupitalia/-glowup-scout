@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS discovery_rotation_global_history (
     discovery_count INTEGER NOT NULL DEFAULT 0,
     last_job_id TEXT
 );
+CREATE TABLE IF NOT EXISTS discovery_rotation_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_discovery_rotation_remaining
 ON discovery_rotation_items(scope_key,active,last_analyzed_cycle,priority_new,last_discovery_at);
 CREATE INDEX IF NOT EXISTS idx_discovery_rotation_job
@@ -129,22 +134,34 @@ class DiscoveryRotationStore:
     def initialize(self):
         with self._connect() as connection:
             connection.executescript(SCHEMA)
-            # Safe, idempotent migration from the original scope-local history.
-            # Exact canonical identifiers are aggregated without changing cycles,
-            # selections, checkpoints, or prior scope membership.
-            connection.execute(
-                """INSERT INTO discovery_rotation_global_history
-                     (canonical_identifier,first_discovery_at,last_discovery_at,
-                      discovery_count,last_job_id)
-                   SELECT canonical_identifier,
-                          MIN(COALESCE(last_discovery_at,first_seen_at)),
-                          MAX(COALESCE(last_discovery_at,first_seen_at)),
-                          SUM(discovery_count),MAX(last_job_id)
-                     FROM discovery_rotation_items
-                    WHERE discovery_count>0
-                    GROUP BY canonical_identifier
-                   ON CONFLICT(canonical_identifier) DO NOTHING"""
-            )
+            migration = "global_history_from_scope_items_v1"
+            migrated = connection.execute(
+                "SELECT 1 FROM discovery_rotation_metadata WHERE key=?", (migration,)
+            ).fetchone()
+            if not migrated:
+                # Safe, idempotent migration from the original scope-local history.
+                # Run it once: repeating this aggregate for every 20-item Catalog
+                # commit makes otherwise bounded commits scale with the universe.
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """INSERT INTO discovery_rotation_global_history
+                         (canonical_identifier,first_discovery_at,last_discovery_at,
+                          discovery_count,last_job_id)
+                       SELECT canonical_identifier,
+                              MIN(COALESCE(last_discovery_at,first_seen_at)),
+                              MAX(COALESCE(last_discovery_at,first_seen_at)),
+                              SUM(discovery_count),MAX(last_job_id)
+                         FROM discovery_rotation_items
+                        WHERE discovery_count>0
+                        GROUP BY canonical_identifier
+                       ON CONFLICT(canonical_identifier) DO NOTHING"""
+                )
+                connection.execute(
+                    """INSERT OR IGNORE INTO discovery_rotation_metadata
+                       (key,value,updated_at) VALUES (?,?,?)""",
+                    (migration, "completed", _now()),
+                )
+                connection.commit()
 
     def sync_universe(
         self, candidates: Iterable[dict[str, Any]], selected_suppliers: Iterable[str],
@@ -596,21 +613,38 @@ class DiscoveryRotationStore:
 
     def commit_catalog_results(
         self, job_id: str, statuses: dict[str, Any], *, now: str | None = None,
+        include_summary: bool = False,
     ) -> dict[str, Any]:
-        """Consume only identifiers with a definitive Catalog Items result."""
+        """Consume definitive Catalog results without scanning the job selection.
+
+        Incremental workers do not need rotation-wide counters after each batch,
+        so the default path is proportional to the supplied identifiers. Legacy
+        checkpoint callers can request the indexed aggregate summary explicitly.
+        """
         self.initialize()
         observed = now or _now()
+        definitive = {
+            str(identifier): str(status)
+            for identifier, status in statuses.items()
+            if _definitive_catalog_status(status)
+        }
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            selections = connection.execute(
-                "SELECT * FROM discovery_rotation_selections WHERE job_id=?",
-                (job_id,),
-            ).fetchall()
+            selections = []
+            identifiers = list(definitive)
+            for offset in range(0, len(identifiers), 500):
+                chunk = identifiers[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                selections.extend(connection.execute(
+                    f"""SELECT job_id,scope_key,cycle_id,canonical_identifier,status
+                          FROM discovery_rotation_selections
+                         WHERE job_id=? AND status<>'analyzed'
+                           AND canonical_identifier IN ({placeholders})""",
+                    (job_id, *chunk),
+                ).fetchall())
             for row in selections:
                 identifier = row["canonical_identifier"]
-                status = statuses.get(identifier)
-                if not _definitive_catalog_status(status):
-                    continue
+                status = definitive[identifier]
                 connection.execute(
                     """UPDATE discovery_rotation_selections
                        SET status='analyzed',catalog_status=?,analyzed_at=?
@@ -640,7 +674,13 @@ class DiscoveryRotationStore:
                              last_job_id=excluded.last_job_id""",
                         (identifier, observed, observed, 1, job_id),
                     )
-            first = selections[0] if selections else None
+            if not include_summary:
+                connection.commit()
+                return {}
+            first = selections[0] if selections else connection.execute(
+                """SELECT scope_key,cycle_id FROM discovery_rotation_selections
+                   WHERE job_id=? LIMIT 1""", (job_id,),
+            ).fetchone()
             if not first:
                 connection.commit()
                 return {}

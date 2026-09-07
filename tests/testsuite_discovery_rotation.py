@@ -45,7 +45,8 @@ class DiscoveryRotationTests(unittest.TestCase):
 
     def commit(self, job, rows, status="not_found"):
         return self.store.commit_catalog_results(
-            job, {row["canonical_ean"]: status for row in rows}
+            job, {row["canonical_ean"]: status for row in rows},
+            include_summary=True,
         )
 
     def test_two_bounded_runs_have_zero_overlap(self):
@@ -240,13 +241,100 @@ class DiscoveryRotationTests(unittest.TestCase):
 
     def test_repeated_commit_is_idempotent_for_global_history(self):
         selected, _ = self.store.select("job", self.rows, ["abw"], 1)
-        self.commit("job", selected)
-        self.commit("job", selected)
+        self.store.commit_catalog_results(
+            "job", {selected[0]["canonical_ean"]: "not_found"},
+            now="2026-09-07T08:00:00Z",
+        )
+        self.store.commit_catalog_results(
+            "job", {selected[0]["canonical_ean"]: "not_found"},
+            now="2026-09-07T09:00:00Z",
+        )
         with self.store._connect() as connection:
             count = connection.execute(
                 "SELECT discovery_count FROM discovery_rotation_global_history"
             ).fetchone()[0]
+            analyzed_at = connection.execute(
+                "SELECT analyzed_at FROM discovery_rotation_selections"
+            ).fetchone()[0]
         self.assertEqual(count, 1)
+        self.assertEqual(analyzed_at, "2026-09-07T08:00:00Z")
+
+    def test_incremental_commit_reads_only_the_supplied_batch(self):
+        class TracedStore(DiscoveryRotationStore):
+            def __init__(self, path):
+                super().__init__(path)
+                self.statements = []
+
+            def _connect(self):
+                connection = super()._connect()
+                connection.set_trace_callback(self.statements.append)
+                return connection
+
+        traced = TracedStore(self.path)
+        rows = [candidate(index) for index in range(1000)]
+        selected, _ = traced.select("bounded", rows, ["abw"], None)
+        traced.statements.clear()
+        result = traced.commit_catalog_results(
+            "bounded",
+            {row["canonical_ean"]: "not_found" for row in selected[:20]},
+        )
+        statements = "\n".join(traced.statements).lower()
+        self.assertEqual(result, {})
+        self.assertIn("canonical_identifier in (", statements)
+        self.assertNotIn(
+            "select * from discovery_rotation_selections where job_id=", statements,
+        )
+        self.assertNotIn("select count(", statements)
+        with traced._connect() as connection:
+            counts = dict(connection.execute(
+                """SELECT status,COUNT(*) FROM discovery_rotation_selections
+                   WHERE job_id='bounded' GROUP BY status"""
+            ).fetchall())
+        self.assertEqual(counts, {"analyzed": 20, "selected": 980})
+
+    def test_summary_is_explicit_and_matches_authoritative_status(self):
+        selected, _ = self.store.select("job", self.rows, ["abw"], 4)
+        result = self.store.commit_catalog_results(
+            "job",
+            {row["canonical_ean"]: "resolved" for row in selected[:3]},
+            include_summary=True,
+        )
+        authoritative = self.store.status(["abw"])
+        self.assertEqual(result["rotation_analyzed_this_run"], 3)
+        self.assertEqual(
+            result["rotation_analyzed_count"],
+            authoritative["rotation_analyzed_count"],
+        )
+        self.assertEqual(
+            result["rotation_remaining_after_run"],
+            authoritative["rotation_remaining_count"],
+        )
+
+    def test_global_history_migration_is_not_repeated_per_commit(self):
+        class TracedStore(DiscoveryRotationStore):
+            def __init__(self, path):
+                super().__init__(path)
+                self.statements = []
+
+            def _connect(self):
+                connection = super()._connect()
+                connection.set_trace_callback(self.statements.append)
+                return connection
+
+        traced = TracedStore(self.path)
+        selected, _ = traced.select("job", self.rows, ["abw"], 2)
+        traced.statements.clear()
+        traced.commit_catalog_results(
+            "job", {selected[0]["canonical_ean"]: "not_found"},
+        )
+        traced.commit_catalog_results(
+            "job", {selected[1]["canonical_ean"]: "not_found"},
+        )
+        statements = "\n".join(traced.statements).lower()
+        self.assertNotIn(
+            "from discovery_rotation_items\n                        where discovery_count>0",
+            statements,
+        )
 
     def test_all_means_all_remaining(self):
         first, _ = self.store.select("job-1", self.rows, ["abw"], 3)

@@ -94,6 +94,21 @@ def process_alive(pid: int | None) -> bool:
         return False
     except PermissionError:
         return True
+    # kill(pid, 0) also succeeds for an unreaped zombie. Such a process cannot
+    # own work or renew a lease, and treating it as live permanently blocks the
+    # normal resume path. On POSIX, confirm the state without mutating it.
+    if os.name == "posix":
+        try:
+            status = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                check=False, capture_output=True, text=True, timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True
+        if status.returncode != 0:
+            return True
+        if str(status.stdout or "").strip().upper().startswith("Z"):
+            return False
     return True
 
 

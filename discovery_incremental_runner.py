@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -29,6 +30,9 @@ from discovery_taxonomy import (
 )
 
 
+logger = logging.getLogger("discovery_incremental")
+
+
 def _valid_price(value: Any) -> bool:
     try:
         return Decimal(str(value)) > 0
@@ -40,8 +44,9 @@ def _checkpoint(
     store: DiscoveryIncrementalStore, metadata_store: LightweightCheckpointStore,
     job_id: str, *, progress_phase: str, progress_current: int, progress_total: int,
     extra: dict[str, Any] | None = None,
+    base_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    state = store.summary(job_id)
+    state = dict(base_state) if base_state is not None else store.summary(job_id)
     state.update({
         "progress_phase": progress_phase,
         "progress_current": int(progress_current),
@@ -89,16 +94,22 @@ def run_incremental_discovery(
             break
         governor.before_next_batch()
         identifiers = list(dict.fromkeys(row["gtin"] for row in batch))
+        http_started = time.perf_counter()
         mapping = _call_catalog_batch(catalog_batch, identifiers, job_id, batch)
+        http_seconds = time.perf_counter() - http_started
         for row in batch:
             _ensure_product_listings(
                 row, mapping.get(row["gtin"], {"status": "not_found"})
             )
         batch_number += 1
+        catalog_commit_started = time.perf_counter()
         summary = store.commit_catalog_batch(job_id, batch, batch_number=batch_number)
+        catalog_commit_seconds = time.perf_counter() - catalog_commit_started
         if batch_number % 50 == 0:
             store.passive_wal_checkpoint()
+        rotation_commit_seconds = 0.0
         if rotation_store is not None and state.get("rotation_scope"):
+            rotation_commit_started = time.perf_counter()
             rotation_store.commit_catalog_results(
                 job_id,
                 {
@@ -106,9 +117,20 @@ def run_incremental_discovery(
                     for row in batch
                 },
             )
+            rotation_commit_seconds = time.perf_counter() - rotation_commit_started
+        checkpoint_started = time.perf_counter()
         state = _checkpoint(
             store, metadata_store, job_id, progress_phase="catalog",
             progress_current=summary["catalog_completed_count"], progress_total=selected,
+            base_state={**state, **summary},
+        )
+        checkpoint_seconds = time.perf_counter() - checkpoint_started
+        logger.info(
+            "DISCOVERY CATALOG BATCH | job_id=%s batch=%s items=%s "
+            "http_seconds=%.3f catalog_commit_seconds=%.3f "
+            "rotation_commit_seconds=%.3f checkpoint_seconds=%.3f",
+            job_id, batch_number, len(batch), http_seconds,
+            catalog_commit_seconds, rotation_commit_seconds, checkpoint_seconds,
         )
         if progress:
             progress("catalog", state)
@@ -119,19 +141,23 @@ def run_incremental_discovery(
                 progress_current=summary["catalog_completed_count"],
                 progress_total=selected,
                 extra={"status": "waiting_retry", "catalog_retry_pending": True},
+                base_state={**state, **summary},
             )
         if catalog_batch_interval:
             sleep_func(catalog_batch_interval)
 
-    store.set_phase(job_id, "catalog_complete")
-    _checkpoint(
-        store, metadata_store, job_id, progress_phase="catalog",
-        progress_current=selected, progress_total=selected,
-    )
+    # A resume from Pricing/Fees/Economics has no Catalog work pending.  Do not
+    # regress its persisted phase merely because the Catalog queue is empty.
+    if store.job_phase(job_id) in {"suppliers_loaded", "catalog_complete"}:
+        store.set_phase(job_id, "catalog_complete")
+        _checkpoint(
+            store, metadata_store, job_id, progress_phase="catalog",
+            progress_current=selected, progress_total=selected,
+        )
 
     # Compatibility is already part of the Catalog result. Apply Beauty/BSR
     # record-by-record so the phase remains restart-safe and memory-bounded.
-    if store.summary(job_id)["phase"] == "catalog_complete":
+    if store.job_phase(job_id) == "catalog_complete":
         processed = 0
         category_filter = normalize_qogita_category_filter(state)
         category_mode = category_filter["qogita_category_filter_mode"]
@@ -219,7 +245,7 @@ def run_incremental_discovery(
 
     pricing_targets: set[str] = set()
     pricing_completed: set[str] = set()
-    if store.summary(job_id)["phase"] == "bsr_filtered":
+    if store.job_phase(job_id) == "bsr_filtered":
         pricing_targets, pricing_completed = store.pricing_progress_asins(job_id)
         if progress:
             progress("pricing", {
@@ -228,28 +254,18 @@ def run_incremental_discovery(
                 "progress_total": len(pricing_targets),
             })
 
+    # A shared ASIN may occur on multiple candidates.  If an older worker
+    # committed one occurrence, hydrate its pending twins locally once at
+    # phase entry rather than issuing the same Amazon request again on resume.
+    while store.job_phase(job_id) == "bsr_filtered":
+        if not store.reconcile_pricing_duplicates(job_id, 250):
+            break
+
     # Collect at most twenty unique pending ASINs for each Product Pricing call.
-    while store.summary(job_id)["phase"] == "bsr_filtered":
-        candidates: list[dict[str, Any]] = []
-        asins: list[str] = []
-        seen: set[str] = set()
-        for candidate in store.iter_candidates(job_id):
-            pending = [
-                listing for listing in candidate.get("amazon_listings") or []
-                if listing.get("evaluation_status") == "bsr_passed"
-                and not listing.get("pricing_status")
-            ]
-            if pending:
-                candidates.append(candidate)
-            for listing in pending:
-                asin = listing["asin"]
-                if asin not in seen:
-                    seen.add(asin)
-                    asins.append(asin)
-                if len(asins) == 20:
-                    break
-            if len(asins) == 20:
-                break
+    while store.job_phase(job_id) == "bsr_filtered":
+        lookup_started = time.perf_counter()
+        asins = store.pending_pricing_asins(job_id, 20)
+        lookup_seconds = time.perf_counter() - lookup_started
         if not asins:
             store.set_phase(job_id, "pricing_complete")
             _checkpoint(
@@ -258,23 +274,25 @@ def run_incremental_discovery(
             )
             break
         governor.before_next_batch()
+        http_started = time.perf_counter()
         mapping = pricing_batch(asins, job_id)
-        for candidate in candidates:
-            for listing in candidate.get("amazon_listings") or []:
-                if listing.get("asin") not in seen or listing.get("pricing_status"):
-                    continue
-                pricing = mapping.get(listing["asin"], {"status": "missing"})
-                listing.update({
-                    "pricing_status": pricing.get("status"),
-                    "fba_sellers": pricing.get("Venditori FBA"),
-                    "total_sellers": pricing.get("Venditori totali"),
-                    "seller_count_source": pricing.get("Seller count source"),
-                    "reference_price": pricing.get("reference_price"),
-                    "price_source": pricing.get("price_source"),
-                    "min_fba_price": pricing.get("Prezzo minimo FBA Amount"),
-                    "min_fbm_price": pricing.get("Prezzo minimo FBM Amount"),
-                })
-            store.update_candidates(job_id, [candidate])
+        http_seconds = time.perf_counter() - http_started
+        updates = {}
+        for asin in asins:
+            pricing = mapping.get(asin, {"status": "missing"})
+            updates[asin] = {
+                "pricing_status": pricing.get("status"),
+                "fba_sellers": pricing.get("Venditori FBA"),
+                "total_sellers": pricing.get("Venditori totali"),
+                "seller_count_source": pricing.get("Seller count source"),
+                "reference_price": pricing.get("reference_price"),
+                "price_source": pricing.get("price_source"),
+                "min_fba_price": pricing.get("Prezzo minimo FBA Amount"),
+                "min_fbm_price": pricing.get("Prezzo minimo FBM Amount"),
+            }
+        commit_started = time.perf_counter()
+        updated_listings = store.commit_pricing_results(job_id, updates)
+        commit_seconds = time.perf_counter() - commit_started
         pricing_completed.update(asins)
         if progress:
             progress("pricing", {
@@ -282,10 +300,17 @@ def run_incremental_discovery(
                 "progress_current": min(len(pricing_completed), len(pricing_targets)),
                 "progress_total": len(pricing_targets),
             })
+        logger.info(
+            "DISCOVERY PRICING BATCH | job_id=%s items=%s listings=%s "
+            "lookup_seconds=%.3f http_seconds=%.3f commit_seconds=%.3f",
+            job_id, len(asins), updated_listings, lookup_seconds,
+            http_seconds, commit_seconds,
+        )
         if pricing_batch_interval:
             sleep_func(pricing_batch_interval)
 
-    if store.summary(job_id)["phase"] == "pricing_complete":
+    if store.job_phase(job_id) == "pricing_complete":
+        processed = 0
         transformed = []
         observations_batch = []
         for candidate in store.iter_candidates(job_id):
@@ -330,6 +355,7 @@ def run_incremental_discovery(
                         observation["fee_cache_reused"] = True
             observations_batch.extend(new_observations)
             transformed.append(candidate)
+            processed += 1
             if len(transformed) == 250:
                 store.upsert_observations(job_id, observations_batch)
                 store.update_candidates(job_id, transformed)
@@ -357,13 +383,13 @@ def run_incremental_discovery(
         )
 
     fee_completed, fee_total = store.fee_progress_counts(job_id)
-    if store.summary(job_id)["phase"] == "competition_filtered" and progress:
+    if store.job_phase(job_id) == "competition_filtered" and progress:
         progress("fees", {
             "progress_phase": "fees",
             "progress_current": fee_completed,
             "progress_total": fee_total,
         })
-    while store.summary(job_id)["phase"] == "competition_filtered":
+    while store.job_phase(job_id) == "competition_filtered":
         pending = store.pending_observations(job_id, 20)
         if not pending:
             store.set_phase(job_id, "fees_complete")
@@ -411,7 +437,7 @@ def run_incremental_discovery(
         if fee_batch_interval:
             sleep_func(fee_batch_interval)
 
-    if store.summary(job_id)["phase"] == "fees_complete":
+    if store.job_phase(job_id) == "fees_complete":
         final_products = 0
         economics_processed = 0
         transformed = []

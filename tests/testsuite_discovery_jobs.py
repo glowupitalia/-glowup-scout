@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from streamlit.testing.v1 import AppTest
 
 from discovery import DiscoveryCheckpointStore, default_filters
-from discovery_jobs import DiscoveryJobRegistry, reconcile_discovery_state
+from discovery_jobs import DiscoveryJobRegistry, process_alive, reconcile_discovery_state
 from notifications import DEFAULT_RECIPIENT
 from storage_maintenance import MaintenanceLockUnavailable, StorageMaintenanceLock
 from supplier_catalog import SupplierCatalogStore
@@ -39,6 +39,19 @@ class DiscoveryJobRegistryTests(unittest.TestCase):
         })
         self.checkpoints.save(state)
         return state
+
+    @patch("discovery_jobs.subprocess.run")
+    @patch("discovery_jobs.os.kill")
+    def test_zombie_worker_is_not_considered_alive(self, kill, run):
+        run.return_value = Mock(returncode=0, stdout="Z    ")
+        self.assertFalse(process_alive(12345))
+        kill.assert_called_once_with(12345, 0)
+
+    @patch("discovery_jobs.subprocess.run", side_effect=OSError("ps unavailable"))
+    @patch("discovery_jobs.os.kill")
+    def test_indeterminate_process_state_fails_closed(self, kill, _run):
+        self.assertTrue(process_alive(12345))
+        kill.assert_called_once_with(12345, 0)
 
     def test_browser_session_recreation_detects_running_job(self):
         state = self.state()
