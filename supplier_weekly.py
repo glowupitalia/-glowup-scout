@@ -514,19 +514,21 @@ class IncrementalWeeklyHandler:
         enumeration = self.enumerate_catalog(source=source, policy=policy)
         products = list(enumeration.get("products") or [])
         previous = self.previous_run_id()
+        previous_reference = enumeration.get("previous_reference_run_id") or previous
         generation_run_id = f"{run_id}-{self.supplier}"
         # The first incremental run imports the already-active, validated
         # baseline into the immutable reference store.  This prevents a safe
         # rollout from classifying the entire supplier universe as NEW.
-        if previous and not self.incremental.has_generation(previous):
+        if previous_reference and not self.incremental.has_generation(previous_reference):
             self.incremental.compose_generation(
-                previous, self.supplier,
+                previous_reference, self.supplier,
                 enumeration.get("previous_products") or (),
                 scenarios_by_product=enumeration.get("previous_scenarios_by_product") or {},
                 reconciliation_days=policy.reconciliation_days,
             )
         counts = self.incremental.compose_generation(
-            generation_run_id, self.supplier, products, previous_run_id=previous,
+            generation_run_id, self.supplier, products,
+            previous_run_id=previous_reference,
             reconciliation_days=policy.reconciliation_days,
         )
         queue = self.incremental.enrichment_queue(generation_run_id)

@@ -15,8 +15,9 @@ from supplier_weekly import (
 )
 from supplier_incremental import SupplierIncrementalStore
 from supplier_weekly_adapters import (
-    QudoIncrementalAdapter, UmmaIncrementalAdapter, _make_handler,
-    build_weekly_handlers, validate_umma_gap,
+    QudoIncrementalAdapter, UmmaIncrementalAdapter, _baseline_seed,
+    _catalog_generation, _make_handler, build_weekly_handlers,
+    validate_umma_gap,
 )
 from umma_discovery import normalize_umma_barcode
 
@@ -317,6 +318,203 @@ class WeeklyStoreTests(unittest.TestCase):
 
 
 class WeeklyAdapterAsyncLifecycleTests(unittest.TestCase):
+    def test_umma_baseline_seed_collapses_legacy_aliases_by_product_option(self):
+        current = [{
+            "canonical_product_key": "current-key",
+            "supplier_product_id": "product-1", "supplier_option_id": "option-1",
+            "supplier_sku": "current-sku", "canonical_ean": None,
+            "canonical_gtin": None, "identifier_valid": False,
+            "raw_identifiers": [{"value": "invalid", "type": "UMMA_BARCODE"}],
+        }]
+
+        class Store:
+            @staticmethod
+            def latest_success(_supplier):
+                return {
+                    "completed_at": "2026-09-01T00:00:00Z",
+                    "products": [
+                        {
+                            "canonical_product_key": "catalog-alias",
+                            "supplier_product_id": "product-1",
+                            "supplier_option_id": "option-1",
+                            "supplier_sku": "current-sku",
+                        },
+                        {
+                            "canonical_product_key": "scenario-alias",
+                            "supplier_product_id": "product-1",
+                            "supplier_option_id": "option-1",
+                            "canonical_ean": "8809640735820",
+                            "canonical_gtin": "08809640735820",
+                            "identifier_type": "EAN",
+                        },
+                    ],
+                    "scenarios": [{
+                        "scenario_id": "scenario-1",
+                        "supplier_catalog_product_key": "scenario-alias",
+                        "snapshot_at": "2026-09-01T00:00:00Z",
+                    }],
+                }
+
+        products, scenarios = _baseline_seed(Store(), "umma", current)
+        self.assertEqual(len(products), 1)
+        self.assertEqual(products[0]["canonical_product_key"], "current-key")
+        self.assertEqual(products[0]["canonical_ean"], "8809640735820")
+        self.assertTrue(products[0]["identifier_valid"])
+        self.assertEqual(list(scenarios), ["current-key"])
+        self.assertEqual(scenarios["current-key"][0]["canonical_product_key"], "current-key")
+
+    def test_umma_identity_bridge_distinguishes_real_removal_and_unresolved(self):
+        current = [
+            {
+                "canonical_product_key": "current-known",
+                "supplier_product_id": "product-1", "supplier_option_id": "option-1",
+                "identifier_valid": True, "canonical_ean": "8809640735820",
+            },
+            {
+                "canonical_product_key": "current-new",
+                "supplier_product_id": "product-3", "supplier_option_id": "option-3",
+                "identifier_valid": True, "canonical_ean": "8809704095518",
+            },
+            {
+                "canonical_product_key": "current-unresolved",
+                "supplier_product_id": "product-4", "supplier_option_id": "option-4",
+                "identifier_valid": False, "raw_barcode": "880346301661677",
+            },
+        ]
+
+        class Store:
+            @staticmethod
+            def latest_success(_supplier):
+                return {
+                    "completed_at": "2026-09-01T00:00:00Z",
+                    "products": [
+                        {
+                            "canonical_product_key": "known-catalog-alias",
+                            "supplier_product_id": "product-1",
+                            "supplier_option_id": "option-1",
+                            "supplier_sku": "sku-1",
+                        },
+                        {
+                            "canonical_product_key": "known-scenario-alias",
+                            "supplier_product_id": "product-1",
+                            "supplier_option_id": "option-1",
+                            "canonical_ean": "8809640735820",
+                        },
+                        {
+                            "canonical_product_key": "removed",
+                            "supplier_product_id": "product-2",
+                            "supplier_option_id": "option-2",
+                            "canonical_ean": "8809562193654",
+                        },
+                    ],
+                    "scenarios": [{
+                        "scenario_id": "scenario-known",
+                        "supplier_catalog_product_key": "known-scenario-alias",
+                        "snapshot_at": "2026-09-01T00:00:00Z",
+                    }],
+                }
+
+        seed_products, seed_scenarios = _baseline_seed(Store(), "umma", current)
+        with tempfile.TemporaryDirectory() as temporary:
+            incremental = SupplierIncrementalStore(Path(temporary) / "incremental.sqlite3")
+            incremental.compose_generation(
+                "baseline:identity-v2", "umma", seed_products,
+                scenarios_by_product=seed_scenarios, now="2026-09-01T00:00:00Z",
+            )
+            counts = incremental.compose_generation(
+                "weekly", "umma", current,
+                previous_run_id="baseline:identity-v2",
+                now="2026-09-06T00:00:00Z",
+            )
+            summary = incremental.generation_summary("weekly")
+        self.assertEqual(counts["unchanged"], 1)
+        self.assertEqual(counts["new"], 1)
+        self.assertEqual(counts["identifier_unresolved"], 1)
+        self.assertEqual(counts["removed"], 1)
+        self.assertEqual(summary["scenario_refs"], 1)
+
+    def test_weekly_uses_versioned_reference_but_publishes_against_active_baseline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            incremental = SupplierIncrementalStore(Path(temporary) / "incremental.sqlite3")
+            weekly = WeeklySupplierStore(Path(temporary) / "weekly.sqlite3")
+            product = {
+                "canonical_product_key": "product-1", "product_id": "1",
+                "identifier_valid": True,
+            }
+            published = []
+            handler = IncrementalWeeklyHandler(
+                "umma",
+                enumerate_catalog=lambda **_: {
+                    "products": [product], "previous_products": [product],
+                    "previous_reference_run_id": "active-umma:identity-v2",
+                    "previous_scenarios_by_product": {"product-1": [{
+                        "scenario_id": "scenario-1",
+                        "canonical_product_key": "product-1",
+                        "enriched_at": "2026-09-01T00:00:00Z",
+                    }]},
+                },
+                enrich_product=lambda **_: self.fail("unchanged product was enriched"),
+                publish_generation=lambda **kwargs: published.append(kwargs) or {
+                    "run_id": kwargs["run_id"], "promotion_result": "promoted",
+                },
+                previous_run_id=lambda: "active-umma",
+                incremental_store=incremental,
+            )
+            result = handler(
+                run_id="weekly-umma", source=None,
+                policy=SupplierRatePolicy(reconciliation_days=60), work_store=weekly,
+            )
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(published[0]["previous_run_id"], "active-umma")
+            self.assertEqual(
+                incremental.generation_summary("weekly-umma-umma")["scenario_refs"], 1,
+            )
+
+    def test_catalog_publication_validates_previous_run_and_rejects_zero_scenarios(self):
+        class Incremental:
+            @staticmethod
+            def generation_records(_run_id):
+                return ([{
+                    "canonical_product_key": "product-1",
+                    "canonical_ean": "8809640735820",
+                    "canonical_gtin": "08809640735820",
+                }], [])
+
+        class Store:
+            started = False
+            published = None
+
+            @staticmethod
+            def active_generation_metadata(_supplier):
+                return {"run_id": "active-umma"}
+
+            def start_run(self, *_args, **_kwargs):
+                self.started = True
+
+            def publish(self, *_args, **kwargs):
+                self.published = kwargs
+
+        store = Store()
+        enumeration = {"diagnostics": {
+            "source_count": 1, "search_total_count": 1,
+            "unique_product_ids": 1, "enumeration_gap": 0,
+        }}
+        with self.assertRaisesRegex(RuntimeError, "no_purchase_scenarios"):
+            _catalog_generation(
+                "umma", "draft", enumeration, Incremental(),
+                previous_run_id="active-umma", catalog_store=store,
+            )
+        self.assertTrue(store.started)
+        self.assertFalse(store.published["promote"])
+
+        stale = Store()
+        with self.assertRaisesRegex(RuntimeError, "baseline changed"):
+            _catalog_generation(
+                "umma", "draft", enumeration, Incremental(),
+                previous_run_id="stale-umma", catalog_store=stale,
+            )
+        self.assertFalse(stale.started)
+
     class _Client:
         def __init__(self, loop_ids):
             self.loop_ids = loop_ids

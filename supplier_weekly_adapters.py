@@ -36,6 +36,8 @@ from qudo_discovery import normalize_qudo_candidates
 
 logger = logging.getLogger(__name__)
 
+UMMA_INCREMENTAL_IDENTITY_VERSION = "umma_product_option_v2"
+
 
 def _iso_now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -134,6 +136,73 @@ def _baseline_seed(store: SupplierCatalogStore, supplier: str,
         row["canonical_product_key"]: row for row in active["products"]
     }
     current_by_key = {row["canonical_product_key"]: row for row in current_products}
+    scenarios_by_active_key = {}
+    for scenario in active["scenarios"]:
+        key = scenario.get("supplier_catalog_product_key")
+        if key:
+            scenarios_by_active_key.setdefault(key, []).append(scenario)
+
+    if supplier == "umma":
+        def identity(row):
+            product_id = str(row.get("supplier_product_id") or "")
+            option_id = str(row.get("supplier_option_id") or "")
+            return (product_id, option_id) if product_id and option_id else (
+                "canonical_product_key", str(row.get("canonical_product_key") or "")
+            )
+
+        active_by_identity = {}
+        for row in active_products.values():
+            active_by_identity.setdefault(identity(row), []).append(row)
+        current_by_identity = {}
+        for row in current_products:
+            stable_identity = identity(row)
+            if stable_identity in current_by_identity:
+                raise RuntimeError("UMMA enumeration contains duplicate product/option identity")
+            current_by_identity[stable_identity] = row
+
+        previous_products = []
+        scenarios = {}
+        for stable_identity in sorted(active_by_identity):
+            aliases = sorted(
+                active_by_identity[stable_identity],
+                key=lambda row: (
+                    not bool(scenarios_by_active_key.get(row["canonical_product_key"])),
+                    row["canonical_product_key"],
+                ),
+            )
+            current = current_by_identity.get(stable_identity)
+            row = dict(current or aliases[0])
+            target_key = row["canonical_product_key"]
+            if current:
+                for field in ("canonical_ean", "canonical_gtin", "identifier_type",
+                              "raw_identifiers"):
+                    if not row.get(field):
+                        for old in aliases:
+                            if old.get(field):
+                                row[field] = old[field]
+                                break
+                row["identifier_valid"] = bool(
+                    row.get("canonical_gtin") or canonical_gtin14(row.get("canonical_ean"))
+                )
+            previous_products.append(row)
+            seen_scenarios = set()
+            for old in aliases:
+                for scenario in scenarios_by_active_key.get(old["canonical_product_key"], []):
+                    scenario_id = str(scenario.get("scenario_id") or "")
+                    if not scenario_id or scenario_id in seen_scenarios:
+                        continue
+                    seen_scenarios.add(scenario_id)
+                    payload = dict(scenario)
+                    payload["canonical_product_key"] = target_key
+                    payload.setdefault(
+                        "enriched_at",
+                        payload.get("snapshot_at")
+                        or active.get("scenario_enrichment_observed_at")
+                        or active.get("completed_at"),
+                    )
+                    scenarios.setdefault(target_key, []).append(payload)
+        return previous_products, scenarios
+
     previous_products = []
     for key, old in active_products.items():
         # Matching identities deliberately use the new light-index payload for
@@ -165,7 +234,7 @@ def _baseline_seed(store: SupplierCatalogStore, supplier: str,
 
 
 def _catalog_generation(supplier, run_id, enumeration, incremental_store,
-                        catalog_store=None):
+                        previous_run_id=None, catalog_store=None):
     products, scenarios = incremental_store.generation_records(run_id)
     coverage = {"abw": ABW_COVERAGE, "umma": UMMA_COVERAGE,
                 "qudo": QUDO_COVERAGE}[supplier]
@@ -210,9 +279,13 @@ def _catalog_generation(supplier, run_id, enumeration, incremental_store,
         product_catalog_coverage_type=coverage["type"],
         product_catalog_coverage_complete=coverage["complete"],
         scenario_enrichment_status="partial", scenario_enrichment_count=len(scenarios),
-        diagnostics=diagnostics,
+        diagnostics={**diagnostics, "previous_run_id": previous_run_id},
     )
     store = catalog_store or SupplierCatalogStore()
+    active = store.active_generation_metadata(supplier)
+    active_run_id = active.get("run_id") if active else None
+    if previous_run_id != active_run_id:
+        raise RuntimeError("Supplier baseline changed before atomic publication")
     store.start_run(
         supplier, run_id=run_id, coverage_type=coverage["type"],
         coverage_description=coverage["description"],
@@ -316,8 +389,13 @@ class UmmaIncrementalAdapter(_StableAsyncAdapter):
         old_gap = int((previous_meta.get("diagnostics") or {}).get("enumeration_gap") or 0)
         validate_umma_gap(gap, old_gap)
         retry, rate_limits, server_errors = self._telemetry.snapshot()
+        previous_reference_run_id = (
+            f"{previous_meta['run_id']}:{UMMA_INCREMENTAL_IDENTITY_VERSION}"
+            if previous_meta.get("run_id") else None
+        )
         return {"products": products, "previous_products": previous_products,
                 "previous_scenarios_by_product": previous_scenarios,
+                "previous_reference_run_id": previous_reference_run_id,
                 "pages": pages, "requests": self._client.request_count,
                 "retry": retry, "rate_limits": rate_limits, "server_errors": server_errors,
                 "diagnostics": {"source_type": "global_search_index", "source_count": total,
