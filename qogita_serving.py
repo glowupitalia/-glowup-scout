@@ -69,6 +69,14 @@ CREATE TABLE IF NOT EXISTS qogita_serving_memberships (
 CREATE INDEX IF NOT EXISTS idx_qogita_serving_membership_product
 ON qogita_serving_memberships(canonical_product_key, serving_generation_id);
 
+-- Keep the one-shot snapshot reader on a compact covering index instead of
+-- fetching product payload pages once per enriched bootstrap product.
+CREATE INDEX IF NOT EXISTS idx_supplier_catalog_products_qogita_snapshot
+ON supplier_catalog_products(
+    run_id, canonical_product_key, enrichment_status,
+    offer_tier_observed_at, canonical_gtin
+);
+
 CREATE TABLE IF NOT EXISTS qogita_serving_active (
     supplier TEXT PRIMARY KEY CHECK (supplier='qogita'),
     serving_generation_id TEXT NOT NULL,
@@ -108,6 +116,44 @@ class QogitaServingStore:
 
     def __init__(self, path: str | Path = DEFAULT_DATABASE_PATH):
         self.path = Path(path).expanduser().resolve()
+
+    @staticmethod
+    def _eligible_snapshot_rows(
+        connection: sqlite3.Connection, bootstrap_run_id: str,
+        source_generation_id: str,
+    ) -> list[dict[str, Any]]:
+        """Hydrate snapshot rows with sequential index reads, preserving queue order."""
+        selected = connection.execute(
+            """SELECT canonical_product_key,scenario_count
+                 FROM qogita_bootstrap_products
+                WHERE bootstrap_run_id=? AND staging_run_id=? AND status='enriched'
+                  AND variant_fid IS NOT NULL AND variant_fid<>''
+                ORDER BY sequence_no""",
+            (bootstrap_run_id, source_generation_id),
+        ).fetchall()
+        selected_keys = {row["canonical_product_key"] for row in selected}
+        products: dict[str, tuple[str | None, str | None]] = {}
+        for row in connection.execute(
+            """SELECT canonical_product_key,offer_tier_observed_at,canonical_gtin,
+                      enrichment_status
+                 FROM supplier_catalog_products
+                      INDEXED BY idx_supplier_catalog_products_qogita_snapshot
+                WHERE run_id=?""",
+            (source_generation_id,),
+        ):
+            key = row["canonical_product_key"]
+            if (key in selected_keys
+                    and row["enrichment_status"] in {"enriched", "carried_forward"}):
+                products[key] = (row["offer_tier_observed_at"], row["canonical_gtin"])
+        return [
+            {
+                "canonical_product_key": row["canonical_product_key"],
+                "scenario_count": row["scenario_count"],
+                "offer_tier_observed_at": products[row["canonical_product_key"]][0],
+                "canonical_gtin": products[row["canonical_product_key"]][1],
+            }
+            for row in selected if row["canonical_product_key"] in products
+        ]
 
     def initialize(self) -> None:
         with _connect(self.path) as connection:
@@ -330,29 +376,20 @@ class QogitaServingStore:
             if not run:
                 raise ValueError("Production bootstrap not found")
             source_generation_id = run["staging_run_id"]
-            eligible = connection.execute(
-                """SELECT selected.canonical_product_key,selected.scenario_count,
-                          product.offer_tier_observed_at,product.canonical_gtin
-                     FROM qogita_bootstrap_products selected
-                     JOIN supplier_catalog_products product
-                       ON product.run_id=selected.staging_run_id
-                      AND product.canonical_product_key=selected.canonical_product_key
-                    WHERE selected.bootstrap_run_id=? AND selected.status='enriched'
-                      AND selected.variant_fid IS NOT NULL AND selected.variant_fid<>''
-                      AND product.enrichment_status IN ('enriched','carried_forward')""",
-                (bootstrap_run_id,),
-            ).fetchall()
+            eligible = self._eligible_snapshot_rows(
+                connection, bootstrap_run_id, source_generation_id,
+            )
             valid = [row for row in eligible if canonical_gtin14(row["canonical_gtin"])]
             if len(valid) != len(eligible):
                 raise RuntimeError("Serving snapshot contains invalid canonical GTIN")
             expected_scenarios = sum(int(row["scenario_count"] or 0) for row in valid)
+            # Scenarios are replaced and the selected row's scenario_count is
+            # updated in the same transaction.  Counting the source generation
+            # directly preserves the physical-row consistency gate without one
+            # index seek per enriched product.
             actual_scenarios = connection.execute(
-                """SELECT COUNT(*) FROM supplier_catalog_scenarios scenario
-                     JOIN qogita_bootstrap_products selected
-                       ON selected.staging_run_id=scenario.run_id
-                      AND selected.canonical_product_key=scenario.canonical_product_key
-                    WHERE selected.bootstrap_run_id=? AND selected.status='enriched'""",
-                (bootstrap_run_id,),
+                "SELECT COUNT(*) FROM supplier_catalog_scenarios WHERE run_id=?",
+                (source_generation_id,),
             ).fetchone()[0]
             if int(actual_scenarios) != expected_scenarios:
                 raise RuntimeError("Serving snapshot scenario membership is inconsistent")
@@ -363,16 +400,15 @@ class QogitaServingStore:
                      FROM qogita_bootstrap_products WHERE bootstrap_run_id=?""",
                 (bootstrap_run_id,),
             ).fetchone())
-            usable = connection.execute(
-                """SELECT COUNT(DISTINCT scenario.canonical_ean)
-                     FROM supplier_catalog_scenarios scenario
-                     JOIN qogita_bootstrap_products selected
-                       ON selected.staging_run_id=scenario.run_id
-                      AND selected.canonical_product_key=scenario.canonical_product_key
-                    WHERE selected.bootstrap_run_id=? AND selected.status='enriched'
-                      AND scenario.canonical_ean IS NOT NULL""",
-                (bootstrap_run_id,),
-            ).fetchone()[0]
+            # Qogita scenario construction writes the selected product's
+            # canonical GTIN into every scenario.  The product key is derived
+            # from that GTIN, so a valid product with at least one scenario is
+            # exactly one usable identifier.  Deriving this from the already
+            # materialized eligible rows avoids a global DISTINCT/temp B-tree.
+            usable = len({
+                canonical_gtin14(row["canonical_gtin"])
+                for row in valid if int(row["scenario_count"] or 0) > 0
+            })
             last_enrichment = max(
                 (row["offer_tier_observed_at"] for row in valid
                  if row["offer_tier_observed_at"]), default=None,
@@ -408,7 +444,9 @@ class QogitaServingStore:
                        offer_tier_observed_at) VALUES (?,?,?,?)""",
                 ((serving_generation_id, row["canonical_product_key"],
                   int(row["scenario_count"] or 0), row["offer_tier_observed_at"])
-                 for row in valid),
+                 for row in sorted(
+                     valid, key=lambda value: value["canonical_product_key"],
+                 )),
             )
             connection.execute(
                 """INSERT INTO qogita_serving_active(supplier,serving_generation_id,updated_at)

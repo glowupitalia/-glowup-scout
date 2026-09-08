@@ -919,6 +919,7 @@ class QogitaBootstrapTests(unittest.TestCase):
             bootstrap_state="resting", now="2026-08-27T04:00:00Z",
         )
         self.assertEqual(snapshot["enriched_product_count"], 2)
+        self.assertEqual(snapshot["usable_identifier_count"], 2)
         self.assertEqual(snapshot["pending_count"], 1)
         self.assertEqual(snapshot["scenario_count"], 4)
         self.assertEqual(snapshot["scenario_enrichment_status"], "partial")
@@ -956,6 +957,84 @@ class QogitaBootstrapTests(unittest.TestCase):
             serving.active_snapshot()["serving_generation_id"],
             second["serving_generation_id"],
         )
+
+    def test_serving_snapshot_excludes_enriched_products_without_scenarios(self):
+        run_id = self.staging(2)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        run_qogita_bootstrap(
+            bootstrap["bootstrap_run_id"], store=self.store,
+            client=BootstrapFakeClient(), max_products=1,
+            product_link_pacing=0, offers_pacing=0, sleep_func=lambda _: None,
+        )
+        with sqlite3.connect(self.database) as connection:
+            pending = connection.execute(
+                """SELECT canonical_product_key FROM qogita_bootstrap_products
+                   WHERE bootstrap_run_id=? AND status='pending'""",
+                (bootstrap["bootstrap_run_id"],),
+            ).fetchone()[0]
+            connection.execute(
+                """UPDATE qogita_bootstrap_products
+                      SET status='enriched',variant_fid='no-offers',scenario_count=0
+                    WHERE bootstrap_run_id=? AND canonical_product_key=?""",
+                (bootstrap["bootstrap_run_id"], pending),
+            )
+            connection.execute(
+                """UPDATE supplier_catalog_products
+                      SET enrichment_status='enriched'
+                    WHERE run_id=? AND canonical_product_key=?""",
+                (run_id, pending),
+            )
+        snapshot = QogitaServingStore(self.database).build_snapshot(
+            bootstrap["bootstrap_run_id"], window_number=1,
+            bootstrap_state="resting",
+        )
+        self.assertEqual(snapshot["enriched_product_count"], 2)
+        self.assertEqual(snapshot["usable_identifier_count"], 1)
+        self.assertEqual(snapshot["scenario_count"], 2)
+
+    def test_bounded_snapshot_counts_match_legacy_scenario_aggregates(self):
+        run_id = self.staging(3)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        run_qogita_bootstrap(
+            bootstrap["bootstrap_run_id"], store=self.store,
+            client=BootstrapFakeClient(), max_products=2,
+            product_link_pacing=0, offers_pacing=0, sleep_func=lambda _: None,
+        )
+        with sqlite3.connect(self.database) as connection:
+            legacy = connection.execute(
+                """SELECT COUNT(*),COUNT(DISTINCT scenario.canonical_ean)
+                     FROM supplier_catalog_scenarios scenario
+                     JOIN qogita_bootstrap_products selected
+                       ON selected.staging_run_id=scenario.run_id
+                      AND selected.canonical_product_key=scenario.canonical_product_key
+                    WHERE selected.bootstrap_run_id=? AND selected.status='enriched'
+                      AND scenario.canonical_ean IS NOT NULL""",
+                (bootstrap["bootstrap_run_id"],),
+            ).fetchone()
+        snapshot = QogitaServingStore(self.database).build_snapshot(
+            bootstrap["bootstrap_run_id"], window_number=1,
+            bootstrap_state="resting",
+        )
+        self.assertEqual(snapshot["scenario_count"], legacy[0])
+        self.assertEqual(snapshot["usable_identifier_count"], legacy[1])
+
+    def test_snapshot_product_lookup_uses_covering_index(self):
+        run_id = self.staging(2)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        serving = QogitaServingStore(self.database)
+        serving.initialize()
+        with sqlite3.connect(self.database) as connection:
+            plan = " ".join(str(row[3]) for row in connection.execute(
+                """EXPLAIN QUERY PLAN
+                   SELECT canonical_product_key,offer_tier_observed_at,canonical_gtin,
+                          enrichment_status
+                     FROM supplier_catalog_products
+                          INDEXED BY idx_supplier_catalog_products_qogita_snapshot
+                    WHERE run_id=?""",
+                (run_id,),
+            ))
+        self.assertIn("idx_supplier_catalog_products_qogita_snapshot", plan)
+        self.assertIn("COVERING INDEX", plan)
 
 
 if __name__ == "__main__":
