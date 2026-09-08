@@ -181,6 +181,11 @@ CREATE TABLE IF NOT EXISTS qogita_bootstrap_products (
 );
 CREATE INDEX IF NOT EXISTS idx_qogita_bootstrap_products_next
 ON qogita_bootstrap_products (bootstrap_run_id, status, sequence_no);
+CREATE INDEX IF NOT EXISTS idx_qogita_bootstrap_products_claimable
+ON qogita_bootstrap_products (bootstrap_run_id, status, worker_id, sequence_no);
+CREATE INDEX IF NOT EXISTS idx_qogita_bootstrap_products_expired_lease
+ON qogita_bootstrap_products (bootstrap_run_id, lease_expires_at)
+WHERE worker_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS qogita_bootstrap_milestones (
     bootstrap_run_id TEXT NOT NULL,
@@ -1207,12 +1212,22 @@ class QogitaBootstrapStore:
                        AND worker_id IS NOT NULL AND lease_expires_at<=?""",
                 (bootstrap_run_id, *sorted(RETRYABLE_PRODUCT_STATES), claimed_at),
             )
-            keys = [row[0] for row in connection.execute(
-                f"""SELECT canonical_product_key FROM qogita_bootstrap_products
-                     WHERE bootstrap_run_id=? AND status IN ({placeholders})
-                       AND worker_id IS NULL ORDER BY sequence_no LIMIT ?""",
-                (bootstrap_run_id, *sorted(RETRYABLE_PRODUCT_STATES), max(1, int(limit))),
-            )]
+            batch_limit = max(1, int(limit))
+            # An IN predicate combined with global sequence ordering makes SQLite
+            # walk the completed prefix of the whole bootstrap on every claim.
+            # Seek each claimable state independently, then preserve the exact
+            # global sequence contract in memory.  The number of states is fixed.
+            candidates = []
+            for status in sorted(RETRYABLE_PRODUCT_STATES):
+                candidates.extend(connection.execute(
+                    """SELECT canonical_product_key,sequence_no
+                         FROM qogita_bootstrap_products
+                        WHERE bootstrap_run_id=? AND status=? AND worker_id IS NULL
+                        ORDER BY sequence_no LIMIT ?""",
+                    (bootstrap_run_id, status, batch_limit),
+                ).fetchall())
+            candidates.sort(key=lambda row: (int(row["sequence_no"]), row["canonical_product_key"]))
+            keys = [row["canonical_product_key"] for row in candidates[:batch_limit]]
             for key in keys:
                 connection.execute(
                     """UPDATE qogita_bootstrap_products
@@ -1222,7 +1237,7 @@ class QogitaBootstrapStore:
                 )
         if not keys:
             return []
-        with _connect(self.path) as connection:
+        with self._read_connection() as connection:
             placeholders_keys = ",".join("?" for _ in keys)
             rows = connection.execute(
                 f"""SELECT selected.*,product.brand,product.title,product.product_url,

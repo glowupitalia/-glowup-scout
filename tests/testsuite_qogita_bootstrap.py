@@ -10,6 +10,7 @@ from pathlib import Path
 
 from qogita_bootstrap import (
     PRODUCT_LINK_SOURCE,
+    RETRYABLE_PRODUCT_STATES,
     QogitaBootstrapClient,
     QogitaBootstrapError,
     QogitaBootstrapStore,
@@ -346,6 +347,76 @@ class QogitaBootstrapTests(unittest.TestCase):
         )
         self.assertEqual(recovered[0]["canonical_product_key"], first[0]["canonical_product_key"])
         self.assertEqual(recovered[0]["claim_count"], 2)
+
+    def test_claim_preserves_global_sequence_across_all_retryable_states(self):
+        run_id = self.staging(6)
+        bootstrap = self.store.create_bootstrap(run_id, target_count=6, batch_size=6)
+        products = self.store.products(bootstrap["bootstrap_run_id"])
+        statuses = {
+            products[0]["canonical_product_key"]: "offers_retryable",
+            products[1]["canonical_product_key"]: "resolver_retryable",
+            products[2]["canonical_product_key"]: "fid_resolved",
+            products[3]["canonical_product_key"]: "enriched",
+        }
+        with sqlite3.connect(self.database) as connection:
+            for key, status in statuses.items():
+                connection.execute(
+                    """UPDATE qogita_bootstrap_products SET status=?
+                         WHERE bootstrap_run_id=? AND canonical_product_key=?""",
+                    (status, bootstrap["bootstrap_run_id"], key),
+                )
+        claimed = self.store.claim_batch(
+            bootstrap["bootstrap_run_id"], worker_id="worker", limit=4,
+        )
+        self.assertEqual(
+            [row["sequence_no"] for row in claimed],
+            [products[index]["sequence_no"] for index in (0, 1, 2, 4)],
+        )
+
+    def test_claim_queries_use_bounded_indexes(self):
+        run_id = self.staging(4)
+        bootstrap = self.store.create_bootstrap(run_id, target_count=4, batch_size=4)
+        with sqlite3.connect(self.database) as connection:
+            claim_plan = " ".join(row[3] for row in connection.execute(
+                """EXPLAIN QUERY PLAN
+                   SELECT canonical_product_key,sequence_no
+                     FROM qogita_bootstrap_products
+                    WHERE bootstrap_run_id=? AND status=? AND worker_id IS NULL
+                    ORDER BY sequence_no LIMIT ?""",
+                (bootstrap["bootstrap_run_id"], "pending", 1),
+            ))
+            lease_plan = " ".join(row[3] for row in connection.execute(
+                """EXPLAIN QUERY PLAN
+                   UPDATE qogita_bootstrap_products
+                      SET worker_id=NULL,claimed_at=NULL,lease_expires_at=NULL
+                    WHERE bootstrap_run_id=? AND status IN (?,?,?,?)
+                      AND worker_id IS NOT NULL AND lease_expires_at<=?""",
+                (bootstrap["bootstrap_run_id"], *sorted(RETRYABLE_PRODUCT_STATES),
+                 "2026-08-26T10:00:00Z"),
+            ))
+        self.assertIn("idx_qogita_bootstrap_products_claimable", claim_plan)
+        self.assertIn("idx_qogita_bootstrap_products_expired_lease", lease_plan)
+
+    def test_claim_hydration_closes_its_read_connection(self):
+        run_id = self.staging(1)
+        bootstrap = self.store.create_bootstrap(run_id, target_count=1, batch_size=1)
+        original_read = self.store._read_connection
+        observed = []
+
+        @contextmanager
+        def tracked_read():
+            with original_read() as connection:
+                observed.append(connection)
+                yield connection
+
+        self.store._read_connection = tracked_read
+        claimed = self.store.claim_batch(
+            bootstrap["bootstrap_run_id"], worker_id="worker", limit=1,
+        )
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(len(observed), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            observed[0].execute("SELECT 1")
 
     def test_two_workers_do_not_duplicate_processing_or_scenarios(self):
         run_id = self.staging(12)
