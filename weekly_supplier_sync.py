@@ -24,6 +24,12 @@ from storage_gc import (
     evaluate_weekly_admission,
     production_retention_plan,
 )
+from supplier_catalog_coordination import (
+    DEFAULT_WEEKLY_HANDOFF_TIMEOUT_SECONDS,
+    SupplierCatalogCoordinationTimeout,
+    supplier_catalog_writer_lock,
+    weekly_supplier_catalog_intent,
+)
 
 
 def _baseline(supplier: str) -> str | None:
@@ -102,30 +108,40 @@ def main(argv=None) -> int:
         return 0
     try:
         with weekly_lock():
-            handlers = _handlers()
-            if args.action == "import-abw":
-                handlers = {
-                    "abw": handlers["abw"],
-                    "umma": lambda **_: {"status": "skipped", "baseline_after": _baseline("umma"),
-                                          "promotion_result": "baseline_preserved"},
-                    "qudo": lambda **_: {"status": "skipped", "baseline_after": _baseline("qudo"),
-                                          "promotion_result": "baseline_preserved"},
-                    QOGITA_KOREAN_BEAUTY_STEP: lambda **_: {
-                        "status": "skipped",
-                        "baseline_after": _baseline(QOGITA_KOREAN_BEAUTY_STEP),
-                        "promotion_result": "baseline_preserved",
-                    },
-                }
-            orchestrator = WeeklySupplierOrchestrator(
-                handlers, store=store, baseline_provider=_baseline,
-                admission_check=_weekly_admission,
-                storage_metrics=collect_storage_metrics,
-            )
-            result = orchestrator.run(
-                trigger_type=args.trigger,
-                scheduled_at=scheduled_at,
-                sources={"abw": args.abw_export} if args.abw_export else {},
-            )
+            with weekly_supplier_catalog_intent():
+                with supplier_catalog_writer_lock(
+                    timeout_seconds=DEFAULT_WEEKLY_HANDOFF_TIMEOUT_SECONDS,
+                ):
+                    handlers = _handlers()
+                    if args.action == "import-abw":
+                        handlers = {
+                            "abw": handlers["abw"],
+                            "umma": lambda **_: {"status": "skipped", "baseline_after": _baseline("umma"),
+                                                  "promotion_result": "baseline_preserved"},
+                            "qudo": lambda **_: {"status": "skipped", "baseline_after": _baseline("qudo"),
+                                                  "promotion_result": "baseline_preserved"},
+                            QOGITA_KOREAN_BEAUTY_STEP: lambda **_: {
+                                "status": "skipped",
+                                "baseline_after": _baseline(QOGITA_KOREAN_BEAUTY_STEP),
+                                "promotion_result": "baseline_preserved",
+                            },
+                        }
+                    orchestrator = WeeklySupplierOrchestrator(
+                        handlers, store=store, baseline_provider=_baseline,
+                        admission_check=_weekly_admission,
+                        storage_metrics=collect_storage_metrics,
+                    )
+                    result = orchestrator.run(
+                        trigger_type=args.trigger,
+                        scheduled_at=scheduled_at,
+                        sources={"abw": args.abw_export} if args.abw_export else {},
+                    )
+    except SupplierCatalogCoordinationTimeout:
+        result = {
+            "status": "coordination_blocked_supplier_catalog",
+            "reason": "supplier_catalog_writer_handoff_timeout",
+            "baseline_preserved": True,
+        }
     except RuntimeError as exc:
         if str(exc) != "weekly_supplier_sync_already_running":
             raise
