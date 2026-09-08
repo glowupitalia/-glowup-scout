@@ -144,6 +144,10 @@ CREATE TABLE IF NOT EXISTS qogita_bootstrap_runs (
     offers_pacing REAL,
     stop_reason TEXT,
     health_json TEXT NOT NULL DEFAULT '{}',
+    retryable_count INTEGER NOT NULL DEFAULT 0,
+    terminal_failed_count INTEGER NOT NULL DEFAULT 0,
+    active_claim_count INTEGER NOT NULL DEFAULT 0,
+    reclaimed_claim_count INTEGER NOT NULL DEFAULT 0,
     last_progress_json TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (staging_run_id) REFERENCES supplier_catalog_runs(run_id)
 );
@@ -195,6 +199,59 @@ CREATE TABLE IF NOT EXISTS qogita_bootstrap_milestones (
     PRIMARY KEY (bootstrap_run_id, milestone),
     FOREIGN KEY (bootstrap_run_id) REFERENCES qogita_bootstrap_runs(bootstrap_run_id)
 );
+"""
+
+BOOTSTRAP_COUNTER_TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS qogita_bootstrap_products_counter_insert
+AFTER INSERT ON qogita_bootstrap_products
+BEGIN
+    UPDATE qogita_bootstrap_runs SET
+        products_attempted=products_attempted+(NEW.status<>'pending'),
+        fid_resolved=fid_resolved+(NEW.variant_fid IS NOT NULL),
+        fid_failed=fid_failed+(NEW.status IN ('resolver_retryable','resolver_permanent')),
+        offers_success=offers_success+(NEW.status='enriched'),
+        offers_failed=offers_failed+(NEW.status IN ('offers_retryable','offers_permanent','parsing_failure')),
+        scenarios_written=scenarios_written+NEW.scenario_count,
+        retryable_count=retryable_count+(NEW.status IN ('resolver_retryable','offers_retryable')),
+        terminal_failed_count=terminal_failed_count+(NEW.status IN ('resolver_permanent','offers_permanent','parsing_failure')),
+        active_claim_count=active_claim_count+(NEW.worker_id IS NOT NULL),
+        reclaimed_claim_count=reclaimed_claim_count+MAX(NEW.claim_count-1,0)
+    WHERE bootstrap_run_id=NEW.bootstrap_run_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS qogita_bootstrap_products_counter_update
+AFTER UPDATE OF status,variant_fid,scenario_count,worker_id,claim_count ON qogita_bootstrap_products
+BEGIN
+    UPDATE qogita_bootstrap_runs SET
+        products_attempted=products_attempted+(NEW.status<>'pending')-(OLD.status<>'pending'),
+        fid_resolved=fid_resolved+(NEW.variant_fid IS NOT NULL)-(OLD.variant_fid IS NOT NULL),
+        fid_failed=fid_failed+(NEW.status IN ('resolver_retryable','resolver_permanent'))-(OLD.status IN ('resolver_retryable','resolver_permanent')),
+        offers_success=offers_success+(NEW.status='enriched')-(OLD.status='enriched'),
+        offers_failed=offers_failed+(NEW.status IN ('offers_retryable','offers_permanent','parsing_failure'))-(OLD.status IN ('offers_retryable','offers_permanent','parsing_failure')),
+        scenarios_written=scenarios_written+NEW.scenario_count-OLD.scenario_count,
+        retryable_count=retryable_count+(NEW.status IN ('resolver_retryable','offers_retryable'))-(OLD.status IN ('resolver_retryable','offers_retryable')),
+        terminal_failed_count=terminal_failed_count+(NEW.status IN ('resolver_permanent','offers_permanent','parsing_failure'))-(OLD.status IN ('resolver_permanent','offers_permanent','parsing_failure')),
+        active_claim_count=active_claim_count+(NEW.worker_id IS NOT NULL)-(OLD.worker_id IS NOT NULL),
+        reclaimed_claim_count=reclaimed_claim_count+MAX(NEW.claim_count-1,0)-MAX(OLD.claim_count-1,0)
+    WHERE bootstrap_run_id=NEW.bootstrap_run_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS qogita_bootstrap_products_counter_delete
+AFTER DELETE ON qogita_bootstrap_products
+BEGIN
+    UPDATE qogita_bootstrap_runs SET
+        products_attempted=products_attempted-(OLD.status<>'pending'),
+        fid_resolved=fid_resolved-(OLD.variant_fid IS NOT NULL),
+        fid_failed=fid_failed-(OLD.status IN ('resolver_retryable','resolver_permanent')),
+        offers_success=offers_success-(OLD.status='enriched'),
+        offers_failed=offers_failed-(OLD.status IN ('offers_retryable','offers_permanent','parsing_failure')),
+        scenarios_written=scenarios_written-OLD.scenario_count,
+        retryable_count=retryable_count-(OLD.status IN ('resolver_retryable','offers_retryable')),
+        terminal_failed_count=terminal_failed_count-(OLD.status IN ('resolver_permanent','offers_permanent','parsing_failure')),
+        active_claim_count=active_claim_count-(OLD.worker_id IS NOT NULL),
+        reclaimed_claim_count=reclaimed_claim_count-MAX(OLD.claim_count-1,0)
+    WHERE bootstrap_run_id=OLD.bootstrap_run_id;
+END;
 """
 
 
@@ -840,6 +897,10 @@ class QogitaBootstrapStore:
                 "offers_pacing": "REAL",
                 "stop_reason": "TEXT",
                 "health_json": "TEXT NOT NULL DEFAULT '{}'",
+                "retryable_count": "INTEGER NOT NULL DEFAULT 0",
+                "terminal_failed_count": "INTEGER NOT NULL DEFAULT 0",
+                "active_claim_count": "INTEGER NOT NULL DEFAULT 0",
+                "reclaimed_claim_count": "INTEGER NOT NULL DEFAULT 0",
             }.items():
                 if name not in run_columns:
                     connection.execute(f"ALTER TABLE qogita_bootstrap_runs ADD COLUMN {name} {declaration}")
@@ -852,6 +913,7 @@ class QogitaBootstrapStore:
             }.items():
                 if name not in selected_columns:
                     connection.execute(f"ALTER TABLE qogita_bootstrap_products ADD COLUMN {name} {declaration}")
+            connection.executescript(BOOTSTRAP_COUNTER_TRIGGERS)
 
     def create_production_bootstrap(
         self, staging_run_id: str, *, batch_size: int = 100,
@@ -1094,7 +1156,8 @@ class QogitaBootstrapStore:
             )
             connection.execute(
                 """UPDATE qogita_bootstrap_products SET worker_id=NULL,claimed_at=NULL,
-                          lease_expires_at=NULL WHERE bootstrap_run_id=?""",
+                          lease_expires_at=NULL WHERE bootstrap_run_id=?
+                          AND worker_id IS NOT NULL""",
                 (bootstrap_run_id,),
             )
         return self.bootstrap(bootstrap_run_id)
@@ -1270,17 +1333,21 @@ class QogitaBootstrapStore:
 
     def claim_summary(self, bootstrap_run_id: str, *, now: str | None = None):
         observed = now or utc_now()
-        with _connect(self.path) as connection:
-            row = connection.execute(
-                """SELECT SUM(worker_id IS NOT NULL) claimed,
-                          SUM(worker_id IS NOT NULL AND lease_expires_at<=?) expired,
-                          COALESCE(SUM(CASE WHEN claim_count>1 THEN claim_count-1 ELSE 0 END),0)
-                            reclaimed
-                     FROM qogita_bootstrap_products WHERE bootstrap_run_id=?""",
-                (observed, bootstrap_run_id),
+        with self._read_connection() as connection:
+            run = connection.execute(
+                """SELECT active_claim_count,reclaimed_claim_count
+                     FROM qogita_bootstrap_runs WHERE bootstrap_run_id=?""",
+                (bootstrap_run_id,),
             ).fetchone()
-        return {"claimed": int(row["claimed"] or 0), "expired": int(row["expired"] or 0),
-                "reclaimed": int(row["reclaimed"] or 0)}
+            expired = connection.execute(
+                """SELECT COUNT(*) FROM qogita_bootstrap_products
+                     WHERE bootstrap_run_id=? AND worker_id IS NOT NULL
+                       AND lease_expires_at<=?""",
+                (bootstrap_run_id, observed),
+            ).fetchone()[0]
+        return {"claimed": int(run["active_claim_count"] or 0),
+                "expired": int(expired or 0),
+                "reclaimed": int(run["reclaimed_claim_count"] or 0)}
 
     def requeue_expired_auth_failures(self, bootstrap_run_id: str) -> int:
         """Recover rows written by clients that lacked token refresh on HTTP 401."""
@@ -1507,58 +1574,84 @@ class QogitaBootstrapStore:
                 (attempts, observed_at, row["staging_run_id"], canonical_product_key),
             )
 
+    @staticmethod
+    def _checkpoint_counts(run) -> dict[str, int]:
+        selected = int(run["target_count"] or 0)
+        return {
+            "selected": selected,
+            "attempted": int(run["products_attempted"] or 0),
+            "fid_resolved": int(run["fid_resolved"] or 0),
+            "fid_failed": int(run["fid_failed"] or 0),
+            "offers_success": int(run["offers_success"] or 0),
+            "offers_failed": int(run["offers_failed"] or 0),
+            "retryable": int(run["retryable_count"] or 0),
+            "terminal_failed": int(run["terminal_failed_count"] or 0),
+            "scenarios_written": int(run["scenarios_written"] or 0),
+        }
+
+    def reconcile_checkpoint_counters(self, bootstrap_run_id: str):
+        """Full authoritative reconciliation reserved for recovery/finalization."""
+        with self._read_connection() as connection:
+            counts = dict(connection.execute(
+                """SELECT COUNT(*) selected,SUM(status<>'pending') attempted,
+                          SUM(variant_fid IS NOT NULL) fid_resolved,
+                          SUM(status IN ('resolver_retryable','resolver_permanent')) fid_failed,
+                          SUM(status='enriched') offers_success,
+                          SUM(status IN ('offers_retryable','offers_permanent','parsing_failure')) offers_failed,
+                          SUM(status IN ('resolver_retryable','offers_retryable')) retryable,
+                          SUM(status IN ('resolver_permanent','offers_permanent','parsing_failure')) terminal_failed,
+                          COALESCE(SUM(scenario_count),0) scenarios_written,
+                          SUM(worker_id IS NOT NULL) active_claims,
+                          COALESCE(SUM(MAX(claim_count-1,0)),0) reclaimed_claims
+                     FROM qogita_bootstrap_products WHERE bootstrap_run_id=?""",
+                (bootstrap_run_id,),
+            ).fetchone())
+        with self._write_transaction(
+            operation="reconcile_checkpoint_counters", bootstrap_run_id=bootstrap_run_id,
+        ) as connection:
+            connection.execute(
+                """UPDATE qogita_bootstrap_runs SET target_count=?,products_attempted=?,
+                          fid_resolved=?,fid_failed=?,offers_success=?,offers_failed=?,
+                          scenarios_written=?,retryable_count=?,terminal_failed_count=?,
+                          active_claim_count=?,reclaimed_claim_count=?
+                     WHERE bootstrap_run_id=?""",
+                (counts["selected"], counts["attempted"], counts["fid_resolved"],
+                 counts["fid_failed"], counts["offers_success"], counts["offers_failed"],
+                 counts["scenarios_written"], counts["retryable"],
+                 counts["terminal_failed"], counts["active_claims"],
+                 counts["reclaimed_claims"], bootstrap_run_id),
+            )
+        return counts
+
     def checkpoint_batch(self, bootstrap_run_id: str, *, client_metrics: dict[str, Any],
                          batch_attempted: int):
         now = utc_now()
         with self._read_connection() as connection:
             run = connection.execute(
-                "SELECT staging_run_id,target_count FROM qogita_bootstrap_runs WHERE bootstrap_run_id=?",
+                "SELECT * FROM qogita_bootstrap_runs WHERE bootstrap_run_id=?",
                 (bootstrap_run_id,),
             ).fetchone()
-            counts = dict(connection.execute(
-                """SELECT
-                    COUNT(*) AS selected,
-                    SUM(status<>'pending') AS attempted,
-                    SUM(variant_fid IS NOT NULL) AS fid_resolved,
-                    SUM(status IN ('resolver_retryable','resolver_permanent')) AS fid_failed,
-                    SUM(status='enriched') AS offers_success,
-                    SUM(status IN ('offers_retryable','offers_permanent','parsing_failure')) AS offers_failed,
-                    SUM(status IN ('resolver_retryable','offers_retryable')) AS retryable,
-                    SUM(status IN ('resolver_permanent','offers_permanent','parsing_failure')) AS terminal_failed,
-                    COALESCE(SUM(scenario_count),0) AS scenarios_written
-                   FROM qogita_bootstrap_products WHERE bootstrap_run_id=?""",
-                (bootstrap_run_id,),
-            ).fetchone())
+            counts = self._checkpoint_counts(run)
             remaining = counts["selected"] - counts["offers_success"] - counts["terminal_failed"]
             status = "completed" if remaining == 0 else (
                 "waiting_retry" if counts["retryable"] else "running"
             )
             progress = {**counts, "remaining": remaining, "last_batch_attempted": batch_attempted}
-            scenario_count = connection.execute(
-                "SELECT COUNT(*) FROM supplier_catalog_scenarios WHERE run_id=?",
-                (run["staging_run_id"],),
-            ).fetchone()[0]
-            enriched_products = connection.execute(
-                """SELECT COUNT(*) FROM supplier_catalog_products
-                   WHERE run_id=? AND enrichment_status IN ('enriched','carried_forward')""",
-                (run["staging_run_id"],),
-            ).fetchone()[0]
+            scenario_count = counts["scenarios_written"]
+            enriched_products = counts["offers_success"]
         with self._write_transaction(
             operation="checkpoint_batch", bootstrap_run_id=bootstrap_run_id,
         ) as connection:
             connection.execute(
                 """UPDATE qogita_bootstrap_runs SET updated_at=?,status=?,
-                   completed_batches=completed_batches+1,products_attempted=?,fid_resolved=?,
-                   fid_failed=?,offers_success=?,offers_failed=?,scenarios_written=?,
+                   completed_batches=completed_batches+1,
                    product_link_requests=product_link_requests+?,
                    offers_requests=offers_requests+?,retry_count=retry_count+?,
                    rate_limit_count=rate_limit_count+?,server_error_count=server_error_count+?,
                    resolver_elapsed_seconds=resolver_elapsed_seconds+?,
                    offers_elapsed_seconds=offers_elapsed_seconds+?,
                    last_progress_json=? WHERE bootstrap_run_id=?""",
-                (now, status, counts["attempted"], counts["fid_resolved"], counts["fid_failed"],
-                 counts["offers_success"], counts["offers_failed"], counts["scenarios_written"],
-                 client_metrics["product_link_requests"], client_metrics["offers_requests"],
+                (now, status, client_metrics["product_link_requests"], client_metrics["offers_requests"],
                  client_metrics["retries"], client_metrics["http_429"], client_metrics["http_5xx"],
                  client_metrics["resolver_elapsed_seconds"], client_metrics["offers_elapsed_seconds"],
                  json_dumps(progress), bootstrap_run_id),
@@ -1598,18 +1691,7 @@ class QogitaBootstrapStore:
                 "SELECT * FROM qogita_bootstrap_runs WHERE bootstrap_run_id=?",
                 (bootstrap_run_id,),
             ).fetchone()
-            counts = dict(connection.execute(
-                """SELECT COUNT(*) selected,SUM(status<>'pending') attempted,
-                          SUM(variant_fid IS NOT NULL) fid_resolved,
-                          SUM(status IN ('resolver_retryable','resolver_permanent')) fid_failed,
-                          SUM(status='enriched') offers_success,
-                          SUM(status IN ('offers_retryable','offers_permanent','parsing_failure')) offers_failed,
-                          SUM(status IN ('resolver_retryable','offers_retryable')) retryable,
-                          SUM(status IN ('resolver_permanent','offers_permanent','parsing_failure')) terminal_failed,
-                          COALESCE(SUM(scenario_count),0) scenarios_written
-                     FROM qogita_bootstrap_products WHERE bootstrap_run_id=?""",
-                (bootstrap_run_id,),
-            ).fetchone())
+            counts = self._checkpoint_counts(run)
             remaining = counts["selected"] - counts["offers_success"] - counts["terminal_failed"]
             status = ("awaiting_promotion_review" if remaining == 0 and run["run_mode"] == "production"
                       else "completed" if remaining == 0 else (
@@ -1617,15 +1699,8 @@ class QogitaBootstrapStore:
             ))
             if run["status"] == "auto_stopped" and remaining:
                 status = "auto_stopped"
-            scenario_count = connection.execute(
-                "SELECT COUNT(*) FROM supplier_catalog_scenarios WHERE run_id=?",
-                (run["staging_run_id"],),
-            ).fetchone()[0]
-            enriched_products = connection.execute(
-                """SELECT COUNT(*) FROM supplier_catalog_products
-                   WHERE run_id=? AND enrichment_status IN ('enriched','carried_forward')""",
-                (run["staging_run_id"],),
-            ).fetchone()[0]
+            scenario_count = counts["scenarios_written"]
+            enriched_products = counts["offers_success"]
         claims = self.claim_summary(bootstrap_run_id, now=now)
         progress = {**counts, "remaining": remaining,
                     "last_batch_attempted": batch_attempted, "claims": claims}
@@ -1638,17 +1713,14 @@ class QogitaBootstrapStore:
         ) as connection:
             connection.execute(
                 """UPDATE qogita_bootstrap_runs SET updated_at=?,status=?,
-                   completed_batches=completed_batches+1,products_attempted=?,fid_resolved=?,
-                   fid_failed=?,offers_success=?,offers_failed=?,scenarios_written=?,worker_count=?,
+                   completed_batches=completed_batches+1,worker_count=?,
                    product_link_requests=?,offers_requests=?,retry_count=?,http_401_count=?,
                    auth_refresh_count=?,rate_limit_count=?,server_error_count=?,
                    resolver_elapsed_seconds=?,offers_elapsed_seconds=?,sqlite_busy_count=?,
                    transaction_retry_count=?,lock_wait_seconds=?,write_latency_seconds=?,
                    wal_peak_bytes=MAX(wal_peak_bytes,?),wall_elapsed_seconds=?,last_progress_json=?
                    WHERE bootstrap_run_id=?""",
-                (now, status, counts["attempted"], counts["fid_resolved"], counts["fid_failed"],
-                 counts["offers_success"], counts["offers_failed"], counts["scenarios_written"],
-                 worker_count, metrics.get("product_link_requests", 0),
+                (now, status, worker_count, metrics.get("product_link_requests", 0),
                  metrics.get("offers_requests", 0), metrics.get("retries", 0),
                  metrics.get("http_401", 0), metrics.get("auth_refreshes", 0),
                  metrics.get("http_429", 0), metrics.get("http_5xx", 0),
@@ -1673,6 +1745,8 @@ class QogitaBootstrapStore:
             raise ValueError("Production bootstrap not found")
         if run.get("status") != "auto_stopped":
             raise ValueError("Bootstrap is not auto-stopped")
+        self.reconcile_checkpoint_counters(bootstrap_run_id)
+        run = self.bootstrap(bootstrap_run_id)
         metrics = {
             "product_link_requests": run.get("product_link_requests", 0),
             "offers_requests": run.get("offers_requests", 0),

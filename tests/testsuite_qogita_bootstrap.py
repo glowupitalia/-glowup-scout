@@ -603,6 +603,54 @@ class QogitaBootstrapTests(unittest.TestCase):
         self.assertEqual(self.store.sqlite_metrics["lock_wait_seconds"], 10.25)
         self.assertEqual(self.store.sqlite_metrics["write_latency_seconds"], 20.5)
 
+    def test_checkpoint_uses_transactional_counters_and_recovery_reconciles(self):
+        run_id = self.staging(3)
+        bootstrap = self.store.create_bootstrap(run_id, target_count=3, batch_size=1)
+        run_qogita_bootstrap(
+            bootstrap["bootstrap_run_id"], store=self.store,
+            client=BootstrapFakeClient(), max_products=2,
+            product_link_pacing=0, offers_pacing=0, sleep_func=lambda _: None,
+        )
+        checkpoint = self.store.checkpoint_concurrent(
+            bootstrap["bootstrap_run_id"], metrics={}, worker_count=2,
+            batch_attempted=2, wall_elapsed_seconds=1,
+        )
+        self.assertEqual(checkpoint["offers_success"], 2)
+        self.assertEqual(checkpoint["scenarios_written"], 4)
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """UPDATE qogita_bootstrap_runs SET offers_success=0,
+                          scenarios_written=0 WHERE bootstrap_run_id=?""",
+                (bootstrap["bootstrap_run_id"],),
+            )
+        reconciled = self.store.reconcile_checkpoint_counters(
+            bootstrap["bootstrap_run_id"]
+        )
+        self.assertEqual(reconciled["offers_success"], 2)
+        self.assertEqual(reconciled["scenarios_written"], 4)
+
+    def test_hot_checkpoint_avoids_global_aggregate_scans(self):
+        run_id = self.staging(2)
+        bootstrap = self.store.create_bootstrap(run_id, target_count=2, batch_size=1)
+        statements = []
+        original_read = self.store._read_connection
+
+        @contextmanager
+        def traced_read():
+            with original_read() as connection:
+                connection.set_trace_callback(statements.append)
+                yield connection
+
+        self.store._read_connection = traced_read
+        self.store.checkpoint_concurrent(
+            bootstrap["bootstrap_run_id"], metrics={}, worker_count=2,
+            batch_attempted=0, wall_elapsed_seconds=0,
+        )
+        sql = "\n".join(statements).casefold()
+        self.assertNotIn("sum(status", sql)
+        self.assertNotIn("from supplier_catalog_scenarios", sql)
+        self.assertNotIn("from supplier_catalog_products", sql)
+
     def test_persist_offers_rolls_back_complete_product_on_error(self):
         run_id = self.staging(1)
         bootstrap = self.store.create_bootstrap(run_id, target_count=1, batch_size=1)
