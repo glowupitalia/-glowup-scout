@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from supplier_weekly import (
@@ -652,6 +652,67 @@ class WeeklyAdapterAsyncLifecycleTests(unittest.TestCase):
 
     def test_qudo_enumeration_enrichments_and_close_share_one_loop(self):
         self._assert_stable_lifecycle(QudoIncrementalAdapter)
+
+    def test_qudo_enrichment_forwards_authoritative_net_price_contract(self):
+        captured = []
+
+        class Response:
+            text = '<h2 class="qudo-ean">EAN: 8809562192770</h2>'
+
+            @staticmethod
+            def json():
+                return {"id": 45825}
+
+        class Client:
+            request_count = 0
+
+            async def _get(self, _path):
+                self.request_count += 1
+                return Response()
+
+            async def close(self):
+                return None
+
+        qudo_module = ModuleType("purchase_prices.qudo")
+        qudo_module.parse_product_page = lambda *_args, **_kwargs: object()
+        qudo_module.parse_store_offer = lambda *_args, **_kwargs: SimpleNamespace(
+            supplier_sku="QUDO-1", gtin="8809562192770",
+            supplier_product_id="11337", supplier_offer_id="45825",
+            product_name="Product", currency="EUR", net_unit_price="8.90",
+            price_basis="net_ex_vat", pricing_scope="public_catalog",
+            available_quantity=10, availability_status="in_stock",
+            minimum_product_quantity=1, selling_unit=1,
+            minimum_order_value="300", minimum_order_currency="EUR",
+            product_url="https://qudobeauty.com/product/example/",
+        )
+        adapter = QudoIncrementalAdapter(catalog_store=object())
+        adapter._client = Client()
+        product = {
+            "product_url": "https://qudobeauty.com/product/example/",
+            "variation_id": "45825", "product_id": "11337", "brand": "Brand",
+            "metadata": {"parent_contract": {"id": 11337, "variations": []}},
+        }
+
+        def normalize(rows, **_kwargs):
+            captured.extend(rows)
+            return ([{"scenarios": [{"scenario_id": "scenario-1"}]}], {})
+
+        with (
+            patch.dict(sys.modules, {"purchase_prices.qudo": qudo_module}),
+            patch("supplier_weekly_adapters.asyncio.sleep", return_value=None),
+            patch("supplier_weekly_adapters.normalize_qudo_candidates", side_effect=normalize),
+        ):
+            result = adapter.enrich_product(
+                canonical_product_key="key", product=product,
+                policy=SupplierRatePolicy(min_pacing_seconds=0),
+            )
+        adapter.close()
+
+        self.assertEqual(result["scenarios"], [{"scenario_id": "scenario-1"}])
+        self.assertEqual(captured[0]["unit_price"], "8.90")
+        self.assertEqual(captured[0]["price_basis"], "net_ex_vat")
+        self.assertEqual(captured[0]["pricing_scope"], "public_catalog")
+        self.assertEqual(captured[0]["source"], "qudo_woocommerce_store_api")
 
     def test_cleanup_failure_does_not_mask_primary_failure(self):
         class FailingAdapter:

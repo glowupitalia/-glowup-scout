@@ -20,6 +20,7 @@ from supplier_catalog import DEFAULT_DATABASE_PATH, SUPPORTED_SUPPLIERS, json_du
 
 PRODUCT_STATES = {
     "new", "changed", "unchanged", "removed", "unavailable", "identifier_unresolved",
+    "carry_forward", "quarantined",
 }
 ENRICHMENT_STATES = {
     "enrichment_pending", "enriched", "carried_forward", "enrichment_failed",
@@ -159,20 +160,120 @@ class SupplierIncrementalStore:
         """Materialize a small/medium completed generation for atomic publication."""
         self.initialize()
         with _connect(self.path) as connection:
-            products = [json.loads(row[0]) for row in connection.execute(
-                """SELECT version.payload_json FROM supplier_generation_product_refs ref
+            products = []
+            for row in connection.execute(
+                """SELECT version.payload_json,ref.product_state,ref.enrichment_state,
+                          ref.source_run_id
+                   FROM supplier_generation_product_refs ref
                    JOIN supplier_product_versions version
                      ON version.version_hash=ref.product_version_hash
-                   WHERE ref.run_id=? AND ref.product_state!='removed'
+                   WHERE ref.run_id=? AND ref.product_state NOT IN ('removed','quarantined')
                    ORDER BY ref.canonical_product_key""", (run_id,),
-            )]
-            scenarios = [json.loads(row[0]) for row in connection.execute(
-                """SELECT version.payload_json FROM supplier_generation_scenario_refs ref
+            ):
+                payload = json.loads(row["payload_json"])
+                if row["product_state"] == "carry_forward":
+                    payload["weekly_resolution"] = {
+                        "status": "carry_forward",
+                        "carried_forward": True,
+                        "source_generation": row["source_run_id"],
+                    }
+                products.append(payload)
+            scenarios = []
+            for row in connection.execute(
+                """SELECT version.payload_json,ref.carried_forward,ref.source_run_id,
+                          ref.source_enriched_at
+                   FROM supplier_generation_scenario_refs ref
                    JOIN supplier_scenario_versions version
                      ON version.version_hash=ref.scenario_version_hash
                    WHERE ref.run_id=? ORDER BY ref.scenario_id""", (run_id,),
-            )]
+            ):
+                payload = json.loads(row["payload_json"])
+                if row["carried_forward"]:
+                    payload["weekly_resolution"] = {
+                        "status": "carry_forward",
+                        "carried_forward": True,
+                        "source_generation": row["source_run_id"],
+                        "source_enriched_at": row["source_enriched_at"],
+                    }
+                scenarios.append(payload)
         return products, scenarios
+
+    def resolve_product_failure(self, run_id: str, supplier: str,
+                                canonical_product_key: str, *,
+                                previous_run_id: str | None,
+                                source_generation: str | None = None,
+                                category: str) -> str:
+        """Resolve one classified item without turning an item failure global.
+
+        A prior identity is reused only when the versioned reference bridge
+        contains that exact current key. Source conflicts are always
+        quarantined. Unknown categories are rejected fail-closed by callers.
+        """
+        clean = str(supplier or "").casefold()
+        self.initialize()
+        connection = _connect(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """SELECT * FROM supplier_generation_product_refs
+                   WHERE run_id=? AND supplier=? AND canonical_product_key=?""",
+                (run_id, clean, canonical_product_key),
+            ).fetchone()
+            if not current:
+                raise ValueError("Unknown generation product")
+            previous = None
+            if previous_run_id:
+                previous = connection.execute(
+                    """SELECT * FROM supplier_generation_product_refs
+                       WHERE run_id=? AND supplier=? AND canonical_product_key=?""",
+                    (previous_run_id, clean, canonical_product_key),
+                ).fetchone()
+            carry = category != "SOURCE_CONFLICT" and previous is not None
+            provenance = source_generation or previous_run_id
+            connection.execute(
+                "DELETE FROM supplier_generation_scenario_refs WHERE run_id=? AND canonical_product_key=?",
+                (run_id, canonical_product_key),
+            )
+            if carry:
+                connection.execute(
+                    """UPDATE supplier_generation_product_refs
+                       SET product_version_hash=?,product_state='carry_forward',
+                           enrichment_state='carried_forward',enrichment_observed_at=?,
+                           reconciliation_due_at=?,source_run_id=?
+                       WHERE run_id=? AND supplier=? AND canonical_product_key=?""",
+                    (previous["product_version_hash"], previous["enrichment_observed_at"],
+                     previous["reconciliation_due_at"], provenance,
+                     run_id, clean, canonical_product_key),
+                )
+                connection.execute(
+                    """INSERT INTO supplier_generation_scenario_refs
+                       (run_id,supplier,scenario_id,canonical_product_key,
+                        scenario_version_hash,enrichment_state,carried_forward,
+                        source_enriched_at,source_run_id)
+                       SELECT ?,supplier,scenario_id,canonical_product_key,
+                              scenario_version_hash,'carried_forward',1,
+                              source_enriched_at,?
+                       FROM supplier_generation_scenario_refs
+                       WHERE run_id=? AND supplier=? AND canonical_product_key=?""",
+                    (run_id, provenance, previous_run_id, clean, canonical_product_key),
+                )
+                resolution = "carry_forward"
+            else:
+                connection.execute(
+                    """UPDATE supplier_generation_product_refs
+                       SET product_state='quarantined',enrichment_state='unavailable',
+                           source_run_id=?
+                       WHERE run_id=? AND supplier=? AND canonical_product_key=?""",
+                    (provenance, run_id, clean, canonical_product_key),
+                )
+                resolution = "quarantined"
+            connection.commit()
+            return resolution
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def compose_generation(
         self, run_id: str, supplier: str, products: Iterable[dict[str, Any]], *,
@@ -321,18 +422,23 @@ class SupplierIncrementalStore:
         }
         with _connect(self.path) as connection:
             rows = connection.execute(
-                """SELECT * FROM supplier_generation_product_refs
-                   WHERE run_id=? AND product_state NOT IN ('removed','unavailable')""",
+                """SELECT ref.*,version.payload_json FROM supplier_generation_product_refs ref
+                   JOIN supplier_product_versions version
+                     ON version.version_hash=ref.product_version_hash
+                   WHERE ref.run_id=? AND ref.product_state NOT IN ('removed','unavailable')""",
                 (run_id,),
             ).fetchall()
         result = []
         for row in rows:
             value = dict(row)
             signal = value["enrichment_state"]
+            payload = json.loads(value.pop("payload_json"))
             if value["product_state"] in {"new", "changed", "identifier_unresolved"}:
                 signal = value["product_state"]
             if value.get("reconciliation_due_at") and value["reconciliation_due_at"] <= observed:
                 signal = "reconciliation_due"
+            if payload.get("weekly_recheck_required"):
+                signal = "enrichment_failed"
             value["queue_reason"] = signal
             value["priority"] = priority.get(signal, priority.get(value["product_state"], 0))
             result.append(value)

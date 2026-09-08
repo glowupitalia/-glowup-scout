@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS supplier_sync_work_items (
     last_progress TEXT,
     error_class TEXT,
     error_message TEXT,
+    failure_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL,
     PRIMARY KEY (run_id,supplier,canonical_product_key)
 );
@@ -183,6 +184,14 @@ class WeeklySupplierStore:
     def initialize(self) -> None:
         with _connect(self.path) as connection:
             connection.executescript(SCHEMA)
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(supplier_sync_work_items)")
+            }
+            if "failure_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE supplier_sync_work_items "
+                    "ADD COLUMN failure_json TEXT NOT NULL DEFAULT '{}'"
+                )
 
     def start_run(self, *, trigger_type: str, scheduled_at: str | None = None,
                   run_id: str | None = None) -> str:
@@ -362,15 +371,37 @@ class WeeklySupplierStore:
             return cursor.rowcount == 1
 
     def fail_item(self, run_id: str, supplier: str, key: str, worker_id: str, *,
-                  retryable: bool, error_class: str, error_message: str = "") -> bool:
+                  retryable: bool, error_class: str, error_message: str = "",
+                  failure: dict[str, Any] | None = None) -> bool:
         self.initialize()
         status = "pending" if retryable else "permanent_failure"
         with _connect(self.path) as connection:
             cursor = connection.execute(
                 """UPDATE supplier_sync_work_items SET work_status=?,error_class=?,error_message=?,
+                   failure_json=?,
                    claimed_by=NULL,lease_expires_at=NULL,updated_at=? WHERE run_id=? AND supplier=?
                    AND canonical_product_key=? AND work_status='claimed' AND claimed_by=?""",
-                (status, error_class, error_message[:500], utc_now(), run_id, supplier, key, worker_id),
+                (status, error_class, error_message[:500], json_dumps(failure or {}),
+                 utc_now(), run_id, supplier, key, worker_id),
+            )
+            return cursor.rowcount == 1
+
+    def resolve_item(self, run_id: str, supplier: str, key: str, worker_id: str, *,
+                     resolution: str, error_class: str, error_message: str,
+                     failure: dict[str, Any]) -> bool:
+        if resolution not in {"carry_forward", "quarantined"}:
+            raise ValueError("Unsupported weekly failure resolution")
+        self.initialize()
+        with _connect(self.path) as connection:
+            cursor = connection.execute(
+                """UPDATE supplier_sync_work_items
+                   SET work_status=?,last_progress=?,error_class=?,error_message=?,failure_json=?,
+                       claimed_by=NULL,lease_expires_at=NULL,updated_at=?
+                   WHERE run_id=? AND supplier=? AND canonical_product_key=?
+                     AND work_status='claimed' AND claimed_by=?""",
+                (resolution, f"failure_resolved:{resolution}", error_class,
+                 error_message[:500], json_dumps(failure), utc_now(),
+                 run_id, supplier, key, worker_id),
             )
             return cursor.rowcount == 1
 
@@ -497,6 +528,7 @@ class IncrementalWeeklyHandler:
                  enrich_product: Callable[..., list[dict[str, Any]]],
                  publish_generation: Callable[..., dict[str, Any]],
                  previous_run_id: Callable[[], str | None],
+                 failure_classifier: Callable[[BaseException, dict[str, Any]], dict[str, Any] | None] | None = None,
                  incremental_store: SupplierIncrementalStore | None = None,
                  batch_size: int = 100):
         if supplier not in WEEKLY_SUPPLIERS:
@@ -506,6 +538,7 @@ class IncrementalWeeklyHandler:
         self.enrich_product = enrich_product
         self.publish_generation = publish_generation
         self.previous_run_id = previous_run_id
+        self.failure_classifier = failure_classifier
         self.incremental = incremental_store or SupplierIncrementalStore()
         self.batch_size = batch_size
 
@@ -560,6 +593,7 @@ class IncrementalWeeklyHandler:
                 break
             for item in batch:
                 key = item["canonical_product_key"]
+                product = self.incremental.product_payload(generation_run_id, key)
                 if metrics["requests"] >= policy.max_requests_per_run:
                     work_store.fail_item(
                         run_id, self.supplier, key, worker, retryable=True,
@@ -570,7 +604,7 @@ class IncrementalWeeklyHandler:
                 try:
                     outcome = self.enrich_product(
                         canonical_product_key=key,
-                        product=self.incremental.product_payload(generation_run_id, key),
+                        product=product,
                         policy=policy,
                     )
                     scenarios = outcome.get("scenarios") if isinstance(outcome, dict) else outcome
@@ -606,12 +640,39 @@ class IncrementalWeeklyHandler:
                         bool(getattr(exc, "retryable", False))
                         and attempts <= policy.max_retries
                     )
-                    work_store.fail_item(
-                        run_id, self.supplier, key, worker, retryable=retryable,
-                        error_class=type(exc).__name__, error_message=str(exc),
+                    failure = (
+                        self.failure_classifier(exc, product)
+                        if self.failure_classifier and not retryable else None
                     )
+                    if failure:
+                        resolution = self.incremental.resolve_product_failure(
+                            generation_run_id, self.supplier, key,
+                            previous_run_id=previous_reference,
+                            source_generation=previous,
+                            category=str(failure["category"]),
+                        )
+                        failure = {
+                            **failure, "resolution": resolution,
+                            "current_weekly_run": run_id,
+                            "source_generation": previous,
+                        }
+                        work_store.resolve_item(
+                            run_id, self.supplier, key, worker,
+                            resolution=resolution,error_class=type(exc).__name__,
+                            error_message=str(exc),failure=failure,
+                        )
+                        consecutive_errors = 0
+                    else:
+                        work_store.fail_item(
+                            run_id, self.supplier, key, worker, retryable=retryable,
+                            error_class=type(exc).__name__, error_message=str(exc),
+                            failure={
+                                "category": "UNKNOWN", "reason_code": "unclassified_failure",
+                                "parser_source_version": "weekly_failure_policy_v1",
+                            } if not retryable else None,
+                        )
+                        consecutive_errors += 1
                     metrics["failures"] += 1
-                    consecutive_errors += 1
                     remote_status = getattr(exc, "remote_status", None)
                     if remote_status == 429 or getattr(exc, "code", None) == "rate_limited":
                         metrics["rate_limits"] += 1

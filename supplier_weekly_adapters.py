@@ -37,6 +37,57 @@ from qudo_discovery import normalize_qudo_candidates
 logger = logging.getLogger(__name__)
 
 UMMA_INCREMENTAL_IDENTITY_VERSION = "umma_product_option_v2"
+QUDO_INCREMENTAL_IDENTITY_VERSION = "qudo_product_variation_v2"
+QUDO_FAILURE_POLICY_VERSION = "qudo_product_quarantine_v1"
+
+
+class QudoWeeklyFailure(ValueError):
+    def __init__(self, message, *, category, reason_code, evidence=None):
+        super().__init__(message)
+        self.category = category
+        self.reason_code = reason_code
+        self.evidence = dict(evidence or {})
+
+
+def classify_qudo_weekly_failure(error, product):
+    message = str(error)
+    contracts = {
+        "Qudo variation price is invalid": ("PRICE_UNAVAILABLE", "variation_price_invalid"),
+        "Qudo product page expected GTIN is invalid": (
+            "IDENTIFIER_INVALID", "expected_gtin_invalid",
+        ),
+        "Qudo identifier unresolved": ("IDENTIFIER_INVALID", "identifier_unresolved"),
+        "Qudo JSON-LD GTIN does not match the requested product": (
+            "SOURCE_CONFLICT", "json_ld_gtin_mismatch",
+        ),
+    }
+    contract = contracts.get(message)
+    if not contract:
+        return None
+    category, reason_code = contract
+    evidence = dict(getattr(error, "evidence", {}) or {})
+    safe_evidence = {
+        key: evidence.get(key) for key in (
+            "raw_identifier", "expected_gtin", "observed_gtins", "marker_gtins",
+            "json_ld_gtins", "variation_price_minor", "currency_code",
+            "currency_minor_unit", "is_in_stock", "stock_quantity",
+        ) if evidence.get(key) is not None
+    }
+    return {
+        "category": category,
+        "reason_code": getattr(error, "reason_code", reason_code),
+        "failure_deterministic": True,
+        "source_product_identity": {
+            "supplier_product_id": product.get("supplier_product_id"),
+            "supplier_option_id": product.get("supplier_option_id"),
+        },
+        "availability": {
+            "index_purchasable": product.get("index_purchasable"),
+            "index_stock_signal": product.get("index_stock_signal"),
+        },
+        "evidence": safe_evidence,
+        "parser_source_version": QUDO_FAILURE_POLICY_VERSION,
+    }
 
 
 def _iso_now():
@@ -142,7 +193,7 @@ def _baseline_seed(store: SupplierCatalogStore, supplier: str,
         if key:
             scenarios_by_active_key.setdefault(key, []).append(scenario)
 
-    if supplier == "umma":
+    if supplier in {"umma", "qudo"}:
         def identity(row):
             product_id = str(row.get("supplier_product_id") or "")
             option_id = str(row.get("supplier_option_id") or "")
@@ -157,7 +208,9 @@ def _baseline_seed(store: SupplierCatalogStore, supplier: str,
         for row in current_products:
             stable_identity = identity(row)
             if stable_identity in current_by_identity:
-                raise RuntimeError("UMMA enumeration contains duplicate product/option identity")
+                raise RuntimeError(
+                    f"{supplier.upper()} enumeration contains duplicate product/option identity"
+                )
             current_by_identity[stable_identity] = row
 
         previous_products = []
@@ -184,6 +237,11 @@ def _baseline_seed(store: SupplierCatalogStore, supplier: str,
                 row["identifier_valid"] = bool(
                     row.get("canonical_gtin") or canonical_gtin14(row.get("canonical_ean"))
                 )
+                if supplier == "qudo" and any(
+                    (old.get("weekly_resolution") or {}).get("status") == "carry_forward"
+                    for old in aliases
+                ):
+                    row["weekly_recheck_required"] = True
             previous_products.append(row)
             seen_scenarios = set()
             for old in aliases:
@@ -564,12 +622,19 @@ class QudoIncrementalAdapter(_StableAsyncAdapter):
         for row in products:
             prior=old.get(row["canonical_product_key"])
             if prior:
-                for field in ("canonical_ean","canonical_gtin","identifier_type","raw_identifiers"):
+                for field in ("canonical_ean","canonical_gtin","identifier_type","raw_identifiers",
+                              "weekly_recheck_required"):
                     if prior.get(field): row[field]=prior[field]
                 row["identifier_valid"]=bool(row.get("canonical_gtin") or canonical_gtin14(row.get("canonical_ean")))
         retry, rate_limits, server_errors = self._telemetry.snapshot()
+        previous_meta = self.store.active_generation_metadata("qudo") or {}
+        previous_reference_run_id = (
+            f"{previous_meta['run_id']}:{QUDO_INCREMENTAL_IDENTITY_VERSION}"
+            if previous_meta.get("run_id") else None
+        )
         return {"products":products,"previous_products":previous_products,
                 "previous_scenarios_by_product":previous_scenarios,"pages":pages,
+                "previous_reference_run_id":previous_reference_run_id,
                 "requests":self._client.request_count,"retry":retry,
                 "rate_limits":rate_limits,"server_errors":server_errors,
                 "diagnostics":{"source_type":"woocommerce_store_api_light_index","source_count":total,
@@ -586,7 +651,14 @@ class QudoIncrementalAdapter(_StableAsyncAdapter):
         try:
             await asyncio.sleep(policy.min_pacing_seconds); page_response=await self._client._get(url)
             evidence=_qudo_page_identifier_evidence(page_response.text)
-            if len(evidence["selected_gtins"]) != 1: raise ValueError("Qudo identifier unresolved")
+            if len(evidence["selected_gtins"]) != 1:
+                raise QudoWeeklyFailure(
+                    "Qudo identifier unresolved", category="IDENTIFIER_INVALID",
+                    reason_code="identifier_unresolved", evidence={
+                        "marker_gtins": evidence["marker_gtins"],
+                        "json_ld_gtins": evidence["json_ld_gtins"],
+                    },
+                )
             gtin=evidence["selected_gtins"][0]
             page=parse_product_page(page_response.text,product_url=url,expected_gtin=gtin)
             await asyncio.sleep(policy.min_pacing_seconds)
@@ -602,10 +674,12 @@ class QudoIncrementalAdapter(_StableAsyncAdapter):
             "supplier_product_id":offer.supplier_product_id,"supplier_offer_id":offer.supplier_offer_id,
             "supplier_sku":offer.supplier_sku,"product_name":offer.product_name,"brand":product.get("brand"),
             "observed_at":observed,"currency":offer.currency,"unit_price":str(offer.net_unit_price),
+            "price_basis":offer.price_basis,"pricing_scope":offer.pricing_scope,
             "available_quantity":offer.available_quantity,"availability_status":offer.availability_status,
             "minimum_product_quantity":offer.minimum_product_quantity,"selling_unit":offer.selling_unit,
             "minimum_order_value":str(offer.minimum_order_value),"minimum_order_currency":offer.minimum_order_currency,
-            "product_url":offer.product_url,"identifier_source":evidence["identifier_source"]}
+            "product_url":offer.product_url,"identifier_source":evidence["identifier_source"],
+            "source":"qudo_woocommerce_store_api"}
         candidates,_=normalize_qudo_candidates([row],now=datetime.now(timezone.utc))
         scenarios=[scenario for candidate in candidates for scenario in candidate["scenarios"]]
         retry, rate_limits, server_errors = self._telemetry.delta(before_telemetry)
@@ -615,7 +689,7 @@ class QudoIncrementalAdapter(_StableAsyncAdapter):
             "identifier_type":"EAN" if len(gtin)==13 else "GTIN",
             "raw_identifiers":[{"value":v,"type":"HTML_MARKER"} for v in evidence["marker_gtins"]]+[
                 {"value":v,"type":"JSON_LD"} for v in evidence["json_ld_gtins"] if v not in evidence["marker_gtins"]],
-            "identifier_valid":True}}
+            "identifier_valid":True,"weekly_recheck_required":False}}
 
     def close(self):
         self._close_async_client()
@@ -629,6 +703,9 @@ def _make_handler(adapter):
             **kwargs, catalog_store=adapter.store,
         ),
         previous_run_id=adapter.previous_run_id,
+        failure_classifier=(
+            classify_qudo_weekly_failure if adapter.supplier == "qudo" else None
+        ),
     )
     def run(**kwargs):
         try:

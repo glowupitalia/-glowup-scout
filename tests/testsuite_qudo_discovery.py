@@ -102,9 +102,14 @@ class QudoAdapterTests(unittest.TestCase):
         self.assertEqual(scenario["supplier_offer_id"], "47062")
         self.assertEqual(scenario["supplier_sku"], "QUDO-HARU-15_1")
         self.assertEqual(scenario["cost_net_unit_eur"], Decimal("8"))
+        self.assertEqual(scenario["source_net_unit_price"], Decimal("8"))
         self.assertEqual(scenario["vat_rate"], Decimal("0.22"))
         self.assertEqual(scenario["vat_amount_unit"], Decimal("1.76"))
         self.assertEqual(scenario["cost_gross_unit_eur"], Decimal("9.76"))
+        self.assertEqual(
+            scenario["cost_gross_unit_eur"],
+            scenario["source_net_unit_price"] * (Decimal("1") + scenario["vat_rate"]),
+        )
         self.assertEqual(scenario["stock"], 309)
         self.assertEqual(scenario["minimum_product_quantity"], 1)
         self.assertEqual(scenario["selling_unit"], 1)
