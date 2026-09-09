@@ -25,6 +25,7 @@ DEFAULT_REFERRAL_RATE = Decimal("0.19")
 TARGET_MARGINS = (15, 20, 25)
 FEE_BATCH_SIZE = 20
 FEE_BATCH_INTERVAL_SECONDS = 2.0
+DISCOVERY_REFERENCE_PRICE_POLICY = "lowest_available_landed"
 
 RESULT_COLUMNS = [
     "EAN",
@@ -181,20 +182,32 @@ def money_value(value):
 
 
 def select_reference_price(pricing):
-    """Select the positive landed price used by fees and economics."""
+    """Select the lowest positive landed price used by Discovery economics.
+
+    Source order is only a deterministic tie-break for the displayed basis; it
+    never overrides a lower numeric price.
+    """
     pricing = pricing or {}
-    candidates = (
-        ("buy_box", pricing.get("Buy Box Amount")),
-        ("buy_box", pricing.get("Buy Box")),
-        ("min_fba", pricing.get("Prezzo minimo FBA Amount")),
-        ("min_fba", pricing.get("Prezzo minimo FBA")),
-        ("min_fbm", pricing.get("Prezzo minimo FBM Amount")),
-        ("min_fbm", pricing.get("Prezzo minimo FBM")),
+    sources = (
+        ("buy_box", ("Buy Box Amount", "Buy Box", "buy_box_price")),
+        ("min_fba", ("Prezzo minimo FBA Amount", "Prezzo minimo FBA", "min_fba_price")),
+        ("min_fbm", ("Prezzo minimo FBM Amount", "Prezzo minimo FBM", "min_fbm_price")),
     )
-    for source, raw_price in candidates:
-        price = to_decimal(raw_price)
-        if price is not None and price > 0:
-            return price, source
+    candidates = []
+    for tie_break, (source, keys) in enumerate(sources):
+        for key in keys:
+            price = money_value(pricing.get(key))
+            if price is not None and price > 0:
+                candidates.append((price, tie_break, source))
+                break
+        if not any(row[2] == source for row in candidates):
+            legacy_source = str(pricing.get("price_source") or "")
+            price = money_value(pricing.get("reference_price"))
+            if legacy_source == source and price is not None and price > 0:
+                candidates.append((price, tie_break, source))
+    if candidates:
+        price, _, source = min(candidates)
+        return price, source
     return None, "missing_price"
 
 

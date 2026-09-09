@@ -18,6 +18,7 @@ from discovery import (
     _sync_observation_fee_fields,
     fee_coverage,
 )
+from batch_analysis import DISCOVERY_REFERENCE_PRICE_POLICY
 from discovery_incremental import (
     DiscoveryIncrementalStore,
     LightweightCheckpointStore,
@@ -287,6 +288,8 @@ def run_incremental_discovery(
                 "seller_count_source": pricing.get("Seller count source"),
                 "reference_price": pricing.get("reference_price"),
                 "price_source": pricing.get("price_source"),
+                "reference_price_policy": DISCOVERY_REFERENCE_PRICE_POLICY,
+                "buy_box_price": pricing.get("Buy Box Amount"),
                 "min_fba_price": pricing.get("Prezzo minimo FBA Amount"),
                 "min_fbm_price": pricing.get("Prezzo minimo FBM Amount"),
             }

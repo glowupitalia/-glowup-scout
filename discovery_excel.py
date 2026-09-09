@@ -24,29 +24,29 @@ from purchase_scenarios import (
 
 OPPORTUNITY_COLUMNS = [
     "EAN", "Brand", "Titolo", "Fornitore", "Scenario", "Requisito", "Costo",
-    "ASIN raccomandato", "BSR Beauty", "Prezzo riferimento", "Venditori FBA", "Venditori totali",
+    "ASIN raccomandato", "BSR Beauty", "Prezzo usato per margine", "Venditori FBA", "Venditori totali",
     "Margine attuale %", "Utile €", "Prezzo 15%", "Prezzo 20%", "Prezzo 25%",
     "Score", "Opportunità", "Numero scenari acquisto", "Numero pagine Amazon",
     "Link Offerte Amazon",
 ]
 SCENARIO_COLUMNS = [
     "EAN", "Brand", "Titolo", "ASIN", "Fornitore", "Seller alias", "Scenario",
-    "Requisito", "Costo", "Prezzo riferimento", "BSR Beauty", "Venditori FBA",
+    "Requisito", "Costo", "Prezzo usato per margine", "BSR Beauty", "Venditori FBA",
     "Venditori totali", "Margine attuale %", "Utile €", "Prezzo 15%", "Prezzo 20%",
     "Prezzo 25%", "Score", "Opportunità", "Ruolo", "Stato", "Stock",
     "Lead time / Snapshot / freshness", "Warehouse", "Disponibilità",
 ]
 TECHNICAL_COLUMNS = [
-    "ObservationRowID", "ProductRowID", "ASIN", "BSR Beauty", "Prezzo riferimento",
+    "ObservationRowID", "ProductRowID", "ASIN", "BSR Beauty", "Prezzo usato per margine",
     "Venditori FBA", "Venditori totali", "FBA fee netta",
     "FBA fee IVA inclusa", "Referral Fee", "Referral rate",
-    "Referral source", "Price source", "Seller count source", "Observed at",
-    "Prezzo minimo FBA", "Prezzo minimo FBM",
+    "Referral source", "Basis prezzo margine", "Seller count source", "Observed at",
+    "Prezzo minimo FBA", "Prezzo minimo FBM", "Buy Box", "Policy prezzo margine",
 ]
 ALL_RESULTS_COLUMNS = [
     "EAN", "Brand", "Titolo", "Fornitori disponibili",
     "Numero scenari acquisto", "ASIN", "Titolo Amazon", "Compatibility",
-    "Beauty", "BSR Beauty", "Prezzo riferimento", "Origine prezzo",
+    "Beauty", "BSR Beauty", "Prezzo usato per margine", "Basis prezzo margine",
     "Min FBA", "Min FBM", "Venditori FBA", "Venditori totali",
     "Miglior costo disponibile", "Miglior margine disponibile %",
     "Score migliore disponibile", "Stato", "Motivo esclusione",
@@ -56,7 +56,7 @@ LISTING_COLUMNS = [
     "EAN", "ASIN", "Titolo Amazon", "Brand Amazon",
     "Compatibility status", "Compatibility reason", "Beauty",
     "Display group", "BSR Beauty", "Catalog status", "Buy Box", "Min FBA",
-    "Min FBM", "Price source", "Venditori FBA", "Venditori totali",
+    "Min FBM", "Basis prezzo margine", "Venditori FBA", "Venditori totali",
     "Pricing status", "Competition status", "Fee status", "Fee attempts",
     "Exclusion reason", "Link Amazon",
 ]
@@ -76,6 +76,22 @@ def _value(value):
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
+
+
+def _price_basis_label(value):
+    return {
+        "buy_box": "Buy Box",
+        "min_fba": "FBA",
+        "min_fbm": "FBM",
+        "missing_price": "Non disponibile",
+    }.get(str(value or ""), str(value or ""))
+
+
+def _buy_box_price(value):
+    explicit = value.get("buy_box_price")
+    if explicit is not None:
+        return explicit
+    return value.get("reference_price") if value.get("price_source") == "buy_box" else None
 
 
 def _hyperlink_formula(url):
@@ -776,7 +792,7 @@ def write_discovery_excel(results, output_file, *, progress=None):
                     listing.get("compatibility_status"),
                     "Sì" if listing.get("beauty_status") == "display_group_beauty" else "No",
                     listing.get("bsr_beauty"), _excel_number(listing.get("reference_price")),
-                    listing.get("price_source"), _excel_number(listing.get("min_fba_price")),
+                    _price_basis_label(listing.get("price_source")), _excel_number(listing.get("min_fba_price")),
                     _excel_number(listing.get("min_fbm_price")), listing.get("fba_sellers"),
                     listing.get("total_sellers"), _excel_number(_best_cost(product)),
                     (_value(_as_decimal((best or {}).get("margin_percent")) / Decimal("100"))
@@ -788,10 +804,7 @@ def write_discovery_excel(results, output_file, *, progress=None):
                     f"https://www.amazon.it/gp/offer-listing/{listing.get('asin')}"
                     if listing.get("asin") else None
                 )
-                buy_box = (
-                    listing.get("reference_price")
-                    if listing.get("price_source") == "buy_box" else listing.get("buy_box_price")
-                )
+                buy_box = _buy_box_price(listing)
                 listings_ws.append([
                     _product_ean(product), listing.get("asin"), listing.get("title"),
                     listing.get("brand"), listing.get("compatibility_status"),
@@ -800,7 +813,7 @@ def write_discovery_excel(results, output_file, *, progress=None):
                     listing.get("display_group"), listing.get("bsr_beauty"),
                     listing.get("catalog_status"), _excel_number(buy_box),
                     _excel_number(listing.get("min_fba_price")), _excel_number(listing.get("min_fbm_price")),
-                    listing.get("price_source"), listing.get("fba_sellers"),
+                    _price_basis_label(listing.get("price_source")), listing.get("fba_sellers"),
                     listing.get("total_sellers"), listing.get("pricing_status"),
                     listing.get("competition_status"), listing.get("fee_status"),
                     listing.get("fee_attempts"),
@@ -816,10 +829,12 @@ def write_discovery_excel(results, output_file, *, progress=None):
                 _excel_number(fee.get("fba_fee_gross")), _excel_number(fee.get("referral_fee")),
                 _excel_number(observation.get("referral_rate") or fee.get("referral_rate")),
                 observation.get("referral_source"),
-                observation.get("price_source"), observation.get("seller_count_source"),
+                _price_basis_label(observation.get("price_source")), observation.get("seller_count_source"),
                 observation.get("observed_at"),
                 _excel_number(observation.get("min_fba_price")),
                 _excel_number(observation.get("min_fbm_price")),
+                _excel_number(_buy_box_price(observation)),
+                observation.get("reference_price_policy") or "lowest_available_landed",
             ])
         for label, value in _run_metadata(state, candidates, final_products):
             run_ws.append([label, _value(value)])
@@ -1004,10 +1019,12 @@ def write_discovery_operational_excel(results, output_file, *, progress=None):
                 _excel_number(fee.get("fba_fee_gross")),
                 _excel_number(fee.get("referral_fee")),
                 _excel_number(observation.get("referral_rate") or fee.get("referral_rate")),
-                observation.get("referral_source"), observation.get("price_source"),
+                observation.get("referral_source"), _price_basis_label(observation.get("price_source")),
                 observation.get("seller_count_source"), observation.get("observed_at"),
                 _excel_number(observation.get("min_fba_price")),
                 _excel_number(observation.get("min_fbm_price")),
+                _excel_number(_buy_box_price(observation)),
+                observation.get("reference_price_policy") or "lowest_available_landed",
             ])
 
         last_data_row = max(2, len(observations) + 1)
@@ -1346,7 +1363,7 @@ def _write_incremental_discovery_excel(
                     _supplier_names(product), len(product.get("scenarios") or []),
                     listing.get("asin"), listing.get("title"), listing.get("compatibility_status"),
                     "Sì" if listing.get("beauty_status") == "display_group_beauty" else "No",
-                    listing.get("bsr_beauty"), listing.get("reference_price"), listing.get("price_source"),
+                    listing.get("bsr_beauty"), listing.get("reference_price"), _price_basis_label(listing.get("price_source")),
                     listing.get("min_fba_price"), listing.get("min_fbm_price"), listing.get("fba_sellers"),
                     listing.get("total_sellers"), _best_cost(product),
                     (_as_decimal((best or {}).get("margin_percent")) / Decimal("100")
@@ -1357,14 +1374,14 @@ def _write_incremental_discovery_excel(
                     integer_columns=(5, 10, 15, 16, 19), text_columns=(1, 6))
                 listing_row += 1
                 link = f"https://www.amazon.it/gp/offer-listing/{listing.get('asin')}" if listing.get("asin") else None
-                buy_box = listing.get("reference_price") if listing.get("price_source") == "buy_box" else listing.get("buy_box_price")
+                buy_box = _buy_box_price(listing)
                 _stream_append(listings_ws, [
                     _product_ean(product), listing.get("asin"), listing.get("title"), listing.get("brand"),
                     listing.get("compatibility_status"), _detail_text(listing.get("compatibility_reason")),
                     "Sì" if listing.get("beauty_status") == "display_group_beauty" else "No",
                     listing.get("display_group"), listing.get("bsr_beauty"), listing.get("catalog_status"),
                     buy_box, listing.get("min_fba_price"), listing.get("min_fbm_price"),
-                    listing.get("price_source"), listing.get("fba_sellers"), listing.get("total_sellers"),
+                    _price_basis_label(listing.get("price_source")), listing.get("fba_sellers"), listing.get("total_sellers"),
                     listing.get("pricing_status"), listing.get("competition_status"), listing.get("fee_status"),
                     listing.get("fee_attempts"), listing.get("exclusion_reason") or reason, link,
                 ], currency_columns=(11, 12, 13), integer_columns=(9, 15, 16, 20),
@@ -1380,10 +1397,12 @@ def _write_incremental_discovery_excel(
                 observation.get("reference_price"), observation.get("fba_sellers"),
                 observation.get("total_sellers"), fee.get("fba_fee_net"), fee.get("fba_fee_gross"),
                 fee.get("referral_fee"), observation.get("referral_rate") or fee.get("referral_rate"),
-                observation.get("referral_source"), observation.get("price_source"),
+                observation.get("referral_source"), _price_basis_label(observation.get("price_source")),
                 observation.get("seller_count_source"), observation.get("observed_at"),
                 observation.get("min_fba_price"), observation.get("min_fbm_price"),
-            ], text_columns=(1, 2, 3), currency_columns=(5, 8, 9, 10, 16, 17),
+                _buy_box_price(observation),
+                observation.get("reference_price_policy") or "lowest_available_landed",
+            ], text_columns=(1, 2, 3), currency_columns=(5, 8, 9, 10, 16, 17, 18),
                 percent_columns=(11,), integer_columns=(4, 6, 7))
         for label, value in _run_metadata(state, candidates, final_products):
             _stream_append(run_ws, [label, value])

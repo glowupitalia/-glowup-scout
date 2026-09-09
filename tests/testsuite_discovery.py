@@ -18,6 +18,8 @@ from batch_analysis import opportunity_score
 from discovery import (
     DISCOVERY_SCHEMA_VERSION,
     DiscoveryCheckpointStore,
+    _build_amazon_observations,
+    _evaluate_product_combinations,
     _fee_element_retry_delay,
     _fees_batch_with_retry,
     classify_product_fee_entry,
@@ -78,6 +80,78 @@ class FakeResponse:
             response.status_code = self.status_code
             raise requests.HTTPError(response=response)
 
+
+class DiscoveryReferencePricePolicyTests(unittest.TestCase):
+    @staticmethod
+    def product(*, reference, source, buy_box, min_fba, min_fbm, cost="4"):
+        return {
+            "product_key": "product-real-biodance",
+            "gtin": "8809891186655",
+            "canonical_ean": "8809891186655",
+            "scenarios": [{
+                "scenario_id": "scenario-1",
+                "supplier": "qogita",
+                "scenario_label": "MOV EUR 500",
+                "cost_gross_unit_eur": Decimal(cost),
+            }],
+            "amazon_listings": [{
+                "listing_id": "listing-1",
+                "amazon_observation_id": "legacy-observation",
+                "marketplace": "IT",
+                "asin": "B0GD6R7CFJ",
+                "title": "BIODANCE Patch Occhi 60 pezzi",
+                "brand": "BIODANCE",
+                "bsr_beauty": 1000,
+                "reference_price": Decimal(reference),
+                "price_source": source,
+                "buy_box_price": Decimal(buy_box) if buy_box is not None else None,
+                "min_fba_price": Decimal(min_fba) if min_fba is not None else None,
+                "min_fbm_price": Decimal(min_fbm) if min_fbm is not None else None,
+                "fba_sellers": 1,
+                "total_sellers": 2,
+                "seller_count_source": "summary_number_of_offers",
+                "competition_status": "passed",
+            }],
+        }
+
+    def test_real_biodance_cached_price_is_reselected_to_fbm(self):
+        product = self.product(
+            reference="45.18", source="min_fba", buy_box=None,
+            min_fba="45.18", min_fbm="44.80",
+        )
+        observation = _build_amazon_observations([product])[0]
+        self.assertEqual(observation["reference_price"], Decimal("44.80"))
+        self.assertEqual(observation["price_source"], "min_fbm")
+        self.assertEqual(
+            observation["reference_price_policy"], "lowest_available_landed"
+        )
+
+    def test_margin_gate_uses_lowest_landed_winner(self):
+        product = self.product(
+            reference="50", source="buy_box", buy_box="50",
+            min_fba="45", min_fbm="10",
+        )
+        observation = _build_amazon_observations([product])[0]
+        observation.update({
+            "fee_status": "valid",
+            "fee_estimate": {
+                "fba_fee_gross": Decimal("4"),
+                "referral_fee": Decimal("1.5"),
+                "referral_rate": Decimal("0.15"),
+            },
+        })
+        passed = _evaluate_product_combinations(
+            product, {observation["observation_id"]: observation}, 15
+        )
+        self.assertFalse(passed)
+        self.assertEqual(
+            product["opportunity_combinations"][0]["price_reference"],
+            Decimal("10"),
+        )
+        self.assertEqual(
+            product["opportunity_combinations"][0]["evaluation_status"],
+            "margin_below_threshold",
+        )
 
 def qogita_row(
     gtin="8801234567890", *, price="10", mov="100", stock=5,
@@ -773,15 +847,15 @@ class AmazonDiscoveryTests(unittest.TestCase):
         self.assertEqual(parsed["Venditori FBA"], 3)
         self.assertEqual(parsed["Venditori totali"], 7)
         self.assertEqual(parsed["Seller count source"], "summary_number_of_offers")
-        self.assertEqual(parsed["reference_price"], Decimal("20"))
-        self.assertEqual(parsed["price_source"], "min_fba")
+        self.assertEqual(parsed["reference_price"], Decimal("18"))
+        self.assertEqual(parsed["price_source"], "min_fbm")
 
         entries[0]["body"]["payload"]["Summary"]["BuyBoxPrices"] = [{
             "LandedPrice": {"Amount": 25, "CurrencyCode": "EUR"}
         }]
         parsed = parse_item_offers_batch(entries)["B000000001"]
-        self.assertEqual(parsed["reference_price"], Decimal("25"))
-        self.assertEqual(parsed["price_source"], "buy_box")
+        self.assertEqual(parsed["reference_price"], Decimal("18"))
+        self.assertEqual(parsed["price_source"], "min_fbm")
 
     def test_retry_429_and_token_renewal_after_401(self):
         tokens = iter(["first", "second"])
@@ -2228,6 +2302,10 @@ class DiscoveryExcelTests(unittest.TestCase):
             "amazon_observation": {
                 "asin": "B000000001", "amazon_brand": "Brand", "amazon_title": "Crema",
                 "bsr_beauty": 5000, "reference_price": Decimal("30"),
+                "buy_box_price": Decimal("30"),
+                "min_fba_price": Decimal("31"),
+                "min_fbm_price": Decimal("32"),
+                "reference_price_policy": "lowest_available_landed",
                 "fba_sellers": 2, "total_sellers": 4,
                 "price_source": "buy_box", "seller_count_source": "summary_number_of_offers",
                 "observed_at": "2026-08-20T12:00:00Z",
@@ -2259,6 +2337,20 @@ class DiscoveryExcelTests(unittest.TestCase):
             self.assertEqual(
                 [scenarios.cell(1, col).value for col in range(1, len(SCENARIO_COLUMNS) + 1)],
                 SCENARIO_COLUMNS,
+            )
+            self.assertEqual(opportunity["J1"].value, "Prezzo usato per margine")
+            data_headers = [cell.value for cell in workbook["Dati"][1]]
+            self.assertEqual(
+                data_headers[-4:],
+                ["Prezzo minimo FBA", "Prezzo minimo FBM", "Buy Box", "Policy prezzo margine"],
+            )
+            self.assertEqual(
+                workbook["Dati"].cell(2, data_headers.index("Buy Box") + 1).value,
+                30,
+            )
+            self.assertEqual(
+                workbook["Dati"].cell(2, data_headers.index("Basis prezzo margine") + 1).value,
+                "Buy Box",
             )
             self.assertEqual(scenarios.max_row, 6)
             for column in ("W", "X", "Y", "Z"):

@@ -1564,7 +1564,8 @@ class DiscoveryIncrementalStore:
         """Copy an already committed ASIN result to pending duplicate listings."""
         pricing_fields = (
             "pricing_status", "fba_sellers", "total_sellers", "seller_count_source",
-            "reference_price", "price_source", "min_fba_price", "min_fbm_price",
+            "reference_price", "price_source", "reference_price_policy",
+            "buy_box_price", "min_fba_price", "min_fbm_price",
         )
         observed = _now()
         with self._connect() as connection:
@@ -2231,6 +2232,7 @@ def prepare_incremental_job(
                                 for key in (
                                     "pricing_status", "fba_sellers", "total_sellers",
                                     "seller_count_source", "reference_price", "price_source",
+                                    "reference_price_policy", "buy_box_price",
                                     "min_fba_price", "min_fbm_price", "competition_status",
                                     "pricing_observed_at", "competition_observed_at",
                                 ):

@@ -18,6 +18,7 @@ from uuid import uuid4
 import requests
 
 from batch_analysis import (
+    DISCOVERY_REFERENCE_PRICE_POLICY,
     ProductFeeParseError,
     bsr_points,
     calculate_economics,
@@ -26,6 +27,7 @@ from batch_analysis import (
     opportunity_score,
     parse_product_fee_result,
     total_seller_points,
+    select_reference_price,
 )
 from purchase_scenarios import (
     AmazonObservation,
@@ -1070,7 +1072,12 @@ def _build_amazon_observations(products, marketplace="IT"):
                 product["amazon_listings"] = listings
         for listing in listings:
             asin = str(listing.get("asin") or "")
-            reference_price = listing.get("reference_price")
+            reference_price, price_source = select_reference_price(listing)
+            listing.update({
+                "reference_price": reference_price,
+                "price_source": price_source,
+                "reference_price_policy": DISCOVERY_REFERENCE_PRICE_POLICY,
+            })
             if (
                 not asin or reference_price is None
                 or listing.get("competition_status") not in {None, "passed"}
@@ -1093,6 +1100,14 @@ def _build_amazon_observations(products, marketplace="IT"):
                     fba_sellers=int(listing["fba_sellers"]),
                     total_sellers=int(listing["total_sellers"]),
                     seller_count_source=str(listing.get("seller_count_source") or ""),
+                    reference_price_policy=DISCOVERY_REFERENCE_PRICE_POLICY,
+                    buy_box_price=(
+                        Decimal(str(listing["buy_box_price"]))
+                        if listing.get("buy_box_price") is not None else (
+                            Decimal(str(reference_price))
+                            if price_source == "buy_box" else None
+                        )
+                    ),
                     min_fba_price=(
                         Decimal(str(listing["min_fba_price"]))
                         if listing.get("min_fba_price") is not None else None
@@ -2118,6 +2133,8 @@ def run_discovery(
                         "seller_count_source": pricing.get("Seller count source"),
                         "reference_price": pricing.get("reference_price"),
                         "price_source": pricing.get("price_source"),
+                        "reference_price_policy": DISCOVERY_REFERENCE_PRICE_POLICY,
+                        "buy_box_price": pricing.get("Buy Box Amount"),
                         "min_fba_price": pricing.get("Prezzo minimo FBA Amount"),
                         "min_fbm_price": pricing.get("Prezzo minimo FBM Amount"),
                     })

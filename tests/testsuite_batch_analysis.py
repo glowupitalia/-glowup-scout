@@ -424,23 +424,23 @@ class BatchAnalysisTests(unittest.TestCase):
         )
         return result.iloc[0], captured_candidates
 
-    def test_buy_box_has_priority_as_reference_price(self):
+    def test_lowest_available_landed_wins_regardless_of_legacy_priority(self):
         row, candidates = self.run_reference_price_case({
             "Buy Box Amount": 20,
             "Prezzo minimo FBA Amount": 18,
             "Prezzo minimo FBM Amount": 17,
         })
-        self.assertEqual(row["Prezzo riferimento"], 20)
-        self.assertEqual(row["_Price source"], "buy_box")
-        self.assertEqual(candidates[0]["price"], 20)
+        self.assertEqual(row["Prezzo riferimento"], 17)
+        self.assertEqual(row["_Price source"], "min_fbm")
+        self.assertEqual(candidates[0]["price"], 17)
 
-    def test_lowest_fba_is_used_without_buy_box(self):
+    def test_fbm_wins_without_buy_box_when_lower_than_fba(self):
         price, source = select_reference_price({
             "Prezzo minimo FBA Amount": 14.25,
             "Prezzo minimo FBM Amount": 12,
         })
-        self.assertEqual(price, Decimal("14.25"))
-        self.assertEqual(source, "min_fba")
+        self.assertEqual(price, Decimal("12"))
+        self.assertEqual(source, "min_fbm")
 
     def test_lowest_of_multiple_fba_landed_prices_is_propagated(self):
         row, candidates = self.run_reference_price_case({
@@ -448,9 +448,9 @@ class BatchAnalysisTests(unittest.TestCase):
             "Prezzo minimo FBA Amount": min(18.5, 16.25, 17.0),
             "Prezzo minimo FBM Amount": 15,
         })
-        self.assertEqual(row["Prezzo riferimento"], 16.25)
-        self.assertEqual(row["_Price source"], "min_fba")
-        self.assertEqual(candidates[0]["price"], 16.25)
+        self.assertEqual(row["Prezzo riferimento"], 15)
+        self.assertEqual(row["_Price source"], "min_fbm")
+        self.assertEqual(candidates[0]["price"], 15)
 
     def test_fbm_is_used_only_when_buy_box_and_fba_are_missing(self):
         row, candidates = self.run_reference_price_case({
@@ -462,13 +462,58 @@ class BatchAnalysisTests(unittest.TestCase):
         self.assertEqual(row["_Price source"], "min_fbm")
         self.assertEqual(candidates[0]["price"], 13.75)
 
-    def test_fba_has_priority_even_when_fbm_is_cheaper(self):
+    def test_fbm_wins_when_it_is_cheaper_than_fba(self):
         price, source = select_reference_price({
             "Prezzo minimo FBA Amount": 17,
             "Prezzo minimo FBM Amount": 12,
         })
-        self.assertEqual(price, Decimal("17"))
+        self.assertEqual(price, Decimal("12"))
+        self.assertEqual(source, "min_fbm")
+
+    def test_buy_box_wins_when_it_is_lowest(self):
+        price, source = select_reference_price({
+            "Buy Box Amount": 10,
+            "Prezzo minimo FBA Amount": 11,
+            "Prezzo minimo FBM Amount": 12,
+        })
+        self.assertEqual(price, Decimal("10"))
+        self.assertEqual(source, "buy_box")
+
+    def test_fba_wins_when_it_is_lowest(self):
+        price, source = select_reference_price({
+            "Buy Box Amount": 12,
+            "Prezzo minimo FBA Amount": 10,
+            "Prezzo minimo FBM Amount": 11,
+        })
+        self.assertEqual(price, Decimal("10"))
         self.assertEqual(source, "min_fba")
+
+    def test_tie_uses_legacy_source_order_for_label_only(self):
+        price, source = select_reference_price({
+            "Buy Box Amount": 10,
+            "Prezzo minimo FBA Amount": 10,
+            "Prezzo minimo FBM Amount": 10,
+        })
+        self.assertEqual(price, Decimal("10"))
+        self.assertEqual(source, "buy_box")
+
+    def test_sub_cent_float_noise_does_not_change_the_winner(self):
+        price, source = select_reference_price({
+            "Buy Box Amount": 20.69,
+            "Prezzo minimo FBM Amount": 20.689999999999998,
+        })
+        self.assertEqual(price, Decimal("20.69"))
+        self.assertEqual(source, "buy_box")
+
+    def test_legacy_cached_listing_is_reselected_without_new_api_data(self):
+        price, source = select_reference_price({
+            "reference_price": 45.18,
+            "price_source": "min_fba",
+            "min_fba_price": 45.18,
+            "min_fbm_price": 44.80,
+        })
+        self.assertEqual(price, Decimal("44.8"))
+        self.assertEqual(source, "min_fbm")
 
     def test_missing_or_non_positive_prices_skip_fees_and_economics(self):
         row, candidates = self.run_reference_price_case({

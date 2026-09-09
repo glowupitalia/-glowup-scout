@@ -481,9 +481,9 @@ class MultiListingPipelineTests(unittest.TestCase):
                 {"B0CVFPT7FC"},
             )
             self.assertEqual(
-                calls["fees"],
-                [["B0CVFPT7FC", "B0DL92QM79"], ["B0DL92QM79"], ["B0DL92QM79"]],
+                set(calls["fees"][0]), {"B0CVFPT7FC", "B0DL92QM79"}
             )
+            self.assertEqual(calls["fees"][1:], [["B0DL92QM79"], ["B0DL92QM79"]])
             resumed_calls = []
 
             def resumed_fees(requests_, _token):
@@ -529,7 +529,10 @@ class MultiListingPipelineTests(unittest.TestCase):
         self.assertFalse(combinations["I2"].protection.locked)
         self.assertIn("MATCH($AC2,'Dati'!$A$2:$A$3,0)", combinations["N2"].value)
         headers = [cell.value for cell in data[1]]
-        self.assertEqual(headers[-2:], ["Prezzo minimo FBA", "Prezzo minimo FBM"])
+        self.assertEqual(
+            headers[-4:],
+            ["Prezzo minimo FBA", "Prezzo minimo FBM", "Buy Box", "Policy prezzo margine"],
+        )
         self.assertEqual(data.cell(2, headers.index("Prezzo minimo FBA") + 1).value, 29)
         self.assertEqual(data.cell(2, headers.index("Prezzo minimo FBM") + 1).value, 28)
 

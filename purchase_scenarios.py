@@ -120,6 +120,8 @@ class AmazonObservation:
     fba_sellers: int
     total_sellers: int
     seller_count_source: str
+    reference_price_policy: str = "lowest_available_landed"
+    buy_box_price: Decimal | None = None
     min_fba_price: Decimal | None = None
     min_fbm_price: Decimal | None = None
     fba_fee_net: Decimal | None = None
@@ -468,7 +470,7 @@ def normalize_amazon_listing(value: dict) -> dict:
     if not isinstance(value, dict):
         return value
     for field_name in (
-        "volume_value", "reference_price", "min_fba_price", "min_fbm_price",
+        "volume_value", "reference_price", "buy_box_price", "min_fba_price", "min_fbm_price",
     ):
         _normalize_decimal_field(value, field_name, "AmazonListing")
     for field_name in (
@@ -484,7 +486,7 @@ def normalize_amazon_observation(value: dict) -> dict:
     if not isinstance(value, dict):
         return value
     for field_name in (
-        "reference_price", "min_fba_price", "min_fbm_price", "fba_fee_net",
+        "reference_price", "buy_box_price", "min_fba_price", "min_fbm_price", "fba_fee_net",
         "fba_fee_gross", "referral_fee", "referral_rate",
     ):
         _normalize_decimal_field(value, field_name, "AmazonObservation")
