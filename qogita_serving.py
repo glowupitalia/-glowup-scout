@@ -339,6 +339,75 @@ class QogitaServingStore:
         result["active_serving_generation_id"] = expected_serving_generation_id
         return result
 
+    def auto_resume_window(
+        self, bootstrap_run_id: str, *, expected_serving_generation_id: str,
+        failure_category: str, now: str | datetime | None = None,
+    ) -> dict[str, Any]:
+        """Resume one recoverable stop without publishing or replacing serving data."""
+        self.initialize()
+        now_text = _timestamp(now)
+        now_dt = _datetime(now_text)
+        connection = _connect(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                """SELECT status,health_json FROM qogita_bootstrap_runs
+                   WHERE bootstrap_run_id=? AND run_mode='production'""",
+                (bootstrap_run_id,),
+            ).fetchone()
+            duty = connection.execute(
+                "SELECT * FROM qogita_bootstrap_duty_cycles WHERE bootstrap_run_id=?",
+                (bootstrap_run_id,),
+            ).fetchone()
+            active = connection.execute(
+                "SELECT serving_generation_id FROM qogita_serving_active WHERE supplier='qogita'"
+            ).fetchone()
+            claims = connection.execute(
+                """SELECT COUNT(*) FROM qogita_bootstrap_products
+                   WHERE bootstrap_run_id=? AND worker_id IS NOT NULL""",
+                (bootstrap_run_id,),
+            ).fetchone()[0]
+            if not run or not duty or run["status"] != "auto_stopped" or duty["state"] != "auto_stopped":
+                raise ValueError("Qogita production bootstrap is not auto-stopped")
+            if not active or active["serving_generation_id"] != expected_serving_generation_id:
+                raise RuntimeError("Qogita active serving snapshot changed during auto-resume")
+            if int(claims or 0):
+                raise RuntimeError("Qogita auto-resume requires zero active claims")
+            health = json.loads(run["health_json"] or "{}")
+            health["auto_resume_count"] = int(health.get("auto_resume_count") or 0) + 1
+            health["auto_resume_streak"] = int(health.get("auto_resume_streak") or 0) + 1
+            health["last_auto_resume_at"] = now_text
+            health["last_auto_resume_category"] = failure_category
+            deadline = _datetime(duty["current_window_deadline"])
+            window_number = int(duty["window_number"])
+            started_at = duty["current_window_started_at"]
+            if deadline <= now_dt:
+                window_number += 1
+                started_at = now_text
+                deadline = now_dt + timedelta(seconds=int(duty["run_window_seconds"]))
+            connection.execute(
+                """UPDATE qogita_bootstrap_runs SET status='running',stop_reason=NULL,
+                          health_json=?,updated_at=? WHERE bootstrap_run_id=?""",
+                (json_dumps(health), now_text, bootstrap_run_id),
+            )
+            connection.execute(
+                """UPDATE qogita_bootstrap_duty_cycles SET state='running',
+                          current_window_started_at=?,current_window_deadline=?,
+                          rest_until=NULL,window_number=?,updated_at=?
+                   WHERE bootstrap_run_id=?""",
+                (started_at, _timestamp(deadline), window_number, now_text, bootstrap_run_id),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+        result = self.duty_state(bootstrap_run_id)
+        result["active_serving_generation_id"] = expected_serving_generation_id
+        return result
+
     def mark_completed(
         self, bootstrap_run_id: str, *, serving_generation_id: str, now=None,
     ) -> dict[str, Any]:

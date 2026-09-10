@@ -7,6 +7,7 @@ import unittest
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from qogita_bootstrap import (
     PRODUCT_LINK_SOURCE,
@@ -22,7 +23,15 @@ from qogita_bootstrap import (
     run_qogita_bootstrap_concurrent,
     transient_sqlite_lock,
 )
-from qogita_production_bootstrap import ProductionHealthGuard
+from qogita_production_bootstrap import (
+    ProductionHealthGuard,
+    QogitaFailureCategory,
+    ShutdownController,
+    classify_qogita_outcome,
+    classify_structural_exception,
+    parse_stop_reason,
+    _send_structural_alert,
+)
 from qogita_serving import QogitaServingStore
 from qogita_catalog_pipeline import QogitaCatalogPipelineStore
 from supplier_catalog import SupplierCatalogStore
@@ -784,6 +793,230 @@ class QogitaBootstrapTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "disk_free_below_guardrail"):
             guard.initial_check()
+
+    def test_twenty_product_404s_are_quarantined_without_global_stop(self):
+        run_id = self.staging(20)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        guard = ProductionHealthGuard(
+            store=self.store, bootstrap_run_id=bootstrap["bootstrap_run_id"],
+            database=self.database, minimum_free_bytes=0,
+        )
+        reasons = [guard.product({
+            "processed": index + 1,
+            "outcome": {"status": "failed", "error_code": "offers_http",
+                        "http_status": 404, "retryable": False},
+            "metrics": {},
+        }) for index in range(20)]
+        self.assertEqual(reasons, [None] * 20)
+        self.assertEqual(guard.product_quarantine_count, 20)
+        self.assertEqual(
+            guard.category_counts[QogitaFailureCategory.PRODUCT_NOT_FOUND.value], 20,
+        )
+
+    def test_product_invalid_and_no_offers_do_not_trip_global_guard(self):
+        run_id = self.staging(2)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        guard = ProductionHealthGuard(
+            store=self.store, bootstrap_run_id=bootstrap["bootstrap_run_id"],
+            database=self.database, minimum_free_bytes=0,
+        )
+        for _ in range(20):
+            self.assertIsNone(guard.product({
+                "processed": 1,
+                "outcome": {"status": "failed", "error_code": "offers_parsing_failure"},
+                "metrics": {},
+            }))
+        self.assertEqual(
+            classify_qogita_outcome({"status": "success", "scenario_count": 0}),
+            QogitaFailureCategory.PRODUCT_NO_OFFERS,
+        )
+
+    def test_transient_taxonomy_and_persistent_global_stop(self):
+        cases = [
+            ({"status": "failed", "error_code": "offers_network", "retryable": True},
+             QogitaFailureCategory.NETWORK_TRANSIENT),
+            ({"status": "failed", "error_code": "offers_timeout", "retryable": True},
+             QogitaFailureCategory.TIMEOUT_TRANSIENT),
+            ({"status": "failed", "error_code": "offers_http", "http_status": 429,
+              "retryable": True}, QogitaFailureCategory.RATE_LIMIT),
+            ({"status": "failed", "error_code": "offers_http", "http_status": 503,
+              "retryable": True}, QogitaFailureCategory.UPSTREAM_5XX_TRANSIENT),
+        ]
+        for outcome, expected in cases:
+            self.assertEqual(classify_qogita_outcome(outcome), expected)
+        run_id = self.staging(10)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        guard = ProductionHealthGuard(
+            store=self.store, bootstrap_run_id=bootstrap["bootstrap_run_id"],
+            database=self.database, minimum_free_bytes=0,
+        )
+        reasons = [guard.product({
+            "processed": index + 1,
+            "outcome": cases[0][0], "metrics": {},
+        }) for index in range(10)]
+        self.assertTrue(reasons[-1].startswith("recoverable:NETWORK_TRANSIENT:"))
+
+    def test_product_progress_resets_transient_global_sequence(self):
+        run_id = self.staging(12)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        guard = ProductionHealthGuard(
+            store=self.store, bootstrap_run_id=bootstrap["bootstrap_run_id"],
+            database=self.database, minimum_free_bytes=0,
+        )
+        transient = {"status": "failed", "error_code": "offers_network", "retryable": True}
+        for index in range(9):
+            self.assertIsNone(guard.product({"processed": index + 1, "outcome": transient,
+                                             "metrics": {}}))
+        self.assertIsNone(guard.product({
+            "processed": 10,
+            "outcome": {"status": "failed", "error_code": "offers_http",
+                        "http_status": 404}, "metrics": {},
+        }))
+        self.assertEqual(guard.consecutive_global_errors, 0)
+
+    def test_auth_fatal_stops_but_refreshable_auth_is_recoverable(self):
+        fatal = classify_qogita_outcome({
+            "status": "failed", "error_code": "offers_authentication_failed",
+            "http_status": 401, "retryable": False,
+        })
+        refreshable = classify_qogita_outcome({
+            "status": "failed", "error_code": "authentication_failed",
+            "http_status": 503, "retryable": True,
+        })
+        self.assertEqual(fatal, QogitaFailureCategory.AUTH_FATAL)
+        self.assertEqual(refreshable, QogitaFailureCategory.AUTH_REFRESHABLE)
+
+    def test_sqlite_exhaustion_is_structural_and_resumable(self):
+        error = sqlite3.OperationalError("database is locked")
+        setattr(error, "qogita_sqlite_context", {"operation": "persist_offers"})
+        self.assertEqual(
+            classify_structural_exception(error),
+            (True, QogitaFailureCategory.SQLITE_BUSY_TRANSIENT),
+        )
+
+    def test_auto_resume_preserves_same_run_and_active_serving(self):
+        run_id = self.staging(2)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+        run_qogita_bootstrap(
+            bootstrap["bootstrap_run_id"], store=self.store,
+            client=BootstrapFakeClient(), max_products=1,
+            product_link_pacing=0, offers_pacing=0, sleep_func=lambda _: None,
+        )
+        serving = QogitaServingStore(self.database)
+        serving.ensure_running_window(
+            bootstrap["bootstrap_run_id"], now="2026-09-10T00:00:00Z",
+        )
+        snapshot = serving.build_snapshot(
+            bootstrap["bootstrap_run_id"], window_number=1,
+            bootstrap_state="running", now="2026-09-10T00:01:00Z",
+        )
+        self.store.mark_stopped(
+            bootstrap["bootstrap_run_id"],
+            "recoverable:NETWORK_TRANSIENT:persistent_global_failure",
+        )
+        serving.mark_auto_stopped(
+            bootstrap["bootstrap_run_id"], now="2026-09-10T00:02:00Z",
+        )
+        resumed = serving.auto_resume_window(
+            bootstrap["bootstrap_run_id"],
+            expected_serving_generation_id=snapshot["serving_generation_id"],
+            failure_category="NETWORK_TRANSIENT", now="2026-09-10T00:03:00Z",
+        )
+        self.assertEqual(resumed["state"], "running")
+        self.assertEqual(self.store.bootstrap(bootstrap["bootstrap_run_id"])["status"], "running")
+        self.assertEqual(
+            serving.active_snapshot()["serving_generation_id"],
+            snapshot["serving_generation_id"],
+        )
+        self.assertEqual(
+            self.store.bootstrap(bootstrap["bootstrap_run_id"])["health"]["auto_resume_count"], 1,
+        )
+
+    def test_legacy_stop_is_resumable_but_fatal_stop_is_not(self):
+        self.assertEqual(
+            parse_stop_reason("ten_consecutive_product_errors")[0], True,
+        )
+        recoverable, category = parse_stop_reason(
+            "fatal:AUTH_FATAL:global_authentication_failure"
+        )
+        self.assertFalse(recoverable)
+        self.assertEqual(category, QogitaFailureCategory.AUTH_FATAL)
+
+    def test_sigterm_controller_requests_boundary_stop(self):
+        controller = ShutdownController()
+        controller.request(15)
+        self.assertTrue(controller.requested)
+        self.assertEqual(controller.signal_number, 15)
+
+    def test_twenty_real_offer_404s_finish_without_auto_stop(self):
+        run_id = self.staging(20)
+        bootstrap = self.store.create_production_bootstrap(run_id)
+
+        class NotFoundClient(BootstrapFakeClient):
+            def fetch_offers(self, fid):
+                self.offer_calls.append(fid)
+                self.metrics["offers_requests"] += 1
+                raise QogitaBootstrapError(
+                    "not found", code="offers_http", retryable=False, http_status=404,
+                )
+
+        guard = ProductionHealthGuard(
+            store=self.store, bootstrap_run_id=bootstrap["bootstrap_run_id"],
+            database=self.database, minimum_free_bytes=0,
+        )
+        result = run_qogita_bootstrap_concurrent(
+            bootstrap["bootstrap_run_id"], store=self.store,
+            client_factory=lambda _auth, _limiter: NotFoundClient(),
+            base_url="https://example.test", email="x", password="y", workers=2,
+            offers_pacing=1.15, product_link_pacing=0, sleep_func=lambda _: None,
+            health_callback=guard.product,
+        )
+        self.assertIsNone(result["auto_stop_reason"])
+        self.assertEqual(result["terminal_failed_count"], 20)
+        self.assertEqual(result["last_progress"]["remaining"], 0)
+
+    def test_network_timeout_and_5xx_retry_then_recover(self):
+        for error in (
+            QogitaBootstrapError("network", code="offers_network", retryable=True),
+            QogitaBootstrapError("timeout", code="offers_timeout", retryable=True),
+            QogitaBootstrapError(
+                "server", code="offers_http", retryable=True, http_status=503,
+            ),
+        ):
+            with self.subTest(code=error.code):
+                run_id = self.staging(1)
+                bootstrap = self.store.create_production_bootstrap(run_id)
+
+                class FlakyClient(BootstrapFakeClient):
+                    def __init__(self):
+                        super().__init__()
+                        self.failed = False
+
+                    def fetch_offers(self, fid):
+                        if not self.failed:
+                            self.failed = True
+                            raise error
+                        return super().fetch_offers(fid)
+
+                client = FlakyClient()
+                result = run_qogita_bootstrap(
+                    bootstrap["bootstrap_run_id"], store=self.store, client=client,
+                    product_link_pacing=0, offers_pacing=0,
+                    sleep_func=lambda _: None,
+                )
+                self.assertEqual(result["offers_success"], 1)
+                self.assertEqual(client.metrics["retries"], 1)
+
+    def test_structural_alert_reuses_shared_notification_channel(self):
+        with patch("qogita_production_bootstrap.send_notification") as send:
+            _send_structural_alert(
+                self.database, "run-one", QogitaFailureCategory.AUTH_FATAL,
+                "fatal:AUTH_FATAL:login",
+            )
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(
+            send.call_args.kwargs["entity_id"], "run-one:AUTH_FATAL",
+        )
 
     def test_production_auto_stop_is_persisted_and_resumable(self):
         run_id = self.staging(2)

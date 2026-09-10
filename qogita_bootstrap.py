@@ -632,7 +632,13 @@ class QogitaBootstrapClient:
             response = self.session.get(
                 expected, timeout=self.timeout_seconds, allow_redirects=False,
             )
-        except (requests.Timeout, requests.ConnectionError) as exc:
+        except requests.Timeout as exc:
+            self.metrics["resolver_elapsed_seconds"] += time.monotonic() - started
+            raise QogitaBootstrapError(
+                "Qogita Product Link timed out", code="resolver_timeout",
+                retryable=True,
+            ) from exc
+        except requests.ConnectionError as exc:
             self.metrics["resolver_elapsed_seconds"] += time.monotonic() - started
             raise QogitaBootstrapError(
                 "Qogita Product Link network failure", code="resolver_network",
@@ -672,7 +678,12 @@ class QogitaBootstrapClient:
                 headers={"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"},
                 timeout=self.timeout_seconds, allow_redirects=False,
             )
-        except (requests.Timeout, requests.ConnectionError) as exc:
+        except requests.Timeout as exc:
+            self.metrics["offers_elapsed_seconds"] += time.monotonic() - started
+            raise QogitaBootstrapError(
+                "Qogita offers timed out", code="offers_timeout", retryable=True,
+            ) from exc
+        except requests.ConnectionError as exc:
             self.metrics["offers_elapsed_seconds"] += time.monotonic() - started
             raise QogitaBootstrapError(
                 "Qogita offers network failure", code="offers_network", retryable=True,
@@ -1149,10 +1160,24 @@ class QogitaBootstrapStore:
         with self._write_transaction(
             operation="mark_stopped", bootstrap_run_id=bootstrap_run_id,
         ) as connection:
+            current = connection.execute(
+                "SELECT health_json FROM qogita_bootstrap_runs WHERE bootstrap_run_id=?",
+                (bootstrap_run_id,),
+            ).fetchone()
+            merged_health = json.loads(current["health_json"] or "{}") if current else {}
+            merged_health.update(health or {})
+            merged_health["structural_stop_count"] = int(
+                merged_health.get("structural_stop_count") or 0
+            ) + 1
+            if str(reason).startswith("fatal:"):
+                parts = str(reason).split(":", 2)
+                merged_health["last_fatal_category"] = (
+                    parts[1] if len(parts) > 1 else "UNKNOWN_FATAL"
+                )
             connection.execute(
                 """UPDATE qogita_bootstrap_runs SET status='auto_stopped',stop_reason=?,
                           health_json=?,updated_at=? WHERE bootstrap_run_id=?""",
-                (str(reason)[:300], json_dumps(health or {}), now, bootstrap_run_id),
+                (str(reason)[:300], json_dumps(merged_health), now, bootstrap_run_id),
             )
             connection.execute(
                 """UPDATE qogita_bootstrap_products SET worker_id=NULL,claimed_at=NULL,
@@ -1919,6 +1944,7 @@ def _process_claimed_product(
     store: QogitaBootstrapStore, client: QogitaBootstrapClient,
     max_attempts: int, sleep_func: Callable[[float], None],
 ):
+    recovered_retries: list[dict[str, Any]] = []
     fid = str(selected.get("persisted_variant_fid") or selected.get("variant_fid") or "")
     if not fid:
         elapsed = 0.0
@@ -1938,6 +1964,10 @@ def _process_claimed_product(
             except QogitaBootstrapError as exc:
                 if exc.retryable and attempts < max_attempts:
                     client.metrics["retries"] += 1
+                    recovered_retries.append({
+                        "status": "failed", "error_code": exc.code,
+                        "http_status": exc.http_status, "retryable": True,
+                    })
                     _sleep_for_retry(exc, attempts, sleep_func)
                     continue
                 store.persist_failure(
@@ -1945,7 +1975,8 @@ def _process_claimed_product(
                     error=exc, attempts=attempts, elapsed_seconds=elapsed,
                 )
                 return {"status": "failed", "error_code": exc.code,
-                        "http_status": exc.http_status}
+                        "http_status": exc.http_status, "retryable": exc.retryable,
+                        "phase": "resolver", "recovered_retries": recovered_retries}
     elapsed = 0.0
     for attempts in range(1, max_attempts + 1):
         try:
@@ -1968,10 +1999,15 @@ def _process_claimed_product(
                 worker_id=selected.get("worker_id"), gtin=selected.get("gtin"),
                 variant_fid=fid,
             )
-            return {"status": "success", "scenario_count": diagnostics["scenario_count"]}
+            return {"status": "success", "scenario_count": diagnostics["scenario_count"],
+                    "recovered_retries": recovered_retries}
         except QogitaBootstrapError as exc:
             if exc.retryable and attempts < max_attempts:
                 client.metrics["retries"] += 1
+                recovered_retries.append({
+                    "status": "failed", "error_code": exc.code,
+                    "http_status": exc.http_status, "retryable": True,
+                })
                 _sleep_for_retry(exc, attempts, sleep_func)
                 continue
             phase_error = exc
@@ -1982,7 +2018,9 @@ def _process_claimed_product(
                 error=phase_error, attempts=attempts, elapsed_seconds=elapsed,
             )
             return {"status": "failed", "error_code": phase_error.code,
-                    "http_status": phase_error.http_status}
+                    "http_status": phase_error.http_status,
+                    "retryable": phase_error.retryable, "phase": "offers",
+                    "recovered_retries": recovered_retries}
     return {"status": "failed", "error_code": "unexpected_processing_exit"}
 
 
