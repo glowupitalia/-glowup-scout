@@ -1788,7 +1788,18 @@ def supplier_promotion_gate(
             reasons.append("qudo_offer_coverage_anomalous")
         if qudo_products and valid_gtin_products / qudo_products < 0.90:
             reasons.append("qudo_identifier_coverage_anomalous")
-        if len(generation.products) != qudo_products:
+        quarantined = int(diagnostics.get("quarantined_product_count") or 0)
+        expected_publishable = int(
+            diagnostics.get("expected_publishable_product_count")
+            if "expected_publishable_product_count" in diagnostics
+            else qudo_products
+        )
+        if quarantined < 0 or expected_publishable < 0 or (
+            "expected_publishable_product_count" in diagnostics
+            and expected_publishable + quarantined != qudo_products
+        ):
+            reasons.append("qudo_quarantine_accounting_incoherent")
+        if len(generation.products) != expected_publishable:
             reasons.append("qudo_persisted_product_identity_mismatch")
         if normalized_scenarios != len(generation.scenarios):
             reasons.append("qudo_persisted_scenario_count_mismatch")

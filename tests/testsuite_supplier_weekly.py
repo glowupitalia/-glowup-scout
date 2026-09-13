@@ -14,9 +14,10 @@ from supplier_weekly import (
     WeeklySupplierStore, next_weekly_refresh, schedule_key,
 )
 from supplier_incremental import SupplierIncrementalStore
+from supplier_catalog import SupplierCatalogGeneration, SupplierCatalogStore
 from supplier_weekly_adapters import (
     QudoIncrementalAdapter, UmmaIncrementalAdapter, _baseline_seed,
-    _catalog_generation, _make_handler, build_weekly_handlers,
+    _catalog_generation, _make_handler, _umma_brand, build_weekly_handlers,
     validate_umma_gap,
 )
 from umma_discovery import normalize_umma_barcode
@@ -318,6 +319,61 @@ class WeeklyStoreTests(unittest.TestCase):
 
 
 class WeeklyAdapterAsyncLifecycleTests(unittest.TestCase):
+    def test_umma_structured_brand_uses_text_contract_at_sql_boundary(self):
+        production_brand = {
+            "id": 394, "englishName": "VT (EU)", "koreanName": "VT",
+            "approvedStatus": "APPROVAL",
+        }
+        self.assertEqual(_umma_brand(production_brand), "VT (EU)")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "catalog.sqlite3"
+            store = SupplierCatalogStore(path)
+            baseline = SupplierCatalogGeneration(
+                supplier="umma", coverage_type="partial_catalog",
+                coverage_description="test", coverage_complete=False,
+                products=({
+                    "canonical_product_key": "baseline-product",
+                    "supplier_product_id": "baseline", "brand": "Baseline",
+                },),
+                scenarios=({
+                    "scenario_id": "baseline-scenario",
+                    "canonical_product_key": "baseline-product",
+                    "scenario_type": "offer",
+                },),
+            )
+            store.start_run(
+                "umma", run_id="active-umma", coverage_type="partial_catalog",
+                coverage_description="test", coverage_complete=False, sampled=False,
+            )
+            store.publish("active-umma", baseline, elapsed_seconds=0, promote=True)
+
+            class Incremental:
+                @staticmethod
+                def generation_records(_run_id):
+                    return ([{
+                        "canonical_product_key": "current-product",
+                        "supplier_product_id": "product-1",
+                        "supplier_option_id": "option-1",
+                        "brand": production_brand,
+                    }], [{
+                        "scenario_id": "current-scenario",
+                        "canonical_product_key": "current-product",
+                        "scenario_type": "offer",
+                    }])
+
+            result = _catalog_generation(
+                "umma", "weekly-umma", {"diagnostics": {
+                    "source_count": 1, "search_total_count": 1,
+                    "unique_product_ids": 1, "enumeration_gap": 0,
+                }}, Incremental(), previous_run_id="active-umma",
+                catalog_store=store,
+            )
+            published = store.latest_success("umma")
+
+        self.assertEqual(result["promotion_result"], "promoted")
+        self.assertEqual(published["products"][0]["brand"], "VT (EU)")
+
     def test_umma_baseline_seed_collapses_legacy_aliases_by_product_option(self):
         current = [{
             "canonical_product_key": "current-key",

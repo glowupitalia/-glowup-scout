@@ -177,6 +177,19 @@ def _brand(payload):
     return ""
 
 
+def _umma_brand(value):
+    """Return the textual UMMA brand contract without stringifying objects."""
+    if isinstance(value, dict):
+        for field in ("englishName", "name", "koreanName"):
+            candidate = value.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
+
+
 def _baseline_seed(store: SupplierCatalogStore, supplier: str,
                    current_products: list[dict[str, Any]]):
     """Bridge a pre-incremental active generation without triggering full detail."""
@@ -297,6 +310,17 @@ def _catalog_generation(supplier, run_id, enumeration, incremental_store,
     coverage = {"abw": ABW_COVERAGE, "umma": UMMA_COVERAGE,
                 "qudo": QUDO_COVERAGE}[supplier]
     diagnostics = dict(enumeration.get("diagnostics") or {})
+    if supplier == "umma":
+        for product in products:
+            product["brand"] = _umma_brand(product.get("brand"))
+    if supplier == "qudo":
+        product_states = incremental_store.generation_summary(run_id)["product_states"]
+        quarantined = int(product_states.get("quarantined") or 0)
+        enumerated = int(diagnostics.get("qudo_offer_products") or len(products) + quarantined)
+        diagnostics.update({
+            "quarantined_product_count": quarantined,
+            "expected_publishable_product_count": enumerated - quarantined,
+        })
     for scenario in scenarios:
         scenario.pop("supplier_catalog_product_key", None)
         normalize_purchase_scenario(scenario)
@@ -429,7 +453,8 @@ class UmmaIncrementalAdapter(_StableAsyncAdapter):
                             "raw_identifiers": ([{"value": barcode, "type": "UMMA_BARCODE"}] if barcode else []),
                             "identifier_valid": bool(canonical_ean),
                             "supplier_product_id": product_id, "supplier_option_id": option_id,
-                            "supplier_sku": sku, "brand": item.get("brandName") or item.get("brand"),
+                            "supplier_sku": sku,
+                            "brand": _umma_brand(item.get("brandName") or item.get("brand")),
                             "title": option.get("englishName") or item.get("englishName"),
                             "product_id": product_id, "option_id": option_id,
                             "raw_barcode": barcode, "is_display": item.get("isDisplay"),

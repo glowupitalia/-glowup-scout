@@ -301,8 +301,8 @@ class QudoWeeklyPolicyTests(unittest.TestCase):
 
             result = _catalog_generation(
                 "qudo", "weekly", {"diagnostics": {
-                    "global_catalog_total": 6927,
-                    "qudo_offer_products": 6883,
+                    "global_catalog_total": 7113,
+                    "qudo_offer_products": 6927,
                     "canonical_gtin_products": 6883,
                     "normalizer": {"qudo_scenarios": 3857},
                 }}, store, previous_run_id="active-qudo",
@@ -310,6 +310,75 @@ class QudoWeeklyPolicyTests(unittest.TestCase):
             )
             self.assertEqual(result["promotion_result"], "promoted")
             self.assertTrue(PublicationStore.promoted)
+
+    def test_promotion_accounts_for_intentional_quarantine(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SupplierIncrementalStore(Path(temporary) / "catalog.sqlite3")
+            baseline = [product(index, changed=False) for index in range(26)]
+            current = [product(index, changed=True) for index in range(162)]
+            store.compose_generation("baseline-v2", "qudo", baseline)
+            store.compose_generation(
+                "weekly", "qudo", current, previous_run_id="baseline-v2",
+            )
+            for index in range(26):
+                self.assertEqual(store.resolve_product_failure(
+                    "weekly", "qudo", f"product-{index}",
+                    previous_run_id="baseline-v2", category="PRICE_UNAVAILABLE",
+                ), "carry_forward")
+            for index in range(126, 162):
+                self.assertEqual(store.resolve_product_failure(
+                    "weekly", "qudo", f"product-{index}",
+                    previous_run_id="baseline-v2", category="PRICE_UNAVAILABLE",
+                ), "quarantined")
+            for index in range(26, 126):
+                store.persist_enrichment(
+                    "weekly", "qudo", f"product-{index}", [scenario(index)],
+                )
+
+            class PublicationStore:
+                promoted = None
+
+                @staticmethod
+                def active_generation_metadata(_supplier):
+                    return {"run_id": "active-qudo"}
+
+                @staticmethod
+                def start_run(*_args, **_kwargs):
+                    return None
+
+                @classmethod
+                def publish(cls, _run_id, _generation, **kwargs):
+                    cls.promoted = kwargs["promote"]
+
+            diagnostics = {
+                "global_catalog_total": 180,
+                "qudo_offer_products": 162,
+                "canonical_gtin_products": 150,
+                "normalizer": {"qudo_scenarios": 100},
+            }
+            result = _catalog_generation(
+                "qudo", "weekly", {"diagnostics": diagnostics}, store,
+                previous_run_id="active-qudo", catalog_store=PublicationStore(),
+            )
+            products, _ = store.generation_records("weekly")
+            summary = store.generation_summary("weekly")["product_states"]
+
+            self.assertEqual(len(products), 126)
+            self.assertEqual(summary.get("carry_forward"), 26)
+            self.assertEqual(summary.get("quarantined"), 36)
+            self.assertIsNone(summary.get("removed"))
+            self.assertEqual(result["promotion_result"], "promoted")
+            self.assertTrue(PublicationStore.promoted)
+
+            with self.assertRaisesRegex(
+                RuntimeError, "qudo_persisted_product_identity_mismatch",
+            ):
+                _catalog_generation(
+                    "qudo", "weekly", {"diagnostics": {
+                        **diagnostics, "qudo_offer_products": 163,
+                    }}, store, previous_run_id="active-qudo",
+                    catalog_store=PublicationStore(),
+                )
 
 
 if __name__ == "__main__":
