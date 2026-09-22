@@ -28,6 +28,12 @@ from qogita_universe import (
     QOGITA_UNIVERSE_KOREAN_BEAUTY,
     normalize_qogita_universe,
 )
+from supplier_archive import (
+    DEFAULT_MOUNT_PATH as DEFAULT_ARCHIVE_MOUNT,
+    DEFAULT_VOLUME_UUID as DEFAULT_ARCHIVE_UUID,
+    archived_object_connection,
+    initialize_supplier_archive_catalog,
+)
 
 
 SUPPORTED_SUPPLIERS = ("qogita", "umma", "abw", "qudo")
@@ -363,12 +369,21 @@ CREATE TABLE IF NOT EXISTS supplier_catalog_active_generations (
 
 
 class SupplierCatalogStore:
-    def __init__(self, path: str | Path = DEFAULT_DATABASE_PATH):
+    def __init__(
+        self, path: str | Path = DEFAULT_DATABASE_PATH, *,
+        archive_mount_path: str | Path = DEFAULT_ARCHIVE_MOUNT,
+        archive_volume_uuid: str = DEFAULT_ARCHIVE_UUID,
+        archive_uuid_probe=None,
+    ):
         self.path = Path(path).expanduser().resolve()
+        self.archive_mount_path = Path(archive_mount_path)
+        self.archive_volume_uuid = str(archive_volume_uuid)
+        self.archive_uuid_probe = archive_uuid_probe
 
     def initialize(self) -> None:
         with _connect(self.path) as connection:
             connection.executescript(SCHEMA)
+            initialize_supplier_archive_catalog(connection)
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(supplier_catalog_runs)")
             }
@@ -892,16 +907,70 @@ class SupplierCatalogStore:
             row = connection.execute(
                 "SELECT * FROM supplier_catalog_runs WHERE run_id=?", (run_id,)
             ).fetchone()
+        if not row:
+            with archived_object_connection(
+                self.path, "supplier_generation", run_id,
+                mount_path=self.archive_mount_path,
+                expected_volume_uuid=self.archive_volume_uuid,
+                uuid_probe=self.archive_uuid_probe,
+            ) as archive:
+                if archive is None:
+                    return None
+                row = archive.execute(
+                    "SELECT * FROM supplier_catalog_runs WHERE run_id=?", (run_id,)
+                ).fetchone()
+                if not row:
+                    return None
+                row = dict(row)
+        else:
+            row = dict(row)
+        result = dict(row)
+        result["diagnostics"] = json.loads(result.pop("diagnostics_json") or "{}")
+        result["coverage_complete"] = bool(result["coverage_complete"])
+        result["product_catalog_coverage_complete"] = bool(
+            result.get("product_catalog_coverage_complete")
+        )
+        result["sampled"] = bool(result["sampled"])
+        return result
+
+    def historical_generation(self, run_id: str) -> dict[str, Any] | None:
+        """Read exactly one internal or archived generation authority."""
+        self.initialize()
+        internal = _connect(self.path)
+        archive_context = None
+        try:
+            row = internal.execute(
+                "SELECT * FROM supplier_catalog_runs WHERE run_id=?", (run_id,),
+            ).fetchone()
+            connection = internal
+            if not row:
+                archive_context = archived_object_connection(
+                    self.path, "supplier_generation", run_id,
+                    mount_path=self.archive_mount_path,
+                    expected_volume_uuid=self.archive_volume_uuid,
+                    uuid_probe=self.archive_uuid_probe,
+                )
+                connection = archive_context.__enter__()
+                if connection is None:
+                    return None
+                row = connection.execute(
+                    "SELECT * FROM supplier_catalog_runs WHERE run_id=?", (run_id,),
+                ).fetchone()
             if not row:
                 return None
-            result = dict(row)
-            result["diagnostics"] = json.loads(result.pop("diagnostics_json") or "{}")
-            result["coverage_complete"] = bool(result["coverage_complete"])
-            result["product_catalog_coverage_complete"] = bool(
-                result.get("product_catalog_coverage_complete")
-            )
-            result["sampled"] = bool(result["sampled"])
-            return result
+            products = [dict(value) for value in connection.execute(
+                "SELECT * FROM supplier_catalog_products WHERE run_id=? ORDER BY canonical_product_key",
+                (run_id,),
+            )]
+            scenarios = [dict(value) for value in connection.execute(
+                "SELECT * FROM supplier_catalog_scenarios WHERE run_id=? ORDER BY scenario_id",
+                (run_id,),
+            )]
+            return {"run": dict(row), "products": products, "scenarios": scenarios}
+        finally:
+            if archive_context is not None:
+                archive_context.__exit__(None, None, None)
+            internal.close()
 
     def active_generation_metadata(self, supplier: str) -> dict[str, Any] | None:
         supplier = _validate_supplier(supplier)

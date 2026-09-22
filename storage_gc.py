@@ -1112,9 +1112,11 @@ def qogita_snapshot_plan(
                     "WHERE last_serving_generation_id IS NOT NULL",
                 )
             }
+        internal_ids: set[str] = set()
         for row in _query(connection, "SELECT * FROM qogita_serving_snapshots ORDER BY created_at"):
             snapshot = dict(row)
             snapshot_id = str(snapshot["serving_generation_id"])
+            internal_ids.add(snapshot_id)
             memberships = int(snapshot.get("enriched_product_count") or 0)
             # Conservative logical estimate: row values + both membership indexes.
             estimated = memberships * 192 + 768
@@ -1136,6 +1138,25 @@ def qogita_snapshot_plan(
                 "reason": reason, "membership_rows": memberships,
                 "estimated_bytes": estimated,
             })
+        if "supplier_archive_segments" in tables:
+            for archived in _query(
+                connection,
+                "SELECT object_id,row_counts_json,archive_path,content_sha256,status "
+                "FROM supplier_archive_segments WHERE segment_type='qogita_serving_snapshot' "
+                "AND status='valid' ORDER BY created_at",
+            ):
+                snapshot_id = str(archived[0])
+                if snapshot_id in internal_ids:
+                    continue
+                counts = _json_dict(archived[1])
+                result["snapshots"].append({
+                    "snapshot_id": snapshot_id,
+                    "classification": "ARCHIVED_AUTHORITATIVE", "decision": KEEP,
+                    "reason": "immutable X9 archive is authoritative",
+                    "membership_rows": int(counts.get("qogita_serving_memberships") or 0),
+                    "estimated_bytes": 0, "archive_path": archived[2],
+                    "archive_content_sha256": archived[3], "archive_status": archived[4],
+                })
     return result
 
 
@@ -1175,10 +1196,12 @@ def supplier_generation_plan(
                 # One bounded pass is attempted. Repeated per-generation scans
                 # would be an unacceptable production audit pattern.
                 source_reference_unknown = True
+        internal_ids: set[str] = set()
         runs = _query(connection, "SELECT * FROM supplier_catalog_runs ORDER BY started_at")
         for row in runs:
             run = dict(row)
             run_id = str(run["run_id"])
+            internal_ids.add(run_id)
             product_count = int(run.get("product_count") or 0)
             scenario_count = int(run.get("scenario_count") or 0)
             source_ref = run_id in incremental_sources
@@ -1215,6 +1238,26 @@ def supplier_generation_plan(
                 "products": product_count, "scenarios": scenario_count,
                 "estimated_bytes": estimated,
             })
+        if "supplier_archive_segments" in tables:
+            for archived in _query(
+                connection,
+                "SELECT object_id,row_counts_json,archive_path,content_sha256,status "
+                "FROM supplier_archive_segments WHERE segment_type='supplier_generation' "
+                "AND status='valid' ORDER BY created_at",
+            ):
+                run_id = str(archived[0])
+                if run_id in internal_ids:
+                    continue
+                counts = _json_dict(archived[1])
+                result["generations"].append({
+                    "run_id": run_id, "supplier": None, "status": "archived",
+                    "classification": "ARCHIVED_AUTHORITATIVE", "decision": KEEP,
+                    "reason": "immutable X9 archive is authoritative", "roots": [],
+                    "products": int(counts.get("supplier_catalog_products") or 0),
+                    "scenarios": int(counts.get("supplier_catalog_scenarios") or 0),
+                    "estimated_bytes": 0, "archive_path": archived[2],
+                    "archive_content_sha256": archived[3], "archive_status": archived[4],
+                })
     return result
 
 

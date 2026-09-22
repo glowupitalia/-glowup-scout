@@ -10,6 +10,12 @@ from typing import Any
 from uuid import uuid4
 
 from supplier_catalog import DEFAULT_DATABASE_PATH, canonical_gtin14, json_dumps, utc_now
+from supplier_archive import (
+    DEFAULT_MOUNT_PATH as DEFAULT_ARCHIVE_MOUNT,
+    DEFAULT_VOLUME_UUID as DEFAULT_ARCHIVE_UUID,
+    archived_object_connection,
+    initialize_supplier_archive_catalog,
+)
 
 
 RUN_WINDOW_SECONDS = 4 * 60 * 60
@@ -114,8 +120,16 @@ def _datetime(value: str) -> datetime:
 class QogitaServingStore:
     """Owns the serving pointer without changing Qogita latest_success."""
 
-    def __init__(self, path: str | Path = DEFAULT_DATABASE_PATH):
+    def __init__(
+        self, path: str | Path = DEFAULT_DATABASE_PATH, *,
+        archive_mount_path: str | Path = DEFAULT_ARCHIVE_MOUNT,
+        archive_volume_uuid: str = DEFAULT_ARCHIVE_UUID,
+        archive_uuid_probe=None,
+    ):
         self.path = Path(path).expanduser().resolve()
+        self.archive_mount_path = Path(archive_mount_path)
+        self.archive_volume_uuid = str(archive_volume_uuid)
+        self.archive_uuid_probe = archive_uuid_probe
 
     @staticmethod
     def _eligible_snapshot_rows(
@@ -158,6 +172,7 @@ class QogitaServingStore:
     def initialize(self) -> None:
         with _connect(self.path) as connection:
             connection.executescript(SCHEMA)
+            initialize_supplier_archive_catalog(connection)
 
     def duty_state(self, bootstrap_run_id: str) -> dict[str, Any] | None:
         self.initialize()
@@ -548,6 +563,42 @@ class QogitaServingStore:
                 result["product_catalog_coverage_complete"]
             )
             result["diagnostics"] = json.loads(result.pop("diagnostics_json") or "{}")
+            return result
+
+    def snapshot(self, serving_generation_id: str) -> dict[str, Any] | None:
+        """Read one snapshot from its sole internal/archive authority."""
+        self.initialize()
+        with _connect(self.path) as connection:
+            row = connection.execute(
+                "SELECT * FROM qogita_serving_snapshots WHERE serving_generation_id=?",
+                (serving_generation_id,),
+            ).fetchone()
+            if row:
+                result = dict(row)
+                result["membership_count"] = int(connection.execute(
+                    "SELECT COUNT(*) FROM qogita_serving_memberships WHERE serving_generation_id=?",
+                    (serving_generation_id,),
+                ).fetchone()[0])
+                return result
+        with archived_object_connection(
+            self.path, "qogita_serving_snapshot", serving_generation_id,
+            mount_path=self.archive_mount_path,
+            expected_volume_uuid=self.archive_volume_uuid,
+            uuid_probe=self.archive_uuid_probe,
+        ) as archive:
+            if archive is None:
+                return None
+            row = archive.execute(
+                "SELECT * FROM qogita_serving_snapshots WHERE serving_generation_id=?",
+                (serving_generation_id,),
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result["membership_count"] = int(archive.execute(
+                "SELECT COUNT(*) FROM qogita_serving_memberships WHERE serving_generation_id=?",
+                (serving_generation_id,),
+            ).fetchone()[0])
             return result
 
     def checkpoint_sqlite(self) -> dict[str, int]:
