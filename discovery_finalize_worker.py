@@ -17,7 +17,7 @@ from discovery_incremental import (
     IncrementalObservationCollection,
     LightweightCheckpointStore,
 )
-from discovery_jobs import DiscoveryJobRegistry, PROJECT_ROOT
+from discovery_jobs import DiscoveryJobRegistry, PROJECT_ROOT, DEFAULT_DATABASE as DEFAULT_RUNTIME_DATABASE
 from discovery_resources import DiscoveryResourceGovernor, ResourcePause
 from notifications import send_discovery_terminal_notification
 from storage_gc import append_storage_audit_event, collect_storage_metrics
@@ -251,6 +251,12 @@ def finalize(
             (notification or {}).get("status") if isinstance(notification, dict) else "disabled",
             retention.get("status"),
         )
+        if Path(registry.path).resolve() == Path(DEFAULT_RUNTIME_DATABASE).resolve():
+            archive_maintenance_pid = registry.launch_archive_maintenance()
+            logger.info(
+                "DISCOVERY ARCHIVE MAINTENANCE LAUNCHED | pid=%s trigger_job_id=%s",
+                archive_maintenance_pid, job_id,
+            )
         return {**state, "notification": notification}
     except ResourcePause as exc:
         metrics = exc.snapshot.as_dict()
