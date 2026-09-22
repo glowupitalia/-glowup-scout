@@ -545,7 +545,11 @@ class QogitaServingStore:
             raise
         finally:
             connection.close()
-        return self.active_snapshot()
+        snapshot = self.active_snapshot()
+        if self.path == Path(DEFAULT_DATABASE_PATH).resolve():
+            from supplier_archive_lifecycle import launch_supplier_archive_maintenance
+            launch_supplier_archive_maintenance()
+        return snapshot
 
     def active_snapshot(self) -> dict[str, Any] | None:
         self.initialize()

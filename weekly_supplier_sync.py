@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from supplier_catalog import SupplierCatalogStore
 from supplier_weekly import (
@@ -146,6 +147,13 @@ def main(argv=None) -> int:
         if str(exc) != "weekly_supplier_sync_already_running":
             raise
         result = {"status": "skipped", "reason": str(exc)}
+    if (
+        Path(args.database).expanduser().resolve()
+        == Path(DEFAULT_WEEKLY_DATABASE_PATH).expanduser().resolve()
+        and result.get("status") in {"success", "partial_success"}
+    ):
+        from supplier_archive_lifecycle import launch_supplier_archive_maintenance
+        result["archive_maintenance_pid"] = launch_supplier_archive_maintenance()
     print(json.dumps(result, ensure_ascii=False, default=str))
     return 0 if result["status"] in {"success", "partial_success", "skipped"} else 1
 
