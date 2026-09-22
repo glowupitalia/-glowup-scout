@@ -899,6 +899,13 @@ def discovery_gc_plan(
 
     with _readonly_connection(incremental_path) as connection:
         tables = _table_names(connection)
+        archive_records: dict[str, dict[str, Any]] = {}
+        if "discovery_archive_segments" in tables:
+            for archived_row in _query(
+                connection,
+                "SELECT * FROM discovery_archive_segments WHERE status='valid' ORDER BY created_at",
+            ):
+                archive_records[str(archived_row["job_id"])] = dict(archived_row)
         cache_map: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         if "discovery_amazon_cache" in tables:
             columns = _columns(connection, "discovery_amazon_cache")
@@ -1005,9 +1012,73 @@ def discovery_gc_plan(
                 classification = "UNREFERENCED"
             result["jobs"].append({
                 "job_id": job_id, "status": job.get("status"),
+                "schema_version": job.get("schema_version"),
+                "created_at": job.get("created_at"),
+                "authority": "archive" if job_id in archive_records else "internal",
                 "classification": classification, "references": refs,
                 "dependencies": base_dependencies, "components": components,
                 "estimated_bytes": sum(value["estimated_bytes"] for value in components),
+            })
+        # Archived jobs remain visible to GC/reference analysis even after their
+        # job-owned rows have intentionally left the operational database.
+        # The immutable archive is authoritative; GC must never call this data
+        # missing or propose recreating/deleting it internally.
+        internal_ids = {str(row["job_id"]) for row in result["jobs"]}
+        for job_id, archived in archive_records.items():
+            if job_id in internal_ids:
+                continue
+            try:
+                row_counts = json.loads(str(archived.get("row_counts_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                row_counts = {}
+                result["unknowns"].append(f"archive_row_counts_invalid:{job_id}")
+            archived_snapshots: set[str] = set()
+            archived_generations: set[str] = set()
+            archive_readable = False
+            archive_path = Path(str(archived.get("archive_path") or ""))
+            try:
+                if archive_path.is_symlink() or not archive_path.is_file():
+                    raise FileNotFoundError(archive_path)
+                with _readonly_connection(archive_path) as archive_connection:
+                    archive_job = _query(
+                        archive_connection,
+                        "SELECT metadata_json FROM discovery_incremental_jobs WHERE job_id=?",
+                        (job_id,),
+                    )
+                if len(archive_job) != 1:
+                    raise ValueError("archive job metadata missing")
+                archived_metadata = _json_dict(archive_job[0][0])
+                archived_snapshots, archived_generations = _supplier_snapshot_roots(archived_metadata)
+                snapshot_roots.update(archived_snapshots)
+                generation_roots.update(archived_generations)
+                archive_readable = True
+            except (OSError, sqlite3.Error, ValueError, ReadBudgetExceeded) as error:
+                result["unknowns"].append(
+                    f"archive_unavailable_or_invalid:{job_id}:{type(error).__name__}"
+                )
+            components = [{
+                "name": table, "decision": KEEP,
+                "reason": "immutable archive is authoritative",
+                "row_count": int(count or 0), "estimated_bytes": 0,
+            } for table, count in sorted(row_counts.items()) if table != "discovery_incremental_jobs"]
+            result["jobs"].append({
+                "job_id": job_id, "status": "completed", "schema_version": 1,
+                "created_at": archived.get("created_at"),
+                "authority": "archive", "classification": "ARCHIVED_AUTHORITATIVE",
+                "archive_status": archived.get("status"),
+                "archive_readable": archive_readable,
+                "archive_path": archived.get("archive_path"),
+                "archive_content_sha256": archived.get("content_sha256"),
+                "references": dict(cache_map.get(job_id, {})),
+                "dependencies": {
+                    "active_job": False, "outbox_events": outbox.get(job_id, 0),
+                    "rotation_selections": rotations.get(job_id, 0),
+                    "global_history_last_job": global_history.get(job_id, 0),
+                    "export_path": str(runtime.get(job_id, {}).get("export_path") or "") or None,
+                    "frozen_snapshots": sorted(archived_snapshots),
+                    "frozen_generations": sorted(archived_generations),
+                },
+                "components": components, "estimated_bytes": 0,
             })
         result["snapshot_roots"] = sorted(snapshot_roots)
         result["generation_roots"] = sorted(generation_roots)

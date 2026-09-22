@@ -22,6 +22,15 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from discovery_archive import (
+    DEFAULT_ARCHIVE_ROOT,
+    DEFAULT_MOUNT_PATH,
+    DEFAULT_VOLUME_UUID,
+    ArchivedJobReadOnlyError,
+    archive_catalog_record,
+    archived_read_connection,
+    initialize_archive_catalog,
+)
 from discovery_taxonomy import projection_rows
 
 
@@ -324,6 +333,10 @@ class DiscoveryIncrementalStore:
         lock_retry_jitter_fraction: float = SQLITE_LOCK_RETRY_JITTER_FRACTION,
         busy_timeout_ms: int = 30_000, sleep_func=time.sleep,
         random_func=random.random,
+        archive_mount_path: str | Path = DEFAULT_MOUNT_PATH,
+        archive_root: str | Path = DEFAULT_ARCHIVE_ROOT,
+        archive_volume_uuid: str = DEFAULT_VOLUME_UUID,
+        archive_uuid_probe=None,
     ):
         configured = path or os.environ.get("DISCOVERY_INCREMENTAL_DATABASE")
         self.path = Path(configured or DEFAULT_DATABASE).expanduser().resolve()
@@ -338,6 +351,10 @@ class DiscoveryIncrementalStore:
         self.busy_timeout_ms = max(0, int(busy_timeout_ms))
         self._sleep = sleep_func
         self._random = random_func
+        self.archive_mount_path = Path(archive_mount_path)
+        self.archive_root = Path(archive_root)
+        self.archive_volume_uuid = str(archive_volume_uuid)
+        self.archive_uuid_probe = archive_uuid_probe
 
     def _new_connection(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -365,6 +382,31 @@ class DiscoveryIncrementalStore:
         finally:
             connection.close()
 
+    @contextmanager
+    def _read_connect(self, job_id: str):
+        """Select exactly one authority for a Discovery job."""
+        with archived_read_connection(
+            self.path, job_id,
+            mount_path=self.archive_mount_path,
+            archive_root=self.archive_root,
+            expected_volume_uuid=self.archive_volume_uuid,
+            uuid_probe=self.archive_uuid_probe,
+        ) as archive_connection:
+            if archive_connection is not None:
+                yield archive_connection
+                return
+        with self._connect() as connection:
+            yield connection
+
+    def archive_record(self, job_id: str) -> dict[str, Any] | None:
+        return archive_catalog_record(self.path, job_id)
+
+    def _ensure_writable_job(self, job_id: str) -> None:
+        if self.archive_record(job_id):
+            raise ArchivedJobReadOnlyError(
+                f"Discovery job {job_id} is authoritative on the archive tier"
+            )
+
     def initialize(self):
         with self._connect() as connection:
             columns = {
@@ -377,9 +419,12 @@ class DiscoveryIncrementalStore:
                     "ALTER TABLE discovery_purchase_scenarios ADD COLUMN supplier TEXT"
                 )
             connection.executescript(SCHEMA)
+            initialize_archive_catalog(connection)
+            connection.commit()
 
     def _immediate_transaction(self, operation, *, job_id: str, name: str):
         """Run one idempotent write unit with bounded BUSY/LOCKED recovery."""
+        self._ensure_writable_job(job_id)
         started = time.monotonic()
         for attempt in range(1, self.lock_retry_attempts + 1):
             try:
@@ -486,6 +531,8 @@ class DiscoveryIncrementalStore:
 
     def has_job(self, job_id: str) -> bool:
         self.initialize()
+        if self.archive_record(job_id):
+            return True
         with self._connect() as connection:
             return connection.execute(
                 "SELECT 1 FROM discovery_incremental_jobs WHERE job_id=?", (job_id,)
@@ -712,7 +759,9 @@ class DiscoveryIncrementalStore:
         owns = connection is None
         if owns:
             self.initialize()
-        connection = connection or self._new_connection()
+        read_context = self._read_connect(job_id) if owns else None
+        if read_context is not None:
+            connection = read_context.__enter__()
         try:
             job = connection.execute(
                 "SELECT * FROM discovery_incremental_jobs WHERE job_id=?", (job_id,)
@@ -784,12 +833,12 @@ class DiscoveryIncrementalStore:
                 "exact_replay_capable": True,
             }
         finally:
-            if owns:
-                connection.close()
+            if read_context is not None:
+                read_context.__exit__(None, None, None)
 
     def job_phase(self, job_id: str) -> str:
         """Read the phase without rebuilding the full persisted summary."""
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             row = connection.execute(
                 "SELECT phase FROM discovery_incremental_jobs WHERE job_id=?", (job_id,)
             ).fetchone()
@@ -838,7 +887,9 @@ class DiscoveryIncrementalStore:
         owns = connection is None
         if owns:
             self.initialize()
-        connection = connection or self._new_connection()
+        read_context = self._read_connect(job_id) if owns else None
+        if read_context is not None:
+            connection = read_context.__enter__()
         try:
             row = connection.execute(
                 "SELECT status,metadata_json FROM discovery_incremental_jobs WHERE job_id=?",
@@ -864,8 +915,8 @@ class DiscoveryIncrementalStore:
                 "status": row["status"],
             }
         finally:
-            if owns:
-                connection.close()
+            if read_context is not None:
+                read_context.__exit__(None, None, None)
 
     def terminal_summary_dry_run(
         self, job_id: str, *, state: dict[str, Any] | None = None, connection=None,
@@ -874,7 +925,10 @@ class DiscoveryIncrementalStore:
         owns = connection is None
         if owns:
             self.initialize()
-            connection = self._new_connection()
+            read_context = self._read_connect(job_id)
+            connection = read_context.__enter__()
+        else:
+            read_context = None
         try:
             row = connection.execute(
                 "SELECT status FROM discovery_incremental_jobs WHERE job_id=?", (job_id,),
@@ -897,8 +951,8 @@ class DiscoveryIncrementalStore:
                 "terminal_summary_sha256": _terminal_summary_digest(payload),
             }
         finally:
-            if owns:
-                connection.close()
+            if read_context is not None:
+                read_context.__exit__(None, None, None)
 
     def complete_with_terminal_summary(
         self, job_id: str, state: dict[str, Any],
@@ -984,7 +1038,7 @@ class DiscoveryIncrementalStore:
 
     def pending_catalog_batch(self, job_id: str, limit: int = 20) -> list[dict[str, Any]]:
         self.initialize()
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             rows = connection.execute(
                 """SELECT * FROM discovery_job_items
                    WHERE job_id=? AND catalog_status IS NULL
@@ -997,7 +1051,7 @@ class DiscoveryIncrementalStore:
     ) -> Iterator[dict[str, str]]:
         """Stream committed Catalog statuses for idempotent rotation recovery."""
         self.initialize()
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             cursor = connection.execute(
                 """SELECT canonical_identifier,catalog_status
                    FROM discovery_job_items
@@ -1014,6 +1068,7 @@ class DiscoveryIncrementalStore:
 
     def requeue_catalog_incomplete(self, job_id: str) -> int:
         """Make prior incomplete Catalog results eligible for one resume attempt."""
+        self._ensure_writable_job(job_id)
         observed = _now()
         with self._connect() as connection:
             cursor = connection.execute(
@@ -1055,7 +1110,7 @@ class DiscoveryIncrementalStore:
         self.initialize()
         last_sequence = -1
         while True:
-            with self._connect() as connection:
+            with self._read_connect(job_id) as connection:
                 rows = connection.execute(
                     """SELECT * FROM discovery_job_items WHERE job_id=?
                          AND sequence_no>?
@@ -1122,7 +1177,7 @@ class DiscoveryIncrementalStore:
         if not values:
             return result
         placeholders = ",".join("?" for _ in values)
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             rows = connection.execute(
                 f"""SELECT canonical_identifier,asin,path_hash,classification_id,depth
                     FROM discovery_listing_classifications
@@ -1158,7 +1213,7 @@ class DiscoveryIncrementalStore:
                 " AND json_extract(product_json,'$.is_final_result')=1"
                 if final_only else ""
             )
-            with self._connect() as connection:
+            with self._read_connect(job_id) as connection:
                 item_rows = connection.execute(
                     f"""SELECT * FROM discovery_job_items WHERE job_id=?{predicate}
                         ORDER BY sequence_no LIMIT ? OFFSET ?""",
@@ -1250,6 +1305,7 @@ class DiscoveryIncrementalStore:
     def commit_catalog_batch(
         self, job_id: str, candidates: Iterable[dict[str, Any]], *, batch_number: int,
     ) -> dict[str, Any]:
+        self._ensure_writable_job(job_id)
         observed = _now()
         rows = list(candidates)
         with self._connect() as connection:
@@ -1351,6 +1407,7 @@ class DiscoveryIncrementalStore:
         remove_qogita_scenarios: Iterable[str] | None = None,
     ) -> int:
         """Persist a bounded transformed candidate batch idempotently."""
+        self._ensure_writable_job(job_id)
         observed = _now()
         rows = list(candidates)
         with self._connect() as connection:
@@ -1445,6 +1502,8 @@ class DiscoveryIncrementalStore:
     ) -> int:
         """Idempotently derive normalized taxonomy rows from stored listings."""
         self.initialize()
+        if job_id:
+            self._ensure_writable_job(job_id)
         last_rowid = 0
         written = 0
         while True:
@@ -1492,6 +1551,7 @@ class DiscoveryIncrementalStore:
         self.update_job(job_id, **values)
 
     def upsert_observations(self, job_id: str, observations: Iterable[dict[str, Any]]) -> int:
+        self._ensure_writable_job(job_id)
         observed = _now()
         count = 0
         with self._connect() as connection:
@@ -1529,7 +1589,7 @@ class DiscoveryIncrementalStore:
         return count
 
     def pending_observations(self, job_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             rows = connection.execute(
                 """SELECT observation_json FROM discovery_observations
                    WHERE job_id=? AND CASE WHEN COALESCE(
@@ -1542,7 +1602,7 @@ class DiscoveryIncrementalStore:
 
     def pending_pricing_asins(self, job_id: str, limit: int = 20) -> list[str]:
         """Return the next deterministic unique pending ASIN batch via its index."""
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             rows = connection.execute(
                 """SELECT asin FROM discovery_listings
                    WHERE job_id=?
@@ -1562,6 +1622,7 @@ class DiscoveryIncrementalStore:
 
     def reconcile_pricing_duplicates(self, job_id: str, limit: int = 20) -> int:
         """Copy an already committed ASIN result to pending duplicate listings."""
+        self._ensure_writable_job(job_id)
         pricing_fields = (
             "pricing_status", "fba_sellers", "total_sellers", "seller_count_source",
             "reference_price", "price_source", "reference_price_policy",
@@ -1619,6 +1680,7 @@ class DiscoveryIncrementalStore:
         self, job_id: str, updates_by_asin: dict[str, dict[str, Any]],
     ) -> int:
         """Persist one Pricing response for every pending occurrence of its ASIN."""
+        self._ensure_writable_job(job_id)
         asins = sorted(str(value) for value in updates_by_asin if value)
         if not asins:
             return 0
@@ -1657,7 +1719,7 @@ class DiscoveryIncrementalStore:
         if not ids:
             return {}
         placeholders = ",".join("?" for _ in ids)
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             rows = connection.execute(
                 f"""SELECT observation_id,observation_json FROM discovery_observations
                     WHERE job_id=? AND observation_id IN ({placeholders})""",
@@ -1666,7 +1728,7 @@ class DiscoveryIncrementalStore:
         return {row["observation_id"]: json.loads(row["observation_json"]) for row in rows}
 
     def counts(self, job_id: str) -> dict[str, int]:
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             return {
                 "items": connection.execute(
                     "SELECT COUNT(*) FROM discovery_job_items WHERE job_id=?", (job_id,)
@@ -1687,7 +1749,7 @@ class DiscoveryIncrementalStore:
 
     def pricing_progress_asins(self, job_id: str) -> tuple[set[str], set[str]]:
         """Return bounded phase-local Pricing identities from persisted listings."""
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             rows = connection.execute(
                 """SELECT asin,listing_json FROM discovery_listings
                    WHERE job_id=? AND json_extract(listing_json,'$.evaluation_status')='bsr_passed'""",
@@ -1709,7 +1771,7 @@ class DiscoveryIncrementalStore:
         """Return terminal Fee observations and target without hydrating payloads."""
         terminal = ("valid", "unavailable", "invalid")
         placeholders = ",".join("?" for _ in terminal)
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             row = connection.execute(
                 f"""SELECT COUNT(*) total,
                            SUM(CASE WHEN json_extract(observation_json,'$.fee_status')
@@ -1730,7 +1792,9 @@ class DiscoveryIncrementalStore:
         owns = connection is None
         if owns:
             self.initialize()
-        connection = connection or self._new_connection()
+        read_context = self._read_connect(job_id) if owns else None
+        if read_context is not None:
+            connection = read_context.__enter__()
         try:
             job = connection.execute(
                 """SELECT selected_count FROM discovery_incremental_jobs
@@ -1835,11 +1899,11 @@ class DiscoveryIncrementalStore:
                 "best_opportunity": best_opportunity,
             }
         finally:
-            if owns:
-                connection.close()
+            if read_context is not None:
+                read_context.__exit__(None, None, None)
 
     def definitive_catalog_statuses(self, job_id: str) -> dict[str, str]:
-        with self._connect() as connection:
+        with self._read_connect(job_id) as connection:
             return {
                 row["canonical_identifier"]: row["catalog_status"]
                 for row in connection.execute(
@@ -1854,7 +1918,7 @@ class DiscoveryIncrementalStore:
     def iter_observations(self, job_id: str, *, batch_size: int = 250):
         offset = 0
         while True:
-            with self._connect() as connection:
+            with self._read_connect(job_id) as connection:
                 rows = connection.execute(
                     """SELECT observation_json FROM discovery_observations
                        WHERE job_id=? ORDER BY observation_id LIMIT ? OFFSET ?""",
@@ -1868,6 +1932,7 @@ class DiscoveryIncrementalStore:
 
 
     def update_job(self, job_id: str, **values):
+        self._ensure_writable_job(job_id)
         allowed = {"status", "phase", "last_completed_batch", "checkpoint_bytes_written"}
         values = {key: value for key, value in values.items() if key in allowed}
         if not values:
@@ -1882,6 +1947,7 @@ class DiscoveryIncrementalStore:
             connection.commit()
 
     def add_checkpoint_bytes(self, job_id: str, amount: int):
+        self._ensure_writable_job(job_id)
         with self._connect() as connection:
             connection.execute(
                 """UPDATE discovery_incremental_jobs
@@ -1891,6 +1957,7 @@ class DiscoveryIncrementalStore:
             connection.commit()
 
     def record_resource_event(self, job_id: str, level: str, reason: str, metrics: dict[str, Any]):
+        self._ensure_writable_job(job_id)
         with self._connect() as connection:
             connection.execute(
                 """INSERT INTO discovery_resource_events
