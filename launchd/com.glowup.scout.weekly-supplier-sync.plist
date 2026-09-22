@@ -6,7 +6,7 @@
   <string>com.glowup.scout.weekly-supplier-sync</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/casaloria/Developer/GlowUp-Scout/.venv/bin/python</string>
+    <string>/Users/casaloria/Developer/Glow-Up-Manager/.venv/bin/python</string>
     <string>/Users/casaloria/Developer/GlowUp-Scout/weekly_supplier_sync.py</string>
     <string>run</string>
     <string>--trigger</string>

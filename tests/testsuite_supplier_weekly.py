@@ -1,4 +1,5 @@
 import asyncio
+import plistlib
 import sqlite3
 import sys
 import tempfile
@@ -24,6 +25,18 @@ from umma_discovery import normalize_umma_barcode
 
 
 class WeeklyScheduleTests(unittest.TestCase):
+    def test_launchagent_uses_manager_production_runtime(self):
+        plist_path = (
+            Path(__file__).resolve().parents[1]
+            / "launchd/com.glowup.scout.weekly-supplier-sync.plist"
+        )
+        with plist_path.open("rb") as handle:
+            plist = plistlib.load(handle)
+        self.assertEqual(
+            plist["ProgramArguments"][0],
+            "/Users/casaloria/Developer/Glow-Up-Manager/.venv/bin/python",
+        )
+
     def test_calendar_schedule_is_sunday_two_local(self):
         value = next_weekly_refresh(datetime(2026, 1, 5, 12, tzinfo=timezone.utc))
         self.assertEqual(value.weekday(), 6)
