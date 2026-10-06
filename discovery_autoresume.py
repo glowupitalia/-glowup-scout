@@ -8,18 +8,28 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 
 from discovery import DiscoveryCheckpointStore
 from discovery_incremental import DiscoveryIncrementalStore
-from discovery_jobs import DiscoveryJobRegistry
+from discovery_jobs import DiscoveryJobRegistry, _parse_time, process_alive
+from discovery_recovery import (
+    DISCOVERY_MAX_CONSECUTIVE_AUTO_RESUMES,
+    RETRYABLE_PROVIDER_FAILURE,
+)
 from discovery_resources import DiscoveryResourceGovernor
 from supplier_catalog import SupplierCatalogStore
 
 
-BLOCKED_STATUSES = {"completed", "failed", "manual_paused"}
+BLOCKED_STATUSES = {
+    "completed", "failed", "manual_paused", "manual_intervention_required",
+}
 
 
-def evaluate_autoresume(job_id: str, *, registry=None, store=None, governor=None):
+def evaluate_autoresume(
+    job_id: str, *, registry=None, store=None, governor=None,
+    automatic: bool = False, observed_at: datetime | None = None,
+):
     registry = registry or DiscoveryJobRegistry()
     store = store or DiscoveryIncrementalStore()
     runtime = registry.get(job_id)
@@ -27,6 +37,24 @@ def evaluate_autoresume(job_id: str, *, registry=None, store=None, governor=None
         return False, "job_not_registered"
     if runtime.get("status") in BLOCKED_STATUSES or not runtime.get("resumable"):
         return False, "status_not_resumable"
+    if automatic:
+        now = observed_at or datetime.now(timezone.utc)
+        if runtime.get("failure_category") != RETRYABLE_PROVIDER_FAILURE:
+            return False, "failure_not_retryable"
+        if runtime.get("manual_intervention_required"):
+            return False, "manual_intervention_required"
+        if process_alive(runtime.get("worker_pid")):
+            return False, "worker_alive"
+        cooldown = _parse_time(runtime.get("cooldown_until"))
+        if cooldown and cooldown > now:
+            return False, "cooldown_active"
+        if int(runtime.get("consecutive_auto_resume_count") or 0) >= (
+            DISCOVERY_MAX_CONSECUTIVE_AUTO_RESUMES
+        ):
+            return False, "recovery_limit_reached"
+        active = registry.latest_active()
+        if active and active.get("job_id") != job_id:
+            return False, "another_job_active"
     if not store.has_job(job_id):
         return False, "incremental_store_missing"
     state = DiscoveryCheckpointStore().load(job_id)

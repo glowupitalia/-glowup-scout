@@ -27,6 +27,7 @@ from discovery_incremental import (
 from discovery_incremental_runner import ResourcePause, run_incremental_discovery
 from discovery_resources import DiscoveryResourceGovernor
 from discovery_jobs import DiscoveryJobRegistry, PROJECT_ROOT
+from discovery_recovery import classify_retryable_failure, progress_fingerprint
 from notifications import send_discovery_terminal_notification
 from product_fees import search_product_fees_batch
 from supplier_catalog import SupplierCatalogStore
@@ -43,6 +44,24 @@ from storage_retention import run_automatic_retention
 
 
 logger = logging.getLogger(__name__)
+
+
+def _record_worker_failure(registry, job_id, error, incremental_store=None):
+    runtime = registry.get(job_id) or {}
+    incremental = None
+    if incremental_store is not None:
+        try:
+            if incremental_store.has_job(job_id):
+                incremental = incremental_store.summary(job_id)
+        except Exception:
+            incremental = None
+    failure = classify_retryable_failure(
+        error, phase=str(runtime.get("phase") or (incremental or {}).get("phase") or "unknown"),
+    )
+    registry.fail(
+        job_id, str(error), failure=failure,
+        progress_fingerprint_value=progress_fingerprint(runtime, incremental),
+    )
 
 
 def _export_metadata(path: Path, result: dict) -> dict:
@@ -237,7 +256,7 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None, maintenance_lo
         }
     except Exception as exc:
         logger.exception("DISCOVERY PREPARATION FAILED | job_id=%s", job_id)
-        registry.fail(job_id, str(exc))
+        _record_worker_failure(registry, job_id, exc, incremental_store)
         raise
 
     token_provider = RefreshingTokenProvider(get_access_token)
@@ -383,7 +402,7 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None, maintenance_lo
         return paused
     except Exception as exc:
         logger.exception("DISCOVERY WORKER FAILED | job_id=%s", job_id)
-        registry.fail(job_id, str(exc))
+        _record_worker_failure(registry, job_id, exc, incremental_store)
         raise
 
 

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.glowup.scout.discovery-autoresume</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/casaloria/Developer/GlowUp-Scout/.venv/bin/python</string>
+    <string>/Users/casaloria/Developer/GlowUp-Scout/discovery_recovery_supervisor.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/casaloria/Developer/GlowUp-Scout</string>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>UserName</key>
+  <string>casaloria</string>
+  <key>GroupName</key>
+  <string>staff</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/casaloria</string>
+    <key>PATH</key>
+    <string>/Users/casaloria/Developer/GlowUp-Scout/.venv/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/casaloria/Library/Logs/glowup-discovery-autoresume.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/casaloria/Library/Logs/glowup-discovery-autoresume.err.log</string>
+</dict>
+</plist>

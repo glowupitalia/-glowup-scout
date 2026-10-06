@@ -23,7 +23,16 @@ TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 
 
 class AmazonBatchError(RuntimeError):
-    pass
+    def __init__(
+        self, message, *, status_code=None, provider="amazon", operation="unknown",
+        retryable=False, transport_class=None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.provider = provider
+        self.operation = operation
+        self.retryable = bool(retryable)
+        self.transport_class = transport_class
 
 
 class CatalogItems(list):
@@ -105,11 +114,17 @@ def _request_with_retry(
                 return response
             if status == 401 and attempt < max_attempts:
                 token_provider.invalidate()
-                last_error = AmazonBatchError("Amazon token rejected")
+                last_error = AmazonBatchError(
+                    "Amazon token rejected", status_code=401,
+                    operation=phase, retryable=False,
+                )
                 continue
             if status not in TRANSIENT_STATUSES:
                 response.raise_for_status()
-            last_error = AmazonBatchError(f"Amazon temporary status {status}")
+            last_error = AmazonBatchError(
+                f"Amazon temporary status {status}", status_code=status,
+                operation=phase, retryable=True,
+            )
         if attempt < max_attempts:
             delay = backoff_seconds * (2 ** (attempt - 1))
             delay += min(1.0, delay * 0.1) * random_func()
@@ -121,7 +136,15 @@ def _request_with_retry(
                 _request_exception_cause(last_error), delay,
             )
             sleep_func(delay)
-    raise last_error or AmazonBatchError("Amazon request failed")
+    if isinstance(last_error, (requests.ConnectionError, requests.Timeout)):
+        wrapped = AmazonBatchError(
+            "Amazon transient transport failure", operation=phase,
+            retryable=True, transport_class=type(last_error).__name__,
+        )
+        raise wrapped from last_error
+    if last_error is not None:
+        raise last_error
+    raise AmazonBatchError("Amazon request failed", operation=phase)
 
 
 def _request_exception_cause(error):

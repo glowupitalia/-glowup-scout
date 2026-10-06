@@ -13,6 +13,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from discovery_recovery import (
+    DISCOVERY_MAX_CONSECUTIVE_AUTO_RESUMES,
+    DISCOVERY_RECOVERY_COOLDOWN_SECONDS,
+    RETRYABLE_PROVIDER_FAILURE,
+    progress_advanced,
+    progress_fingerprint,
+)
 from storage_maintenance import MaintenanceLockUnavailable, StorageMaintenanceLock
 
 
@@ -65,7 +72,19 @@ CREATE TABLE IF NOT EXISTS discovery_job_runtime (
     checkpoint_path TEXT,
     export_path TEXT,
     phase_started_at TEXT,
-    phase_progress_start INTEGER NOT NULL DEFAULT 0
+    phase_progress_start INTEGER NOT NULL DEFAULT 0,
+    failure_category TEXT,
+    failure_signature TEXT,
+    failure_phase TEXT,
+    failure_at TEXT,
+    progress_fingerprint TEXT,
+    consecutive_auto_resume_count INTEGER NOT NULL DEFAULT 0,
+    total_auto_resume_count INTEGER NOT NULL DEFAULT 0,
+    last_auto_resume_at TEXT,
+    cooldown_until TEXT,
+    last_recovery_outcome TEXT,
+    manual_intervention_required INTEGER NOT NULL DEFAULT 0,
+    failure_details_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_job_runtime_updated
 ON discovery_job_runtime(updated_at DESC);
@@ -196,15 +215,27 @@ class DiscoveryJobRegistry:
                     "PRAGMA table_info(discovery_job_runtime)"
                 ).fetchall()
             }
-            if "phase_started_at" not in existing:
-                connection.execute(
-                    "ALTER TABLE discovery_job_runtime ADD COLUMN phase_started_at TEXT"
-                )
-            if "phase_progress_start" not in existing:
-                connection.execute(
-                    "ALTER TABLE discovery_job_runtime ADD COLUMN phase_progress_start "
-                    "INTEGER NOT NULL DEFAULT 0"
-                )
+            additions = {
+                "phase_started_at": "TEXT",
+                "phase_progress_start": "INTEGER NOT NULL DEFAULT 0",
+                "failure_category": "TEXT",
+                "failure_signature": "TEXT",
+                "failure_phase": "TEXT",
+                "failure_at": "TEXT",
+                "progress_fingerprint": "TEXT",
+                "consecutive_auto_resume_count": "INTEGER NOT NULL DEFAULT 0",
+                "total_auto_resume_count": "INTEGER NOT NULL DEFAULT 0",
+                "last_auto_resume_at": "TEXT",
+                "cooldown_until": "TEXT",
+                "last_recovery_outcome": "TEXT",
+                "manual_intervention_required": "INTEGER NOT NULL DEFAULT 0",
+                "failure_details_json": "TEXT",
+            }
+            for column, declaration in additions.items():
+                if column not in existing:
+                    connection.execute(
+                        f"ALTER TABLE discovery_job_runtime ADD COLUMN {column} {declaration}"
+                    )
             connection.commit()
 
     @staticmethod
@@ -217,6 +248,14 @@ class DiscoveryJobRegistry:
         )
         result["filters"] = json.loads(result.pop("filters_json") or "{}")
         result["resumable"] = bool(result.get("resumable"))
+        result["manual_intervention_required"] = bool(
+            result.get("manual_intervention_required")
+        )
+        if result.get("failure_details_json"):
+            try:
+                result["failure_details"] = json.loads(result["failure_details_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result["failure_details"] = None
         return result
 
     def register_checkpoint(self, state: dict[str, Any], *, maintenance_lock=None):
@@ -243,7 +282,13 @@ class DiscoveryJobRegistry:
                          phase=excluded.phase, started_at=COALESCE(discovery_job_runtime.started_at,excluded.started_at),
                          budget=excluded.budget, selected_suppliers_json=excluded.selected_suppliers_json,
                          filters_json=excluded.filters_json, checkpoint_path=excluded.checkpoint_path,
-                         resumable=excluded.resumable, updated_at=excluded.updated_at""",
+                         resumable=excluded.resumable, updated_at=excluded.updated_at,
+                         consecutive_auto_resume_count=0,
+                         manual_intervention_required=0,cooldown_until=NULL,
+                         last_recovery_outcome=CASE
+                           WHEN discovery_job_runtime.failure_at IS NULL
+                           THEN discovery_job_runtime.last_recovery_outcome
+                           ELSE 'manual_resume_requested' END""",
                     (
                         state["job_id"], "resumable", state.get("phase") or "initialized",
                         state.get("started_at"), now, state.get("completed_at"),
@@ -368,8 +413,28 @@ class DiscoveryJobRegistry:
         if total is not None:
             updates.append("progress_total=?")
             values.append(int(total))
-        values.extend([job_id, pid])
         with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM discovery_job_runtime WHERE job_id=? AND worker_pid=?",
+                (job_id, pid),
+            ).fetchone()
+            if row is not None and row["last_auto_resume_at"]:
+                next_phase = phase or row["phase"]
+                next_current = int(current if current is not None else row["progress_current"] or 0)
+                next_total = int(total if total is not None else row["progress_total"] or 0)
+                observed_fingerprint = progress_fingerprint({
+                    "phase": next_phase,
+                    "progress_current": next_current,
+                    "progress_total": next_total,
+                })
+                if progress_advanced(row["progress_fingerprint"], observed_fingerprint):
+                    updates.extend([
+                        "consecutive_auto_resume_count=0",
+                        "progress_fingerprint=?",
+                        "last_recovery_outcome='progress_observed'",
+                    ])
+                    values.append(observed_fingerprint)
+            values.extend([job_id, pid])
             connection.execute(
                 f"UPDATE discovery_job_runtime SET {','.join(updates)} "
                 "WHERE job_id=? AND worker_pid=? "
@@ -507,14 +572,74 @@ class DiscoveryJobRegistry:
             )
             connection.commit()
 
-    def fail(self, job_id: str, message: str):
+    def fail(
+        self, job_id: str, message: str, *, failure=None,
+        progress_fingerprint_value: str | None = None,
+        observed_at: datetime | None = None,
+    ):
+        observed_at = observed_at or datetime.now(timezone.utc)
+        observed = observed_at.isoformat().replace("+00:00", "Z")
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM discovery_job_runtime WHERE job_id=?", (job_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return
+            fingerprint = progress_fingerprint_value or progress_fingerprint(dict(row))
+            progressed = progress_advanced(row["progress_fingerprint"], fingerprint)
+            consecutive = 0 if progressed else int(row["consecutive_auto_resume_count"] or 0)
+            retryable = bool(
+                failure and failure.category == RETRYABLE_PROVIDER_FAILURE
+            )
+            manual_required = bool(
+                retryable
+                and consecutive >= DISCOVERY_MAX_CONSECUTIVE_AUTO_RESUMES
+                and row["last_auto_resume_at"]
+            )
+            category = failure.category if failure else "unclassified_failure"
+            signature = failure.signature if failure else None
+            details = failure.as_dict() if failure else None
+            cooldown = (
+                observed_at + timedelta(seconds=DISCOVERY_RECOVERY_COOLDOWN_SECONDS)
+                if retryable and not manual_required else None
+            )
+            status = "manual_intervention_required" if manual_required else "resumable"
+            outcome = (
+                "manual_intervention_required" if manual_required
+                else "retryable_failure" if retryable
+                else "non_retryable_failure"
+            )
             connection.execute(
-                """UPDATE discovery_job_runtime SET status='resumable',resumable=1,error=?,
-                   updated_at=?,worker_pid=NULL,lease_expires_at=NULL WHERE job_id=?""",
-                (str(message)[:500], utc_now(), job_id),
+                """UPDATE discovery_job_runtime SET status=?,resumable=1,error=?,
+                   updated_at=?,worker_pid=NULL,lease_expires_at=NULL,
+                   failure_category=?,failure_signature=?,failure_phase=?,failure_at=?,
+                   progress_fingerprint=?,consecutive_auto_resume_count=?,
+                   cooldown_until=?,last_recovery_outcome=?,
+                   manual_intervention_required=?,failure_details_json=? WHERE job_id=?""",
+                (
+                    status, str(message)[:500], observed, category, signature,
+                    str(row["phase"] or "unknown"), observed, fingerprint, consecutive,
+                    cooldown.isoformat().replace("+00:00", "Z") if cooldown else None,
+                    outcome, int(manual_required),
+                    json.dumps(details, sort_keys=True) if details else None, job_id,
+                ),
             )
             connection.commit()
+
+    def recovery_candidates(self) -> list[dict[str, Any]]:
+        """Return retryable stopped jobs; the supervisor applies time/owner guards."""
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM discovery_job_runtime
+                   WHERE status='resumable' AND resumable=1
+                     AND failure_category=?
+                   ORDER BY failure_at,job_id""",
+                (RETRYABLE_PROVIDER_FAILURE,),
+            ).fetchall()
+        return [self._row(row) for row in rows]
 
     def resource_pause(
         self, job_id: str, *, reason: str, metrics: dict[str, Any], phase: str,
@@ -601,7 +726,11 @@ class DiscoveryJobRegistry:
                 )
             connection.commit()
 
-    def launch(self, job_id: str, *, maintenance_lock=None) -> int:
+    def launch(
+        self, job_id: str, *, maintenance_lock=None, auto_resume: bool = False,
+        expected_failure_signature: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> int:
         maintenance_lock = maintenance_lock or StorageMaintenanceLock(
             Path(self.path).parent / "discovery-maintenance.lock"
         )
@@ -616,11 +745,39 @@ class DiscoveryJobRegistry:
                     if active["job_id"] == job_id:
                         raise RuntimeError("Discovery job is already running")
                     raise RuntimeError(f"Another Discovery job is running: {active['job_id']}")
+                now = observed_at or datetime.now(timezone.utc)
+                # The ownership lease is wall-clock state.  ``observed_at`` is
+                # injectable for deterministic cooldown tests, but must never
+                # make a freshly claimed launch look stale to another process.
                 launch_deadline = (
                     datetime.now(timezone.utc) + timedelta(seconds=60)
                 ).isoformat().replace("+00:00", "Z")
                 with self._connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
+                    row = connection.execute(
+                        "SELECT * FROM discovery_job_runtime WHERE job_id=?", (job_id,),
+                    ).fetchone()
+                    if row is None:
+                        connection.rollback()
+                        raise ValueError("Discovery job is not registered")
+                    if auto_resume:
+                        cooldown = _parse_time(row["cooldown_until"])
+                        eligible = (
+                            row["status"] == "resumable"
+                            and bool(row["resumable"])
+                            and row["failure_category"] == RETRYABLE_PROVIDER_FAILURE
+                            and not bool(row["manual_intervention_required"])
+                            and int(row["consecutive_auto_resume_count"] or 0)
+                            < DISCOVERY_MAX_CONSECUTIVE_AUTO_RESUMES
+                            and (cooldown is None or cooldown <= now)
+                            and (
+                                expected_failure_signature is None
+                                or row["failure_signature"] == expected_failure_signature
+                            )
+                        )
+                        if not eligible or process_alive(row["worker_pid"]):
+                            connection.rollback()
+                            raise RuntimeError("Discovery job is not eligible for auto-resume")
                     concurrent = connection.execute(
                         "SELECT job_id FROM discovery_job_runtime "
                         "WHERE status IN ('launching','running') LIMIT 1"
@@ -630,11 +787,28 @@ class DiscoveryJobRegistry:
                         raise RuntimeError(
                             f"Discovery job is already active: {concurrent['job_id']}"
                         )
-                    connection.execute(
-                        """UPDATE discovery_job_runtime SET status='launching',worker_pid=NULL,
-                           updated_at=?,lease_expires_at=? WHERE job_id=?""",
-                        (utc_now(), launch_deadline, job_id),
-                    )
+                    if auto_resume:
+                        connection.execute(
+                            """UPDATE discovery_job_runtime SET status='launching',
+                               worker_pid=NULL,updated_at=?,lease_expires_at=?,
+                               consecutive_auto_resume_count=consecutive_auto_resume_count+1,
+                               total_auto_resume_count=total_auto_resume_count+1,
+                               last_auto_resume_at=?,last_recovery_outcome='launch_requested'
+                               WHERE job_id=?""",
+                            (now.isoformat().replace("+00:00", "Z"), launch_deadline,
+                             now.isoformat().replace("+00:00", "Z"), job_id),
+                        )
+                    else:
+                        connection.execute(
+                            """UPDATE discovery_job_runtime SET status='launching',worker_pid=NULL,
+                               updated_at=?,lease_expires_at=?,
+                               consecutive_auto_resume_count=0,
+                               manual_intervention_required=0,cooldown_until=NULL,
+                               last_recovery_outcome=CASE WHEN failure_at IS NULL
+                                 THEN last_recovery_outcome ELSE 'manual_resume_requested' END
+                               WHERE job_id=?""",
+                            (utc_now(), launch_deadline, job_id),
+                        )
                     connection.commit()
         except MaintenanceLockUnavailable as error:
             if self.get(job_id):
@@ -662,6 +836,8 @@ class DiscoveryJobRegistry:
         with self._connect() as connection:
             connection.execute(
                 """UPDATE discovery_job_runtime SET worker_pid=?,updated_at=?
+                   ,last_recovery_outcome=CASE WHEN last_recovery_outcome='launch_requested'
+                     THEN 'launched' ELSE last_recovery_outcome END
                    WHERE job_id=? AND status IN ('launching','running')""",
                 (process.pid, utc_now(), job_id),
             )

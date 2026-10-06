@@ -1055,6 +1055,14 @@ def _render_discovery_runtime(job_id):
             f"Ultimo aggiornamento: {_discovery_local_time(runtime.get('updated_at'))} · "
             f"{format_eta(discovery_phase_eta_seconds(runtime))}"
         )
+        if runtime.get("last_auto_resume_at"):
+            st.caption(
+                "Auto-recovery eseguito: "
+                f"{_discovery_local_time(runtime.get('last_auto_resume_at'))}"
+                f" · consecutive: {int(runtime.get('consecutive_auto_resume_count') or 0)}"
+                f" · totali: {int(runtime.get('total_auto_resume_count') or 0)}"
+                f" · esito: {runtime.get('last_recovery_outcome') or '—'}"
+            )
         if runtime["status"] in {"computed", "export_pending", "export_running"}:
             st.info("Calcolo completato. Generazione Excel in corso con memoria protetta.")
         elif runtime["status"] == "notification_pending":
@@ -1131,9 +1139,30 @@ def _render_discovery_runtime(job_id):
         state = _load_authoritative_discovery_state(
             runtime["job_id"], runtime=runtime,
         )
-        st.warning(
-            f"Discovery interrotta alla fase {state.get('phase')}. "
-            "Il checkpoint e lo stesso campione sono disponibili."
+        if runtime.get("manual_intervention_required"):
+            st.error("Discovery: intervento manuale richiesto")
+            st.caption(
+                "Il limite di 3 auto-recovery consecutivi senza progresso è stato "
+                "raggiunto. Nessun ulteriore riavvio automatico verrà eseguito."
+            )
+        elif runtime.get("failure_category") == "retryable_provider_failure":
+            st.warning("Discovery interrotta per una failure transitoria")
+            if runtime.get("cooldown_until"):
+                st.caption(
+                    "Auto-recovery: cooldown · prossimo tentativo dopo "
+                    f"{_discovery_local_time(runtime.get('cooldown_until'))}."
+                )
+        else:
+            st.warning(
+                f"Discovery interrotta alla fase {state.get('phase')}. "
+                "Il checkpoint e lo stesso campione sono disponibili."
+            )
+        st.caption(
+            f"Recovery consecutive: {int(runtime.get('consecutive_auto_resume_count') or 0)}"
+            f" · recovery totali: {int(runtime.get('total_auto_resume_count') or 0)}"
+            f" · ultima categoria: {runtime.get('failure_category') or '—'}"
+            f" · ultimo auto-resume: "
+            f"{_discovery_local_time(runtime.get('last_auto_resume_at')) if runtime.get('last_auto_resume_at') else '—'}"
         )
         if st.button("Riprendi Discovery", key="resume_current_discovery", type="primary"):
             _start_discovery_worker(state)
