@@ -108,7 +108,10 @@ def get_access_token():
     return response.json()["access_token"]
 
 
-def execute(job_id: str, *, registry=None, checkpoint_store=None, maintenance_lock=None):
+def execute(
+    job_id: str, *, registry=None, checkpoint_store=None, maintenance_lock=None,
+    storage_recovery=None,
+):
     load_env()
     registry = registry or DiscoveryJobRegistry()
     checkpoint_store = checkpoint_store or DiscoveryCheckpointStore()
@@ -130,6 +133,39 @@ def execute(job_id: str, *, registry=None, checkpoint_store=None, maintenance_lo
     admission = evaluate_discovery_admission(
         selected_suppliers, qogita_universe, metrics=storage_before,
     )
+    if not admission["allowed"]:
+        if storage_recovery is None:
+            from discovery_archive_lifecycle import run_storage_recovery_once
+            storage_recovery = run_storage_recovery_once
+        try:
+            recovery = storage_recovery()
+        except Exception as error:
+            logger.exception("DISCOVERY STORAGE RECOVERY FAILED | job_id=%s", job_id)
+            recovery = {
+                "status": "RECOVERY_FAILED", "recovered": False,
+                "error": f"{type(error).__name__}: {error}",
+            }
+        storage_after_recovery = collect_storage_metrics()
+        admission_after_recovery = evaluate_discovery_admission(
+            selected_suppliers, qogita_universe, metrics=storage_after_recovery,
+        )
+        append_storage_audit_event({
+            "event": "pre_admission_storage_recovery", "workload_id": job_id,
+            "storage_before": storage_before, "storage_after": storage_after_recovery,
+            "retention_execution": True, "recovery": recovery,
+            "decision": admission_after_recovery,
+        }, path=Path(registry.path).parent / "storage-workload-metrics.jsonl")
+        if admission_after_recovery["allowed"]:
+            storage_before = storage_after_recovery
+            admission = admission_after_recovery
+        else:
+            admission = admission_after_recovery
+            admission["storage_recovery"] = {
+                "status": recovery.get("status"),
+                "planned": recovery.get("planned"),
+                "compaction": (recovery.get("compaction") or {}).get("status"),
+                "error": recovery.get("error"),
+            }
     if not admission["allowed"]:
         plan = production_retention_plan(
             str((admission.get("watermark") or {}).get("state") or "UNKNOWN")

@@ -303,12 +303,53 @@ class IntegrationTests(unittest.TestCase):
         }
         retention.return_value = {"summary": {"candidate_count": 2}}
 
-        result = execute("job", registry=registry, checkpoint_store=checkpoint)
+        recovery = MagicMock(return_value={"status": "COMPLETED", "planned": 0})
+        result = execute(
+            "job", registry=registry, checkpoint_store=checkpoint,
+            storage_recovery=recovery,
+        )
 
         self.assertEqual(result["status"], "admission_blocked_storage")
         registry.admission_blocked.assert_called_once()
         registry.claim.assert_not_called()
-        audit.assert_called_once()
+        recovery.assert_called_once()
+        self.assertEqual(2, audit.call_count)
+
+    @patch("discovery_worker.append_storage_audit_event")
+    @patch("discovery_worker.evaluate_discovery_admission")
+    @patch("discovery_worker.collect_storage_metrics")
+    @patch("discovery_worker.load_env")
+    def test_worker_rechecks_admission_after_physical_recovery(
+        self, load_env, collect, evaluate, audit,
+    ):
+        from discovery_worker import execute
+
+        registry = MagicMock()
+        registry.path = Path("/tmp/test-runtime.sqlite3")
+        registry.get.return_value = {"selected_suppliers": ["abw"]}
+        registry.claim.return_value = False
+        checkpoint = MagicMock()
+        checkpoint.state_path.return_value = Path("/definitely/missing/state.json")
+        checkpoint.path.return_value = Path("/definitely/missing/legacy.json")
+        collect.side_effect = [metrics(35), metrics(50)]
+        evaluate.side_effect = [
+            {"allowed": False, "status": "admission_blocked_storage", "reason": "floor",
+             "watermark": {"state": "PRESSURE"}},
+            {"allowed": True, "status": "admitted", "reason": "headroom_ok",
+             "watermark": {"state": "NORMAL"}},
+        ]
+        recovery = MagicMock(return_value={"status": "COMPLETED", "recovered": True})
+
+        with self.assertRaisesRegex(RuntimeError, "already owned"):
+            execute(
+                "job", registry=registry, checkpoint_store=checkpoint,
+                storage_recovery=recovery,
+            )
+
+        recovery.assert_called_once()
+        registry.admission_blocked.assert_not_called()
+        registry.claim.assert_called_once()
+        self.assertEqual("pre_admission_storage_recovery", audit.call_args_list[0].args[0]["event"])
 
     @patch("discovery_worker.append_storage_audit_event")
     @patch("discovery_worker.evaluate_discovery_admission")

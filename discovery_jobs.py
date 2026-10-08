@@ -547,7 +547,7 @@ class DiscoveryJobRegistry:
         with log_path.open("ab", buffering=0) as log:
             process = subprocess.Popen(
                 [sys.executable, str(PROJECT_ROOT / "discovery_archive_lifecycle.py"),
-                 "--max-jobs", "1", "--compact-if-due", "--summary"],
+                 "--compact-if-due", "--summary"],
                 cwd=PROJECT_ROOT, stdin=subprocess.DEVNULL,
                 stdout=log, stderr=log, start_new_session=True, close_fds=True,
             )

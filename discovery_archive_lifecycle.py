@@ -42,6 +42,8 @@ LIFECYCLE_STATES = {
 COMPACT_MIN_BYTES = 2 * 1024**3
 COMPACT_MIN_PERCENT = 15.0
 COMPACT_PRESSURE_FREE_BYTES = 55 * 1024**3
+COMPACT_LOCAL_MARGIN_BYTES = 1024**3
+DEFAULT_STAGING_ROOT = DEFAULT_MOUNT_PATH / "Staging" / "SQLite Tiering" / "Discovery"
 
 
 def _now() -> str:
@@ -145,6 +147,7 @@ class DiscoveryArchiveLifecycle:
         rotation_database: Path = DEFAULT_ROTATION_DATABASE, state_path: Path = DEFAULT_STATE,
         mount_path: Path = DEFAULT_MOUNT_PATH, archive_root: Path = DEFAULT_ARCHIVE_ROOT,
         expected_uuid: str = DEFAULT_VOLUME_UUID, uuid_probe=None, maintenance_lock=None,
+        staging_root: Path | None = None,
     ):
         self.database = Path(database)
         self.runtime_database = Path(runtime_database)
@@ -154,6 +157,9 @@ class DiscoveryArchiveLifecycle:
         self.archive_root = Path(archive_root)
         self.expected_uuid = expected_uuid
         self.uuid_probe = uuid_probe
+        self.staging_root = Path(staging_root) if staging_root else (
+            self.mount_path / "Staging" / "SQLite Tiering" / "Discovery"
+        )
         self.lock = maintenance_lock or StorageMaintenanceLock(self.database.parent / "discovery-maintenance.lock")
 
     def _save_job(self, job_id: str, state: str, **values: Any) -> dict[str, Any]:
@@ -234,6 +240,7 @@ class DiscoveryArchiveLifecycle:
             return self._save_job(
                 job_id, "ARCHIVED", archive=archive, row_counts=deleted,
                 rows_deleted=sum(deleted.values()), reference_hash=reference_hash,
+                logical_bytes_reclaimed=int(candidate.get("estimated_bytes") or 0),
             )
         except ArchiveStorageUnavailable as error:
             return self._save_job(job_id, "RETRYABLE", error=str(error), reference_hash=reference_hash)
@@ -309,66 +316,208 @@ class DiscoveryArchiveLifecycle:
         )
 
     def compact(self) -> dict[str, Any]:
-        """VACUUM INTO, verify, atomic swap, smoke test, then remove bounded rollback."""
-        before = self.metrics()
+        """Rebuild on X9, verify, then atomically replace the internal DB.
+
+        Cross-volume rename is deliberately never attempted.  X9 holds the
+        immutable rollback and the VACUUM output; the verified rebuilt file is
+        copied back beside the live database before the same-filesystem swap.
+        """
+        # The archive planner is intentionally bounded and can time out on a
+        # heavily fragmented production DB.  Compaction needs physical SQLite
+        # metrics only; archive eligibility was already resolved by run().
+        physical_plan = {"candidates": []}
+        before = self.metrics(plan=physical_plan)
         if not self.compaction_due(before):
             return {"status": "NOT_DUE", "before": before}
         runtime = _runtime_rows(self.runtime_database)
-        active = [job for job, row in runtime.items() if str(row.get("status") or "").casefold() in ACTIVE_RUNTIME]
+        active = [
+            job for job, row in runtime.items()
+            if str(row.get("status") or "").casefold() in ACTIVE_RUNTIME
+            and str(row.get("status") or "").casefold() != "admission_blocked_storage"
+        ]
         if active:
             return {"status": "BLOCKED_ACTIVE_DISCOVERY", "active": active, "before": before}
-        compact = self.database.with_name(f".{self.database.name}.compact-{uuid.uuid4().hex}")
-        rollback = self.database.with_name(f".{self.database.name}.precompact-{uuid.uuid4().hex}")
+        validate_archive_volume(
+            mount_path=self.mount_path, expected_uuid=self.expected_uuid,
+            uuid_probe=self.uuid_probe,
+        )
+        source_size = self.database.stat().st_size
+        if shutil.disk_usage(self.mount_path).free < (source_size * 2) + COMPACT_LOCAL_MARGIN_BYTES:
+            raise ArchiveStorageUnavailable("insufficient X9 space for compact database and rollback")
+        run_id = f"compaction-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex}"
+        stage = self.staging_root / run_id
+        stage.mkdir(parents=True, exist_ok=False)
+        compact_x9 = stage / "discovery_incremental.compact.sqlite3"
+        rollback_x9 = stage / "discovery_incremental.rollback.sqlite3"
+        compact_local = self.database.with_name(f".{self.database.name}.compact-{uuid.uuid4().hex}")
+        rollback_local = self.database.with_name(f".{self.database.name}.precompact-{uuid.uuid4().hex}")
+        manifest_path = stage / "manifest.json"
+        swapped = False
         with self.lock.retention_apply_guard(timeout_seconds=0.0):
+            for stale in self.database.parent.glob(f".{self.database.name}.compact-*"):
+                if stale.is_file() and not stale.is_symlink():
+                    stale.unlink()
             connection = sqlite3.connect(self.database, timeout=30)
             try:
                 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ArchiveIntegrityError("source integrity_check failed")
                 schema_count = int(connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0])
-                connection.execute("VACUUM INTO ?", (str(compact),))
+                source_contract = self._database_contract(connection)
+                shutil.copy2(self.database, rollback_x9)
+                self._fsync_file(rollback_x9)
+                self._verify_database(rollback_x9, schema_count, source_contract)
+                connection.execute("VACUUM INTO ?", (str(compact_x9),))
             finally:
                 connection.close()
-            # A zero-length/stale WAL belongs to the old inode and must never
-            # be replayed against the atomically promoted compact database.
+            self._fsync_file(compact_x9)
+            self._verify_database(compact_x9, schema_count, source_contract)
+            compact_size = compact_x9.stat().st_size
+            if shutil.disk_usage(self.database.parent).free < compact_size + COMPACT_LOCAL_MARGIN_BYTES:
+                raise ArchiveStorageUnavailable("insufficient internal staging space for verified compact database")
+            shutil.copy2(compact_x9, compact_local)
+            self._fsync_file(compact_local)
+            self._verify_database(compact_local, schema_count, source_contract)
+            _atomic_json(manifest_path, {
+                "version": 1, "run_id": run_id, "created_at": _now(),
+                "source_path": str(self.database), "source_bytes": self.database.stat().st_size,
+                "compact_bytes": compact_size, "rollback_path": str(rollback_x9),
+                "compact_sha256": self._file_sha256(compact_x9),
+                "rollback_sha256": self._file_sha256(rollback_x9),
+                "source_contract": source_contract, "status": "VERIFIED_STAGED",
+            })
+            # Sidecars belong to the old inode.  No writer can exist while the
+            # exclusive maintenance guard is held.
             for sidecar in (Path(str(self.database) + "-wal"), Path(str(self.database) + "-shm")):
                 if sidecar.exists():
                     sidecar.unlink()
-            rebuilt = sqlite3.connect(compact)
+            os.replace(self.database, rollback_local)
             try:
-                if rebuilt.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                    raise ArchiveIntegrityError("rebuilt integrity_check failed")
-                if int(rebuilt.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]) != schema_count:
-                    raise ArchiveIntegrityError("rebuilt schema mismatch")
-            finally:
-                rebuilt.close()
-            with compact.open("rb") as stream:
-                os.fsync(stream.fileno())
-            os.replace(self.database, rollback)
-            try:
-                os.replace(compact, self.database)
-                smoke = sqlite3.connect(self.database)
-                try:
-                    if smoke.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                        raise ArchiveIntegrityError("post-swap quick_check failed")
-                finally:
-                    smoke.close()
+                os.replace(compact_local, self.database)
+                swapped = True
+                self._verify_database(self.database, schema_count, source_contract, quick=True)
             except BaseException:
                 if self.database.exists():
                     self.database.unlink()
-                os.replace(rollback, self.database)
+                os.replace(rollback_local, self.database)
                 raise
-            rollback.unlink()
+            rollback_local.unlink()
             directory = os.open(self.database.parent, os.O_RDONLY)
             try:
                 os.fsync(directory)
             finally:
                 os.close(directory)
-        after = self.metrics()
+        if compact_local.exists():
+            compact_local.unlink()
+        after = self.metrics(plan=physical_plan)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update({
+            "status": "ACCEPTED", "completed_at": _now(),
+            "physical_bytes_reclaimed": max(0, int(before["sqlite_bytes"]) - int(after["sqlite_bytes"])),
+            "rollback_retained": True, "swapped": swapped,
+        })
+        _atomic_json(manifest_path, manifest)
         payload = _load_state(self.state_path)
-        payload["last_compaction"] = {"completed_at": _now(), "before": before, "after": after}
+        payload["last_compaction"] = {
+            "completed_at": _now(), "before": before, "after": after,
+            "manifest_path": str(manifest_path), "rollback_path": str(rollback_x9),
+            "physical_bytes_reclaimed": manifest["physical_bytes_reclaimed"],
+        }
         _atomic_json(self.state_path, payload)
-        return {"status": "COMPACTED", "before": before, "after": after}
+        return {
+            "status": "COMPACTED", "before": before, "after": after,
+            "manifest_path": str(manifest_path), "rollback_path": str(rollback_x9),
+            "physical_bytes_reclaimed": manifest["physical_bytes_reclaimed"],
+        }
+
+    @staticmethod
+    def _fsync_file(path: Path) -> None:
+        with path.open("rb") as stream:
+            os.fsync(stream.fileno())
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _database_contract(connection: sqlite3.Connection) -> dict[str, Any]:
+        tables = {
+            str(row[0]) for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        protected = (
+            "discovery_incremental_jobs", "discovery_amazon_cache",
+            "discovery_amazon_fee_cache", "discovery_archive_segments",
+        )
+        contract: dict[str, Any] = {
+            table: int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            for table in protected if table in tables
+        }
+        for table in ("discovery_amazon_cache", "discovery_amazon_fee_cache"):
+            if table not in tables:
+                continue
+            rows = [
+                [str(row[0] or ""), int(row[1])]
+                for row in connection.execute(
+                    f'SELECT source_job_id,COUNT(*) FROM "{table}" '
+                    "GROUP BY source_job_id ORDER BY source_job_id"
+                )
+            ]
+            contract[f"{table}_source_map_sha256"] = hashlib.sha256(
+                json.dumps(rows, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+        if "discovery_archive_segments" in tables:
+            rows = [list(row) for row in connection.execute(
+                "SELECT job_id,status,archive_path,content_sha256,row_counts_json "
+                "FROM discovery_archive_segments ORDER BY job_id"
+            )]
+            contract["archive_authority_sha256"] = hashlib.sha256(
+                json.dumps(rows, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+        return contract
+
+    def _verify_database(
+        self, path: Path, schema_count: int, contract: dict[str, Any], *, quick: bool = False,
+    ) -> None:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            pragma = "quick_check" if quick else "integrity_check"
+            if connection.execute(f"PRAGMA {pragma}").fetchone()[0] != "ok":
+                raise ArchiveIntegrityError(f"{path.name} {pragma} failed")
+            if int(connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]) != schema_count:
+                raise ArchiveIntegrityError("rebuilt schema mismatch")
+            if self._database_contract(connection) != contract:
+                raise ArchiveIntegrityError("rebuilt cache/reference contract mismatch")
+        finally:
+            connection.close()
+
+
+def run_storage_recovery_once(*, lifecycle: DiscoveryArchiveLifecycle | None = None) -> dict[str, Any]:
+    """Drain eligible completed jobs and compact once, under a singleton cycle lock."""
+    lifecycle = lifecycle or DiscoveryArchiveLifecycle()
+    cycle_lock = lifecycle.state_path.with_suffix(".lock")
+    cycle_lock.parent.mkdir(parents=True, exist_ok=True)
+    with cycle_lock.open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"status": "ARCHIVE_CYCLE_ALREADY_RUNNING", "recovered": False}
+        before = lifecycle.metrics()
+        result = lifecycle.run()
+        result["compaction"] = lifecycle.compact()
+        result["before"] = before
+        result["after"] = lifecycle.metrics(plan={"candidates": []})
+        result["status"] = "COMPLETED"
+        result["recovered"] = (
+            int(result["after"]["internal_free_bytes"])
+            > int(result["before"]["internal_free_bytes"])
+        )
+        return result
 
 
 def main(argv=None) -> int:
@@ -379,17 +528,20 @@ def main(argv=None) -> int:
     parser.add_argument("--summary", action="store_true")
     args = parser.parse_args(argv)
     lifecycle = DiscoveryArchiveLifecycle()
-    cycle_lock = lifecycle.state_path.with_suffix(".lock")
-    cycle_lock.parent.mkdir(parents=True, exist_ok=True)
-    with cycle_lock.open("a+") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print(json.dumps({"status": "ARCHIVE_CYCLE_ALREADY_RUNNING"}))
-            return 0
-        result = lifecycle.run(max_jobs=args.max_jobs, medium_first=args.medium_first)
-        if args.compact_if_due:
-            result["compaction"] = lifecycle.compact()
+    if args.max_jobs is None and not args.medium_first and args.compact_if_due:
+        result = run_storage_recovery_once(lifecycle=lifecycle)
+    else:
+        cycle_lock = lifecycle.state_path.with_suffix(".lock")
+        cycle_lock.parent.mkdir(parents=True, exist_ok=True)
+        with cycle_lock.open("a+") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(json.dumps({"status": "ARCHIVE_CYCLE_ALREADY_RUNNING"}))
+                return 0
+            result = lifecycle.run(max_jobs=args.max_jobs, medium_first=args.medium_first)
+            if args.compact_if_due:
+                result["compaction"] = lifecycle.compact()
     if args.summary:
         result = {
             "planned": result.get("planned"),

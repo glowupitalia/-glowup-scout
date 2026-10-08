@@ -382,12 +382,19 @@ class DiscoveryArchiveTierTests(unittest.TestCase):
             archive_root=self.archive_root, expected_uuid=DEFAULT_VOLUME_UUID,
             uuid_probe=lambda _: DEFAULT_VOLUME_UUID,
         )
-        with mock.patch.object(lifecycle, "compaction_due", return_value=True):
+        with mock.patch.object(lifecycle, "compaction_due", return_value=True), mock.patch(
+            "discovery_archive_lifecycle.plan_archive_candidates",
+            side_effect=AssertionError("compaction must not rescan archive planner"),
+        ):
             result = lifecycle.compact()
         self.assertEqual("COMPACTED", result["status"])
         self.assertLess(result["after"]["sqlite_bytes"], result["before"]["sqlite_bytes"])
         self.assertEqual("running", self.store.summary(self.CURRENT_JOB_ID)["status"])
         self.assertFalse(list(self.root.glob("*.precompact-*")))
+        self.assertTrue(Path(result["rollback_path"]).is_file())
+        manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+        self.assertEqual("ACCEPTED", manifest["status"])
+        self.assertTrue(manifest["rollback_retained"])
 
     def test_compaction_post_swap_failure_restores_original(self):
         runtime, rotation = self._reference_databases()
@@ -403,20 +410,59 @@ class DiscoveryArchiveTierTests(unittest.TestCase):
             archive_root=self.archive_root, expected_uuid=DEFAULT_VOLUME_UUID,
             uuid_probe=lambda _: DEFAULT_VOLUME_UUID,
         )
-        real_connect = sqlite3.connect
+        real_verify = lifecycle._verify_database
 
         def fail_smoke(path, *args, **kwargs):
-            if Path(path) == self.database and list(self.root.glob("*.precompact-*")):
+            if Path(path) == self.database and kwargs.get("quick"):
                 raise sqlite3.DatabaseError("simulated post-swap failure")
-            return real_connect(path, *args, **kwargs)
+            return real_verify(path, *args, **kwargs)
 
-        with mock.patch.object(lifecycle, "compaction_due", return_value=True), mock.patch(
-            "discovery_archive_lifecycle.sqlite3.connect", side_effect=fail_smoke,
+        with mock.patch.object(lifecycle, "compaction_due", return_value=True), mock.patch.object(
+            lifecycle, "_verify_database", side_effect=fail_smoke,
         ):
             with self.assertRaisesRegex(sqlite3.DatabaseError, "simulated"):
                 lifecycle.compact()
         with sqlite3.connect(self.database) as connection:
             self.assertEqual("ok", connection.execute("PRAGMA quick_check").fetchone()[0])
+
+    def test_compaction_blocks_live_or_resumable_discovery(self):
+        runtime, rotation = self._reference_databases()
+        lifecycle = DiscoveryArchiveLifecycle(
+            database=self.database, runtime_database=runtime, rotation_database=rotation,
+            state_path=self.root / "lifecycle.json", mount_path=self.mount,
+            archive_root=self.archive_root, expected_uuid=DEFAULT_VOLUME_UUID,
+            uuid_probe=lambda _: DEFAULT_VOLUME_UUID,
+        )
+        with mock.patch.object(lifecycle, "compaction_due", return_value=True):
+            result = lifecycle.compact()
+        self.assertEqual("BLOCKED_ACTIVE_DISCOVERY", result["status"])
+        self.assertIn(self.CURRENT_JOB_ID, result["active"])
+
+    def test_admission_blocked_job_is_protected_but_does_not_block_compaction(self):
+        runtime, rotation = self._reference_databases()
+        with sqlite3.connect(runtime) as connection:
+            connection.execute(
+                "UPDATE discovery_job_runtime SET status='admission_blocked_storage',phase='admission_blocked_storage',resumable=1"
+            )
+        plan = plan_archive_candidates(
+            database=self.database, runtime_database=runtime, rotation_database=rotation,
+        )
+        protected = next(row for row in plan["blocked"] if row["job_id"] == self.CURRENT_JOB_ID)
+        self.assertIn("running_queued_or_recovery_required", protected["blockers"])
+        lifecycle = DiscoveryArchiveLifecycle(
+            database=self.database, runtime_database=runtime, rotation_database=rotation,
+            state_path=self.root / "lifecycle.json", mount_path=self.mount,
+            archive_root=self.archive_root, expected_uuid=DEFAULT_VOLUME_UUID,
+            uuid_probe=lambda _: DEFAULT_VOLUME_UUID,
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("CREATE TABLE pressure_junk(value BLOB)")
+            connection.executemany("INSERT INTO pressure_junk VALUES (?)", [(b"x" * 4096,)] * 32)
+            connection.execute("DELETE FROM pressure_junk")
+        with mock.patch.object(lifecycle, "compaction_due", return_value=True):
+            result = lifecycle.compact()
+        self.assertEqual("COMPACTED", result["status"])
+        self.assertEqual("running", self.store.summary(self.CURRENT_JOB_ID)["status"])
 
     def test_copy_crash_leaves_internal_authority_and_no_final_segment(self):
         with mock.patch(

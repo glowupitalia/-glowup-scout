@@ -958,7 +958,10 @@ def discovery_gc_plan(
             refs = dict(cache_map.get(job_id, {}))
             catalog_refs = refs.get("Catalog", 0)
             fee_refs = refs.get("Fee", 0)
-            active = str(runtime.get(job_id, {}).get("status") or job.get("status") or "").casefold() not in {
+            runtime_row = runtime.get(job_id, {})
+            active = bool(runtime_row.get("resumable")) or str(
+                runtime_row.get("status") or job.get("status") or ""
+            ).casefold() not in {
                 "completed", "cancelled", "canceled", "failed", "legacy_incompatible",
             }
             export_path = str(runtime.get(job_id, {}).get("export_path") or "")

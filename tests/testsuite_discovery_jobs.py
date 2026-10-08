@@ -200,7 +200,7 @@ class DiscoveryJobRegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "already"):
                 self.registry.launch(state["job_id"])
 
-    def test_archive_maintenance_launch_is_bounded_and_detached(self):
+    def test_archive_maintenance_launch_drains_candidates_and_is_detached(self):
         process = Mock(pid=43210)
         with (
             patch("discovery_jobs.DEFAULT_LOG_DIR", self.root / "logs"),
@@ -209,10 +209,8 @@ class DiscoveryJobRegistryTests(unittest.TestCase):
             self.assertEqual(self.registry.launch_archive_maintenance(), 43210)
 
         arguments = popen.call_args.args[0]
-        self.assertEqual(
-            arguments[-4:],
-            ["--max-jobs", "1", "--compact-if-due", "--summary"],
-        )
+        self.assertEqual(arguments[-2:], ["--compact-if-due", "--summary"])
+        self.assertNotIn("--max-jobs", arguments)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         self.assertTrue(popen.call_args.kwargs["close_fds"])
 

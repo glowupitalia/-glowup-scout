@@ -56,6 +56,7 @@ ACTIVE_OR_RESUMABLE_STATUSES = {
     "launching", "queued", "running", "computed", "export_pending",
     "export_running", "export_complete", "notification_pending",
     "waiting_retry", "resource_paused", "export_resource_paused", "resumable",
+    "admission_blocked_storage", "maintenance_blocked",
 }
 
 TABLE_SPECS = {
