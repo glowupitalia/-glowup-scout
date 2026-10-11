@@ -23,6 +23,7 @@ from discovery_archive import (
 )
 from storage_gc import collect_storage_metrics, discovery_gc_plan
 from storage_maintenance import StorageMaintenanceLock
+from discovery_jobs import process_alive
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -35,6 +36,7 @@ ACTIVE_RUNTIME = {
     "launching", "running", "computed", "export_pending", "export_running",
     "export_complete", "notification_pending", "resumable", "resource_paused",
 }
+QUIESCED_STORAGE_RUNTIME = {"resource_paused", "admission_blocked_storage"}
 LIFECYCLE_STATES = {
     "INTERNAL", "ARCHIVE_CANDIDATE", "COPYING", "COPIED", "VERIFIED",
     "REPOINTED", "INTERNAL_CLEANUP", "ARCHIVED", "RETRYABLE", "BLOCKED", "CORRUPT",
@@ -330,11 +332,14 @@ class DiscoveryArchiveLifecycle:
         if not self.compaction_due(before):
             return {"status": "NOT_DUE", "before": before}
         runtime = _runtime_rows(self.runtime_database)
-        active = [
-            job for job, row in runtime.items()
-            if str(row.get("status") or "").casefold() in ACTIVE_RUNTIME
-            and str(row.get("status") or "").casefold() != "admission_blocked_storage"
-        ]
+        active = []
+        for job, row in runtime.items():
+            status = str(row.get("status") or "").casefold()
+            if status not in ACTIVE_RUNTIME:
+                continue
+            if status in QUIESCED_STORAGE_RUNTIME and not process_alive(row.get("worker_pid")):
+                continue
+            active.append(job)
         if active:
             return {"status": "BLOCKED_ACTIVE_DISCOVERY", "active": active, "before": before}
         validate_archive_volume(
@@ -354,6 +359,25 @@ class DiscoveryArchiveLifecycle:
         manifest_path = stage / "manifest.json"
         swapped = False
         with self.lock.retention_apply_guard(timeout_seconds=0.0):
+            # Close the check/start race with DiscoveryJobRegistry.launch():
+            # the exclusive guard is held while runtime ownership is checked.
+            runtime = _runtime_rows(self.runtime_database)
+            active = []
+            for job, row in runtime.items():
+                status = str(row.get("status") or "").casefold()
+                if status not in ACTIVE_RUNTIME:
+                    continue
+                if (
+                    status in QUIESCED_STORAGE_RUNTIME
+                    and not process_alive(row.get("worker_pid"))
+                ):
+                    continue
+                active.append(job)
+            if active:
+                return {
+                    "status": "BLOCKED_ACTIVE_DISCOVERY", "active": active,
+                    "before": before,
+                }
             for stale in self.database.parent.glob(f".{self.database.name}.compact-*"):
                 if stale.is_file() and not stale.is_symlink():
                     stale.unlink()

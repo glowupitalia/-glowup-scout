@@ -84,7 +84,10 @@ CREATE TABLE IF NOT EXISTS discovery_job_runtime (
     cooldown_until TEXT,
     last_recovery_outcome TEXT,
     manual_intervention_required INTEGER NOT NULL DEFAULT 0,
-    failure_details_json TEXT
+    failure_details_json TEXT,
+    storage_recovery_fingerprint TEXT,
+    storage_recovery_at TEXT,
+    storage_recovery_outcome TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_job_runtime_updated
 ON discovery_job_runtime(updated_at DESC);
@@ -230,6 +233,9 @@ class DiscoveryJobRegistry:
                 "last_recovery_outcome": "TEXT",
                 "manual_intervention_required": "INTEGER NOT NULL DEFAULT 0",
                 "failure_details_json": "TEXT",
+                "storage_recovery_fingerprint": "TEXT",
+                "storage_recovery_at": "TEXT",
+                "storage_recovery_outcome": "TEXT",
             }
             for column, declaration in additions.items():
                 if column not in existing:
@@ -641,6 +647,38 @@ class DiscoveryJobRegistry:
             ).fetchall()
         return [self._row(row) for row in rows]
 
+    def storage_recovery_candidates(self) -> list[dict[str, Any]]:
+        """Return quiesced jobs whose persisted state requires storage recovery."""
+        self.initialize()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM discovery_job_runtime
+                   WHERE status IN ('resource_paused','admission_blocked_storage')
+                     AND resumable=1
+                   ORDER BY updated_at,job_id"""
+            ).fetchall()
+        return [self._row(row) for row in rows]
+
+    def record_storage_recovery(
+        self, job_id: str, *, fingerprint: str, outcome: str,
+        observed_at: datetime | None = None,
+    ) -> None:
+        """Persist a recovery observation without changing checkpoint authority."""
+        observed = (observed_at or datetime.now(timezone.utc)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE discovery_job_runtime
+                      SET storage_recovery_fingerprint=?,storage_recovery_at=?,
+                          storage_recovery_outcome=?
+                    WHERE job_id=? AND status IN
+                      ('resource_paused','admission_blocked_storage')""",
+                (str(fingerprint), observed, str(outcome)[:1000], job_id),
+            )
+            connection.commit()
+
     def resource_pause(
         self, job_id: str, *, reason: str, metrics: dict[str, Any], phase: str,
     ):
@@ -728,9 +766,12 @@ class DiscoveryJobRegistry:
 
     def launch(
         self, job_id: str, *, maintenance_lock=None, auto_resume: bool = False,
+        storage_resume: bool = False,
         expected_failure_signature: str | None = None,
         observed_at: datetime | None = None,
     ) -> int:
+        if auto_resume and storage_resume:
+            raise ValueError("auto_resume and storage_resume are mutually exclusive")
         maintenance_lock = maintenance_lock or StorageMaintenanceLock(
             Path(self.path).parent / "discovery-maintenance.lock"
         )
@@ -778,6 +819,17 @@ class DiscoveryJobRegistry:
                         if not eligible or process_alive(row["worker_pid"]):
                             connection.rollback()
                             raise RuntimeError("Discovery job is not eligible for auto-resume")
+                    if storage_resume:
+                        eligible = (
+                            row["status"] in ("resource_paused", "admission_blocked_storage")
+                            and bool(row["resumable"])
+                            and not bool(row["manual_intervention_required"])
+                        )
+                        if not eligible or process_alive(row["worker_pid"]):
+                            connection.rollback()
+                            raise RuntimeError(
+                                "Discovery job is not eligible for storage resume"
+                            )
                     concurrent = connection.execute(
                         "SELECT job_id FROM discovery_job_runtime "
                         "WHERE status IN ('launching','running') LIMIT 1"
@@ -797,6 +849,18 @@ class DiscoveryJobRegistry:
                                WHERE job_id=?""",
                             (now.isoformat().replace("+00:00", "Z"), launch_deadline,
                              now.isoformat().replace("+00:00", "Z"), job_id),
+                        )
+                    elif storage_resume:
+                        connection.execute(
+                            """UPDATE discovery_job_runtime SET status='launching',
+                               worker_pid=NULL,updated_at=?,lease_expires_at=?,
+                               storage_recovery_at=?,
+                               storage_recovery_outcome='launch_requested'
+                               WHERE job_id=?""",
+                            (
+                                now.isoformat().replace("+00:00", "Z"), launch_deadline,
+                                now.isoformat().replace("+00:00", "Z"), job_id,
+                            ),
                         )
                     else:
                         connection.execute(
@@ -838,6 +902,9 @@ class DiscoveryJobRegistry:
                 """UPDATE discovery_job_runtime SET worker_pid=?,updated_at=?
                    ,last_recovery_outcome=CASE WHEN last_recovery_outcome='launch_requested'
                      THEN 'launched' ELSE last_recovery_outcome END
+                   ,storage_recovery_outcome=CASE
+                     WHEN storage_recovery_outcome='launch_requested'
+                     THEN 'launched' ELSE storage_recovery_outcome END
                    WHERE job_id=? AND status IN ('launching','running')""",
                 (process.pid, utc_now(), job_id),
             )

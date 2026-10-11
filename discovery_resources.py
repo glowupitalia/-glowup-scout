@@ -16,6 +16,7 @@ from typing import Any
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
+DISCOVERY_LIVE_STORAGE_FLOOR_BYTES = 40 * GIB
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,10 @@ class ResourcePolicy:
     rss_hard_bytes: int = 1280 * MIB
     available_soft_bytes: int = 512 * MIB
     available_hard_bytes: int = 256 * MIB
-    disk_free_hard_bytes: int = 10 * GIB
+    # Keep the live worker aligned with the established full-Discovery
+    # admission floor.  A batch boundary is the safe pause boundary; the
+    # lower-level filesystem/SQLite errors remain hard fail-safe protections.
+    disk_free_hard_bytes: int = DISCOVERY_LIVE_STORAGE_FLOOR_BYTES
     wal_soft_bytes: int = 512 * MIB
     wal_hard_bytes: int = 1024 * MIB
     write_rate_soft_bytes_per_second: int = 50 * MIB
