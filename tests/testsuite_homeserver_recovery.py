@@ -56,9 +56,15 @@ def public_edges(healthy, total):
 class WatchdogTests(unittest.TestCase):
     def run_case(self, state, now, *, public_status=200, local=None,
                  public_result=None, config=None, connected=True,
-                 backend_running=True, **kwargs):
+                 backend_running=True, private_healthy=True, **kwargs):
         local = dict(local or HEALTHY_LOCAL)
         config = config or watchdog.EXPECTED_FUNNEL_CONFIG
+        tailscale_status = {
+            "BackendState": "Running" if backend_running else "Stopped",
+            "CurrentTailnet": {"MagicDNSEnabled": True},
+            "Self": {"TailscaleIPs": [watchdog.TAILNET_IPV4]},
+            "CertDomains": [watchdog.PUBLIC_HOSTNAME],
+        }
         with ExitStack() as stack:
             stack.enter_context(patch.object(watchdog, "ethernet_ready", return_value=True))
             stack.enter_context(patch.object(watchdog, "internet_ready", return_value=True))
@@ -66,10 +72,14 @@ class WatchdogTests(unittest.TestCase):
                 watchdog, "stable_tailscale_connected", return_value=connected,
             ))
             stack.enter_context(patch.object(
-                watchdog, "tailscale_backend_running", return_value=backend_running,
+                watchdog, "tailscale_status", return_value=tailscale_status,
             ))
             stack.enter_context(patch.object(watchdog, "funnel_config", return_value=config))
             stack.enter_context(patch.object(watchdog, "local_upstreams", return_value=local))
+            stack.enter_context(patch.object(
+                watchdog, "private_manager_https_status",
+                return_value={"expected_ok": private_healthy, "status": 200 if private_healthy else None},
+            ))
             stack.enter_context(patch.object(
                 watchdog, "public_https_status",
                 return_value=(
@@ -191,7 +201,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertFalse(third["funnel_recovery_attempted"])
         self.assertTrue(third["would_recover"])
         self.assertEqual(third["reason"], "dry_run_recovery_would_execute")
-        self.assertEqual(len(third["would_execute"]), 3)
+        self.assertEqual(len(third["would_execute"]), 2)
         self.assertTrue(all(
             operation["executed"] is False
             for operation in third["recovery_operations"]
@@ -233,7 +243,7 @@ class WatchdogTests(unittest.TestCase):
         subprocess_run.assert_not_called()
         self.assertTrue(result["funnel_recovery_authorized"])
         self.assertFalse(result["funnel_recovery_attempted"])
-        self.assertEqual(len(result["would_execute"]), 3)
+        self.assertEqual(len(result["would_execute"]), 2)
         flattened = [part for item in result["would_execute"] for part in item["argv"]]
         self.assertIn("off", flattened)
         self.assertIn("--set-path=/webhooks/qogita", flattened)
@@ -295,7 +305,7 @@ class WatchdogTests(unittest.TestCase):
                 watchdog.TAILSCALE_CLI, "funnel", "status", "--json",
             ])
             watchdog._perform_funnel_recovery()
-        self.assertEqual(run.call_count, 5)
+        self.assertEqual(run.call_count, 4)
         for call in run.call_args_list:
             self.assertEqual(call.kwargs["env"]["TAILSCALE_BE_CLI"], "1")
             self.assertEqual(call.kwargs["env"]["BASELINE"], "present")
@@ -402,7 +412,10 @@ class WatchdogTests(unittest.TestCase):
             ))
             prerequisites = stack.enter_context(patch.object(
                 watchdog, "_funnel_prerequisites",
-                return_value=({"all_healthy": True}, watchdog.EXPECTED_FUNNEL_CONFIG),
+                return_value=(
+                    {"all_healthy": True, "configuration_phase": "CURRENT"},
+                    watchdog.EXPECTED_FUNNEL_CONFIG,
+                ),
             ))
             public_probe = stack.enter_context(patch.object(
                 watchdog, "public_https_status", return_value=public(None),
@@ -410,7 +423,9 @@ class WatchdogTests(unittest.TestCase):
             stack.enter_context(patch.object(watchdog, "qogita_run_active", return_value=True))
             result = watchdog.recover(state_path=state, now=1100, dry_run=True)
         self.assertEqual(prerequisites.call_count, 2)
-        public_probe.assert_called_once_with("/openapi.json", expected_status=200)
+        public_probe.assert_called_once_with(
+            "/webhooks/qogita", expected_status=405,
+        )
         self.assertEqual(result["reason"], "dry_run_recovery_would_execute")
 
     def test_backend_down_blocks_funnel_recovery(self):
@@ -555,9 +570,12 @@ class WatchdogTests(unittest.TestCase):
         with patch.object(watchdog, "command", return_value=outcome) as command:
             watchdog._perform_funnel_recovery()
         commands = [call.args[0] for call in command.call_args_list]
-        self.assertEqual(len(commands), 3)
+        self.assertEqual(len(commands), 2)
         self.assertTrue(all(args[1] == "funnel" for args in commands))
         self.assertTrue(all("--https=443" in args for args in commands))
+        self.assertTrue(all(
+            "--set-path=/webhooks/qogita" in args for args in commands
+        ))
         self.assertFalse(any("reset" in args for args in commands))
         self.assertFalse(any("serve" in args for args in commands))
 
@@ -628,13 +646,247 @@ class WatchdogTests(unittest.TestCase):
                     stack.enter_context(patch.object(watchdog, "ethernet_ready", return_value=True))
                     stack.enter_context(patch.object(watchdog, "internet_ready", return_value=True))
                     stack.enter_context(patch.object(watchdog, "stable_tailscale_connected", return_value=True))
-                    stack.enter_context(patch.object(watchdog, "tailscale_backend_running", return_value=True))
+                    stack.enter_context(patch.object(
+                        watchdog, "tailscale_status", return_value={
+                            "BackendState": "Running",
+                            "CurrentTailnet": {"MagicDNSEnabled": True},
+                            "Self": {"TailscaleIPs": [watchdog.TAILNET_IPV4]},
+                            "CertDomains": [watchdog.PUBLIC_HOSTNAME],
+                        },
+                    ))
                     stack.enter_context(patch.object(watchdog, "funnel_config", return_value=watchdog.EXPECTED_FUNNEL_CONFIG))
                     stack.enter_context(patch.object(watchdog, "local_upstreams", return_value=dict(HEALTHY_LOCAL)))
                     stack.enter_context(patch.object(watchdog, "qogita_run_active", return_value=True))
                     watchdog.recover(state_path=state, now=1000)
         paths = [call.args[0] for call in probe.call_args_list]
-        self.assertEqual(paths, ["/openapi.json"])
+        self.assertEqual(paths, ["/webhooks/qogita", "/openapi.json"])
+
+    def test_current_configuration_is_detected_and_healthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_case(
+                Path(directory) / "state.json", 1000,
+                config=watchdog.CURRENT_CONFIG,
+            )
+        self.assertEqual(result["configuration_phase"], "CURRENT")
+        self.assertEqual(result["status"], "HEALTHY")
+        self.assertTrue(result["prerequisites"]["private_manager"]["skipped"])
+
+    def test_transition_configuration_is_detected_and_healthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_case(
+                Path(directory) / "state.json", 1000,
+                config=watchdog.TRANSITION_CONFIG,
+            )
+        self.assertEqual(result["configuration_phase"], "TRANSITION")
+        self.assertEqual(result["status"], "HEALTHY")
+        self.assertTrue(result["prerequisites"]["private_manager_healthy"])
+        self.assertIn("public_manager", result)
+
+    def test_final_configuration_is_detected_and_healthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_case(
+                Path(directory) / "state.json", 1000,
+                config=watchdog.FINAL_CONFIG,
+            )
+        self.assertEqual(result["configuration_phase"], "FINAL")
+        self.assertEqual(result["status"], "HEALTHY")
+        self.assertTrue(result["prerequisites"]["private_manager_healthy"])
+        self.assertNotIn("public_manager", result)
+
+    def test_private_8443_marked_as_funnel_is_internal_failure(self):
+        config = json.loads(json.dumps(watchdog.TRANSITION_CONFIG))
+        config["AllowFunnel"][watchdog.PRIVATE_MANAGER_WEB_KEY] = True
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_case(
+                Path(directory) / "state.json", 1000, config=config,
+            )
+        self.assertIsNone(result["prerequisites"]["configuration_phase"])
+        self.assertEqual(result["status"], "DEGRADED_INTERNAL")
+        self.assertFalse(result["funnel_recovery_authorized"])
+
+    def test_final_shape_without_private_8443_is_rejected(self):
+        config = {
+            "TCP": {"443": {"HTTPS": True}},
+            "Web": {
+                watchdog.PUBLIC_WEB_KEY: {
+                    "Handlers": watchdog.FINAL_PUBLIC_HANDLERS,
+                },
+            },
+            "AllowFunnel": {watchdog.PUBLIC_WEB_KEY: True},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_case(
+                Path(directory) / "state.json", 1000, config=config,
+            )
+        self.assertEqual(result["status"], "DEGRADED_INTERNAL")
+        self.assertIsNone(result["prerequisites"]["configuration_phase"])
+
+    def test_missing_qogita_route_is_rejected(self):
+        config = json.loads(json.dumps(watchdog.FINAL_CONFIG))
+        del config["Web"][watchdog.PUBLIC_WEB_KEY]["Handlers"][watchdog.QOGITA_PATH]
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_case(
+                Path(directory) / "state.json", 1000, config=config,
+            )
+        self.assertEqual(result["status"], "DEGRADED_INTERNAL")
+        self.assertFalse(result["prerequisites"]["funnel_config_exact"])
+
+    def test_root_manager_with_private_serve_is_transition_not_final(self):
+        self.assertEqual(
+            watchdog.configuration_phase(watchdog.TRANSITION_CONFIG),
+            "TRANSITION",
+        )
+        self.assertNotEqual(
+            watchdog.configuration_phase(watchdog.TRANSITION_CONFIG),
+            "FINAL",
+        )
+
+    def test_private_serve_cannot_disappear_after_healthy_transition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            first = self.run_case(
+                state, 1000, config=watchdog.TRANSITION_CONFIG,
+            )
+            second = self.run_case(
+                state, 1100, config=watchdog.CURRENT_CONFIG,
+            )
+        self.assertEqual(first["status"], "HEALTHY")
+        self.assertEqual(second["status"], "DEGRADED_INTERNAL")
+        self.assertEqual(second["reason"], "configuration_phase_regressed")
+        self.assertTrue(
+            second["prerequisites"]["configuration_phase_regression"],
+        )
+
+    def test_public_manager_root_cannot_return_after_healthy_final(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            first = self.run_case(
+                state, 1000, config=watchdog.FINAL_CONFIG,
+            )
+            second = self.run_case(
+                state, 1100, config=watchdog.TRANSITION_CONFIG,
+            )
+        self.assertEqual(first["status"], "HEALTHY")
+        self.assertEqual(second["status"], "DEGRADED_INTERNAL")
+        self.assertEqual(second["reason"], "configuration_phase_regressed")
+
+    def test_private_manager_down_is_internal_even_if_qogita_is_healthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_case(
+                Path(directory) / "state.json", 1000,
+                config=watchdog.FINAL_CONFIG, private_healthy=False,
+            )
+        self.assertEqual(result["status"], "DEGRADED_INTERNAL")
+        self.assertFalse(result["prerequisites"]["private_manager_healthy"])
+        self.assertFalse(result["funnel_recovery_authorized"])
+
+    def test_qogita_public_down_is_public_degradation_with_private_manager_healthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_case(
+                Path(directory) / "state.json", 1000,
+                config=watchdog.FINAL_CONFIG, public_status=None,
+            )
+        self.assertEqual(result["status"], "DEGRADED_PUBLIC")
+        self.assertEqual(result["consecutive_public_failures"], 1)
+        self.assertTrue(result["prerequisites"]["private_manager_healthy"])
+
+    def test_final_phase_never_probes_manager_through_public_funnel(self):
+        prerequisites = {
+            **HEALTHY_LOCAL,
+            "all_healthy": True,
+            "configuration_phase": "FINAL",
+            "tailscale_backend_running": True,
+            "magicdns_enabled": True,
+            "tailnet_ipv4_present": True,
+            "certificate_domain_present": True,
+            "funnel_config_exact": True,
+            "private_manager_healthy": True,
+            "tailscale_status_cli_error": None,
+            "funnel_status_cli_error": None,
+        }
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            stack.enter_context(patch.object(watchdog, "ethernet_ready", return_value=True))
+            stack.enter_context(patch.object(watchdog, "internet_ready", return_value=True))
+            stack.enter_context(patch.object(
+                watchdog, "stable_tailscale_connected", return_value=True,
+            ))
+            stack.enter_context(patch.object(
+                watchdog, "_funnel_prerequisites",
+                return_value=(prerequisites, watchdog.FINAL_CONFIG),
+            ))
+            probe = stack.enter_context(patch.object(
+                watchdog, "public_https_status", return_value=public(405),
+            ))
+            stack.enter_context(patch.object(
+                watchdog, "qogita_run_active", return_value=True,
+            ))
+            result = watchdog.recover(
+                state_path=Path(directory) / "state.json", now=1000,
+            )
+        self.assertEqual(result["status"], "HEALTHY")
+        self.assertEqual(
+            [call.args[0] for call in probe.call_args_list],
+            [watchdog.QOGITA_PATH],
+        )
+
+    def test_private_manager_probe_pins_tailnet_ip_and_preserves_sni(self):
+        outcome = watchdog.subprocess.CompletedProcess(
+            [], 0, stdout="200", stderr="",
+        )
+        with patch.object(watchdog, "command", return_value=outcome) as command:
+            result = watchdog.private_manager_https_status()
+        args = command.call_args.args[0]
+        self.assertIn(
+            f"{watchdog.PUBLIC_HOSTNAME}:8443:{watchdog.TAILNET_IPV4}", args,
+        )
+        self.assertEqual(
+            args[-1],
+            f"https://{watchdog.PUBLIC_HOSTNAME}:8443/openapi.json",
+        )
+        self.assertTrue(result["expected_ok"])
+
+    def test_qogita_recovery_exactly_off_then_configure_webhook_only(self):
+        guard = watchdog.MutationGuard(dry_run=True)
+        operations = watchdog._perform_qogita_funnel_recovery(guard)
+        commands = [item["argv"] for item in guard.would_execute]
+        self.assertEqual(len(commands), 2)
+        self.assertEqual([item["operation"] for item in operations], ["off", "configure"])
+        for args in commands:
+            joined = " ".join(args)
+            self.assertIn("funnel", args)
+            self.assertIn("--https=443", args)
+            self.assertIn("--set-path=/webhooks/qogita", args)
+            self.assertNotIn("8443", joined)
+            self.assertNotIn(" serve ", f" {joined} ")
+            self.assertNotIn("reset", args)
+            self.assertNotIn("http://127.0.0.1:8000", args)
+
+    def test_recovery_source_contains_no_global_reset_or_private_port_mutation(self):
+        import inspect
+        source = inspect.getsource(watchdog._perform_qogita_funnel_recovery)
+        self.assertNotIn("reset", source)
+        self.assertNotIn("8443", source)
+        self.assertNotIn('"serve"', source)
+        self.assertNotIn("http://127.0.0.1:8000", source)
+
+    def test_current_healthy_dry_run_has_no_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_case(
+                Path(directory) / "state.json", 1000,
+                config=watchdog.CURRENT_CONFIG, dry_run=True,
+            )
+        self.assertEqual(result["status"], "HEALTHY")
+        self.assertEqual(result["configuration_phase"], "CURRENT")
+        self.assertEqual(result["would_execute"], [])
+        self.assertFalse(result["would_recover"])
+        self.assertFalse(result["funnel_recovery_attempted"])
+
+    def test_arbitrary_extra_handler_is_not_an_accepted_phase(self):
+        config = json.loads(json.dumps(watchdog.FINAL_CONFIG))
+        config["Web"][watchdog.PUBLIC_WEB_KEY]["Handlers"]["/other"] = {
+            "Proxy": "http://127.0.0.1:9999",
+        }
+        self.assertIsNone(watchdog.configuration_phase(config))
 
 
 if __name__ == "__main__":

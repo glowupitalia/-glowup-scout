@@ -1,12 +1,12 @@
-"""Conservative HomeServer Tailscale and Funnel recovery watchdog.
+"""Conservative HomeServer Tailscale Serve/Funnel recovery watchdog.
 
-This staged watchdog owns the existing bounded Tailscale connection recovery.
-It can also repair one narrowly defined failure mode: Tailscale is Running, the
-exact expected Funnel configuration and both local upstreams are healthy, but
-three spaced probes through public DNS cannot reach the Funnel ingress.
+The watchdog recognizes only the three exact configurations used while moving
+Glow Up Manager from the public Funnel to private Tailscale Serve.  Its bounded
+automatic recovery owns one route only: the public Qogita webhook on HTTPS 443.
 
-It never resets Serve/Funnel, restarts Tailscale, changes DNS, or calls Amazon,
-Qogita, Discovery, Buy Box, or Maintenance APIs.
+It never mutates private Serve, port 8443, the public Manager root, global
+Serve/Funnel state, DNS, Amazon, Qogita logic, Discovery, Buy Box, or
+Maintenance APIs.
 """
 
 from __future__ import annotations
@@ -35,18 +35,49 @@ DIG = "/usr/bin/dig"
 CURL = "/usr/bin/curl"
 MANAGER_ENV = Path("/Users/casaloria/Developer/Glow-Up-Manager/.env")
 PUBLIC_HOSTNAME = "homeserver.tail3d24fa.ts.net"
-EXPECTED_WEB_KEY = f"{PUBLIC_HOSTNAME}:443"
-EXPECTED_HANDLERS = {
+TAILNET_IPV4 = "100.125.21.70"
+PUBLIC_HTTPS_PORT = 443
+PRIVATE_MANAGER_HTTPS_PORT = 8443
+PUBLIC_WEB_KEY = f"{PUBLIC_HOSTNAME}:{PUBLIC_HTTPS_PORT}"
+PRIVATE_MANAGER_WEB_KEY = f"{PUBLIC_HOSTNAME}:{PRIVATE_MANAGER_HTTPS_PORT}"
+QOGITA_PATH = "/webhooks/qogita"
+MANAGER_PROXY = {"Proxy": "http://127.0.0.1:8000"}
+QOGITA_PROXY = {"Proxy": "http://127.0.0.1:8511/webhooks/qogita"}
+
+CURRENT_PUBLIC_HANDLERS = {
     "/": {"Proxy": "http://127.0.0.1:8000"},
-    "/webhooks/qogita": {
-        "Proxy": "http://127.0.0.1:8511/webhooks/qogita",
-    },
+    QOGITA_PATH: QOGITA_PROXY,
 }
-EXPECTED_FUNNEL_CONFIG = {
+FINAL_PUBLIC_HANDLERS = {QOGITA_PATH: QOGITA_PROXY}
+PRIVATE_MANAGER_HANDLERS = {"/": MANAGER_PROXY}
+
+CURRENT_CONFIG = {
     "TCP": {"443": {"HTTPS": True}},
-    "Web": {EXPECTED_WEB_KEY: {"Handlers": EXPECTED_HANDLERS}},
-    "AllowFunnel": {EXPECTED_WEB_KEY: True},
+    "Web": {PUBLIC_WEB_KEY: {"Handlers": CURRENT_PUBLIC_HANDLERS}},
+    "AllowFunnel": {PUBLIC_WEB_KEY: True},
 }
+TRANSITION_CONFIG = {
+    "TCP": {"443": {"HTTPS": True}, "8443": {"HTTPS": True}},
+    "Web": {
+        PUBLIC_WEB_KEY: {"Handlers": CURRENT_PUBLIC_HANDLERS},
+        PRIVATE_MANAGER_WEB_KEY: {"Handlers": PRIVATE_MANAGER_HANDLERS},
+    },
+    "AllowFunnel": {PUBLIC_WEB_KEY: True},
+}
+FINAL_CONFIG = {
+    "TCP": {"443": {"HTTPS": True}, "8443": {"HTTPS": True}},
+    "Web": {
+        PUBLIC_WEB_KEY: {"Handlers": FINAL_PUBLIC_HANDLERS},
+        PRIVATE_MANAGER_WEB_KEY: {"Handlers": PRIVATE_MANAGER_HANDLERS},
+    },
+    "AllowFunnel": {PUBLIC_WEB_KEY: True},
+}
+PHASE_RANK = {"CURRENT": 0, "TRANSITION": 1, "FINAL": 2}
+# Kept as a compatibility alias for existing imports/tests.  It deliberately
+# means the pre-cutover CURRENT configuration, not every accepted phase.
+EXPECTED_WEB_KEY = PUBLIC_WEB_KEY
+EXPECTED_HANDLERS = CURRENT_PUBLIC_HANDLERS
+EXPECTED_FUNNEL_CONFIG = CURRENT_CONFIG
 _MUTATION_PERMIT = object()
 
 
@@ -83,10 +114,14 @@ def _read_only_command(args) -> bool:
         if "--output" not in argv:
             return False
         output_index = argv.index("--output")
+        allowed_urls = (
+            f"https://{PUBLIC_HOSTNAME}/",
+            f"https://{PUBLIC_HOSTNAME}:{PRIVATE_MANAGER_HTTPS_PORT}/",
+        )
         return (
             output_index + 1 < len(argv)
             and argv[output_index + 1] == "/dev/null"
-            and argv[-1].startswith(f"https://{PUBLIC_HOSTNAME}/")
+            and argv[-1].startswith(allowed_urls)
         )
     if executable == "/usr/bin/pgrep":
         return argv == ["/usr/bin/pgrep", "-f", "qogita_production_bootstrap.py"]
@@ -211,12 +246,29 @@ def _json_command(args) -> dict:
     return {"value": value, "error": None}
 
 
-def tailscale_backend_running(*, diagnostic=None) -> bool:
+def tailscale_status(*, diagnostic=None) -> dict | None:
     outcome = _json_command([TAILSCALE_CLI, "status", "--json"])
     if diagnostic is not None and outcome["error"]:
         diagnostic.update(outcome["error"])
-    status = outcome["value"]
+    return outcome["value"]
+
+
+def tailscale_backend_running(*, diagnostic=None, status=None) -> bool:
+    if status is None:
+        status = tailscale_status(diagnostic=diagnostic)
     return bool(status and status.get("BackendState") == "Running")
+
+
+def tailnet_identity(status: dict | None) -> dict:
+    status = status if isinstance(status, dict) else {}
+    current_tailnet = status.get("CurrentTailnet") or {}
+    own_ips = (status.get("Self") or {}).get("TailscaleIPs") or []
+    cert_domains = status.get("CertDomains") or []
+    return {
+        "magicdns_enabled": current_tailnet.get("MagicDNSEnabled") is True,
+        "tailnet_ipv4_present": TAILNET_IPV4 in own_ips,
+        "certificate_domain_present": PUBLIC_HOSTNAME in cert_domains,
+    }
 
 
 def funnel_config(*, diagnostic=None) -> dict | None:
@@ -226,15 +278,54 @@ def funnel_config(*, diagnostic=None) -> dict | None:
     return outcome["value"]
 
 
-def funnel_config_is_exact(config: dict | None) -> bool:
+def _relevant_config(config: dict | None) -> dict | None:
     if not isinstance(config, dict):
-        return False
-    relevant = {
+        return None
+    return {
         "TCP": config.get("TCP"),
         "Web": config.get("Web"),
         "AllowFunnel": config.get("AllowFunnel"),
     }
-    return relevant == EXPECTED_FUNNEL_CONFIG
+
+
+def configuration_phase(config: dict | None) -> str | None:
+    relevant = _relevant_config(config)
+    for phase, expected in (
+        ("CURRENT", CURRENT_CONFIG),
+        ("TRANSITION", TRANSITION_CONFIG),
+        ("FINAL", FINAL_CONFIG),
+    ):
+        if relevant == expected:
+            return phase
+    return None
+
+
+def funnel_config_is_exact(config: dict | None) -> bool:
+    """Compatibility name: true only for one explicitly accepted phase."""
+    return configuration_phase(config) is not None
+
+
+def _apply_phase_progression(state: dict, prerequisites: dict) -> None:
+    """Reject automatic rollback from a previously healthy later phase."""
+    phase = prerequisites.get("configuration_phase")
+    highest = state.get("highest_healthy_configuration_phase")
+    regression = bool(
+        phase in PHASE_RANK
+        and highest in PHASE_RANK
+        and PHASE_RANK[phase] < PHASE_RANK[highest]
+    )
+    prerequisites["highest_healthy_configuration_phase"] = highest
+    prerequisites["configuration_phase_regression"] = regression
+    if regression:
+        prerequisites["all_healthy"] = False
+
+
+def _remember_healthy_phase(state: dict, phase: str | None) -> None:
+    if phase not in PHASE_RANK:
+        return
+    highest = state.get("highest_healthy_configuration_phase")
+    if highest not in PHASE_RANK or PHASE_RANK[phase] > PHASE_RANK[highest]:
+        state["highest_healthy_configuration_phase"] = phase
 
 
 def tcp_ready(host: str, port: int, *, timeout=2) -> bool:
@@ -346,6 +437,33 @@ def public_https_status(path: str, *, expected_status=None, api_token=None, time
     }
 
 
+def private_manager_https_status(*, timeout=8) -> dict:
+    """Probe private Serve via the fixed tailnet IP while preserving TLS SNI."""
+    args = [
+        CURL, "--silent", "--show-error", "--output", "/dev/null",
+        "--connect-timeout", "4", "--max-time", str(int(timeout)),
+        "--resolve",
+        f"{PUBLIC_HOSTNAME}:{PRIVATE_MANAGER_HTTPS_PORT}:{TAILNET_IPV4}",
+        "--write-out", "%{http_code}",
+        f"https://{PUBLIC_HOSTNAME}:{PRIVATE_MANAGER_HTTPS_PORT}/openapi.json",
+    ]
+    response = command(args, timeout=timeout + 2)
+    raw_status = response.stdout.strip()[-3:]
+    status = int(raw_status) if raw_status.isdigit() else None
+    return {
+        "address": TAILNET_IPV4,
+        "hostname": PUBLIC_HOSTNAME,
+        "port": PRIVATE_MANAGER_HTTPS_PORT,
+        "returncode": response.returncode,
+        "status": status,
+        "expected_status": 200,
+        "expected_ok": response.returncode == 0 and status == 200,
+        "error": (
+            None if response.returncode == 0 else _sanitize(response.stderr)
+        ),
+    }
+
+
 def _sanitize(value: str | None, *, limit=300) -> str | None:
     if not value:
         return None
@@ -414,13 +532,12 @@ def _command_summary(result) -> dict:
     }
 
 
-def _perform_funnel_recovery(actions=None) -> list[dict]:
+def _perform_qogita_funnel_recovery(actions=None) -> list[dict]:
     actions = actions or MutationGuard(dry_run=False)
     operations = [
-        [TAILSCALE_CLI, "funnel", "--https=443", "--yes", "off"],
         [
-            TAILSCALE_CLI, "funnel", "--bg", "--https=443", "--yes",
-            "http://127.0.0.1:8000",
+            TAILSCALE_CLI, "funnel", "--https=443",
+            "--set-path=/webhooks/qogita", "--yes", "off",
         ],
         [
             TAILSCALE_CLI, "funnel", "--bg", "--https=443",
@@ -433,30 +550,52 @@ def _perform_funnel_recovery(actions=None) -> list[dict]:
         outcome, executed = actions.run(args, timeout=15)
         results.append({
             "operation": "off" if args[-1] == "off" else "configure",
-            "path": "/webhooks/qogita" if "--set-path=/webhooks/qogita" in args else "/",
+            "path": QOGITA_PATH,
             "executed": executed,
             **_command_summary(outcome),
         })
     return results
 
 
+# Compatibility alias for callers/tests from the first hardening generation.
+_perform_funnel_recovery = _perform_qogita_funnel_recovery
+
+
 def _funnel_prerequisites() -> tuple[dict, dict | None]:
     funnel_cli_error = {}
     status_cli_error = {}
     config = funnel_config(diagnostic=funnel_cli_error)
+    status = tailscale_status(diagnostic=status_cli_error)
+    identity = tailnet_identity(status)
+    phase = configuration_phase(config)
     local = local_upstreams()
+    private_manager = (
+        private_manager_https_status()
+        if phase in {"TRANSITION", "FINAL"}
+        else {
+            "expected_ok": True,
+            "skipped": True,
+            "reason": "private_serve_not_present_in_current_phase",
+        }
+    )
     values = {
-        "tailscale_backend_running": tailscale_backend_running(
-            diagnostic=status_cli_error,
-        ),
+        "configuration_phase": phase,
+        "tailscale_backend_running": tailscale_backend_running(status=status),
+        **identity,
         "funnel_config_exact": funnel_config_is_exact(config),
         "tailscale_status_cli_error": status_cli_error or None,
         "funnel_status_cli_error": funnel_cli_error or None,
+        "private_manager": private_manager,
+        "private_manager_healthy": bool(private_manager.get("expected_ok")),
         **local,
     }
     values["all_healthy"] = all((
         values["tailscale_backend_running"],
+        values["magicdns_enabled"],
+        values["tailnet_ipv4_present"],
+        values["certificate_domain_present"],
         values["funnel_config_exact"],
+        values["private_manager_healthy"],
         values["backend_healthy"],
         values["receiver_healthy"],
     ))
@@ -464,28 +603,26 @@ def _funnel_prerequisites() -> tuple[dict, dict | None]:
 
 
 def _acceptance() -> dict:
-    local = local_upstreams()
-    public_openapi = public_https_status("/openapi.json", expected_status=200)
-    token = manager_api_token()
-    public_dashboard = public_https_status(
-        "/api/mobile/dashboard", expected_status=200, api_token=token,
-    ) if token else {"status": None, "transport_ok": False, "error": "token_unavailable"}
+    prerequisites, _ = _funnel_prerequisites()
+    phase = prerequisites.get("configuration_phase")
     public_webhook = public_https_status("/webhooks/qogita", expected_status=405)
     result = {
-        **local,
-        "public_openapi": public_openapi,
-        "public_dashboard": public_dashboard,
+        "prerequisites": prerequisites,
+        "configuration_phase": phase,
         "public_webhook": public_webhook,
-        "api_token_available": bool(token),
-        "funnel_config_exact": funnel_config_is_exact(funnel_config()),
     }
-    result["healthy"] = all((
-        result["backend_healthy"], result["receiver_healthy"],
-        public_openapi.get("expected_ok"),
-        public_dashboard.get("expected_ok"),
-        public_webhook.get("expected_ok"),
-        result["funnel_config_exact"],
-    ))
+    if phase in {"CURRENT", "TRANSITION"}:
+        result["public_manager"] = public_https_status(
+            "/openapi.json", expected_status=200,
+        )
+    result["healthy"] = bool(
+        prerequisites.get("all_healthy")
+        and public_webhook.get("expected_ok")
+        and (
+            phase == "FINAL"
+            or (result.get("public_manager") or {}).get("expected_ok")
+        )
+    )
     return result
 
 
@@ -514,7 +651,11 @@ def _installation_acceptance(result: dict, *, failure_threshold: int) -> dict:
     ))
     internal_healthy = all((
         prerequisites.get("tailscale_backend_running"),
+        prerequisites.get("magicdns_enabled"),
+        prerequisites.get("tailnet_ipv4_present"),
+        prerequisites.get("certificate_domain_present"),
         prerequisites.get("funnel_config_exact"),
+        prerequisites.get("private_manager_healthy"),
         prerequisites.get("backend_healthy"),
         prerequisites.get("receiver_healthy"),
         no_cli_error,
@@ -608,26 +749,52 @@ def recover(*, state_path=DEFAULT_STATE, snapshot_dir=DEFAULT_SNAPSHOT_DIR,
         return _finish(result, state, path, failure_threshold=failure_threshold)
 
     prerequisites, config = _funnel_prerequisites()
+    _apply_phase_progression(state, prerequisites)
     result["prerequisites"] = prerequisites
     if not prerequisites["all_healthy"]:
-        result["reason"] = "funnel_prerequisite_failed"
+        result["reason"] = (
+            "configuration_phase_regressed"
+            if prerequisites.get("configuration_phase_regression")
+            else "funnel_prerequisite_failed"
+        )
         state["consecutive_public_failures"] = 0
         result["consecutive_public_failures"] = 0
         return _finish(result, state, path, failure_threshold=failure_threshold)
 
-    public = public_https_status("/openapi.json", expected_status=200)
-    result["public_openapi"] = public
+    phase = prerequisites["configuration_phase"]
+    result["configuration_phase"] = phase
+    _remember_healthy_phase(state, phase)
+    public = public_https_status(QOGITA_PATH, expected_status=405)
+    result["public_webhook"] = public
     healthy_edges, total_edges = _public_edge_counts(public)
     result["public_healthy_edges"] = healthy_edges
     result["public_total_edges"] = total_edges
+    result["qogita_public_healthy_edges"] = healthy_edges
+    result["qogita_public_total_edges"] = total_edges
     if public.get("expected_ok"):
         state["consecutive_public_failures"] = 0
         state["incident_recovery_attempted"] = False
         state.pop("incident_started_at", None)
         state.pop("last_public_failure_at", None)
+        if phase in {"CURRENT", "TRANSITION"}:
+            public_manager = public_https_status(
+                "/openapi.json", expected_status=200,
+            )
+            result["public_manager"] = public_manager
+            manager_healthy, manager_total = _public_edge_counts(public_manager)
+            result["manager_public_healthy_edges"] = manager_healthy
+            result["manager_public_total_edges"] = manager_total
+            if not public_manager.get("expected_ok"):
+                result["status"] = "DEGRADED_PUBLIC"
+                result["reason"] = "transitional_public_manager_degraded"
+                result["consecutive_public_failures"] = 0
+                return _finish(
+                    result, state, path, failure_threshold=failure_threshold,
+                )
         result["status"] = "HEALTHY"
         result["reason"] = "all_checks_healthy"
         result["consecutive_public_failures"] = 0
+        _remember_healthy_phase(state, phase)
         return _finish(result, state, path, failure_threshold=failure_threshold)
 
     result["status"] = "DEGRADED_PUBLIC"
@@ -681,6 +848,9 @@ def recover(*, state_path=DEFAULT_STATE, snapshot_dir=DEFAULT_SNAPSHOT_DIR,
         state["last_funnel_recovery_succeeded"] = True
         result["status"] = "HEALTHY"
         result["reason"] = "funnel_recovery_succeeded"
+        _remember_healthy_phase(
+            state, (acceptance.get("configuration_phase") or phase),
+        )
     else:
         state["last_funnel_recovery_succeeded"] = False
         result["status"] = "RECOVERY_FAILED"
