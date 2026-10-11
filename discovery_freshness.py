@@ -43,6 +43,204 @@ def _verified_payload(payload: Any, version: Any, digest: Any) -> Any | None:
     return value
 
 
+def _fee_semantic_payload(value: dict[str, Any]) -> dict[str, Any]:
+    """Return only fields that can change the commercial Fee result.
+
+    Catalog, Pricing, BSR and seller metadata can legitimately change while a
+    cached Fee estimate is reused.  They must not decide the canonical Fee
+    winner.  ``fee_cache_reused`` is likewise provenance: it decides the rank
+    on equal timestamps, but is not part of the Fee value itself.
+    """
+    return {
+        key: value[key]
+        for key in sorted(value)
+        if (
+            key in {"fee_status", "fee_estimate", "fee_last_attempt_at", "fba_source"}
+            or key.startswith("fba_fee_")
+            or key.startswith("referral_")
+        )
+    }
+
+
+def verify_canonical_fee_rows(
+    source_rows: Iterable[dict[str, Any]],
+    materialized_rows: Iterable[dict[str, Any]],
+    *,
+    fee_keys: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Compare materialized Fee winners with a deterministic source replay.
+
+    The previous cache state is intentionally irrelevant.  For each key the
+    newest source timestamp wins; at an equal timestamp an original Fee row
+    beats every reused copy.  Equal-rank rows may differ in non-Fee Amazon
+    fields, but conflicting Fee projections remain a hard verification error.
+    """
+    requested = set(fee_keys) if fee_keys is not None else None
+    candidates: dict[str, list[dict[str, Any]]] = {}
+    for row in source_rows:
+        try:
+            value = json.loads(str(row.get("observation_json") or "{}"))
+        except (TypeError, ValueError):
+            continue
+        key = str(row.get("fee_cache_key") or fee_cache_key(
+            value.get("asin"), value.get("reference_price"),
+            value.get("currency") or "EUR",
+        ) or "")
+        if not key or (requested is not None and key not in requested):
+            continue
+        fee_status = str(row.get("fee_status") or value.get("fee_status") or "")
+        if not fee_status:
+            continue
+        observed_at = str(
+            row.get("fee_observed_at")
+            or value.get("fee_last_attempt_at")
+            or value.get("observed_at")
+            or row.get("updated_at")
+            or ""
+        )
+        semantic = _fee_semantic_payload(value)
+        _, semantic_sha256 = _canonical_payload(semantic)
+        candidates.setdefault(key, []).append({
+            "fee_cache_key": key,
+            "source_job_id": str(row.get("source_job_id") or row.get("job_id") or ""),
+            "observation_id": str(row.get("observation_id") or ""),
+            "fee_status": fee_status,
+            "fee_observed_at": observed_at,
+            "fee_cache_reused": value.get("fee_cache_reused") is True,
+            "semantic": semantic,
+            "semantic_sha256": semantic_sha256,
+        })
+
+    expected = {}
+    source_ambiguities = []
+    for key, rows in candidates.items():
+        newest = max(row["fee_observed_at"] for row in rows)
+        newest_rows = [row for row in rows if row["fee_observed_at"] == newest]
+        original_rows = [row for row in newest_rows if not row["fee_cache_reused"]]
+        winner_rows = original_rows or newest_rows
+        semantic_hashes = {row["semantic_sha256"] for row in winner_rows}
+        if len(semantic_hashes) != 1:
+            source_ambiguities.append({
+                "fee_cache_key": key,
+                "fee_observed_at": newest,
+                "candidate_count": len(winner_rows),
+                "semantic_sha256": sorted(semantic_hashes),
+            })
+            continue
+        # Stable selection is for diagnostics/provenance only.  Equivalence is
+        # based on the canonical Fee projection shared by this winner class.
+        winner = min(
+            winner_rows,
+            key=lambda row: (
+                row["source_job_id"], row["observation_id"], row["semantic_sha256"],
+            ),
+        )
+        expected[key] = winner
+
+    actual = {}
+    malformed_materialized = []
+    unverified_materialized = []
+    for row in materialized_rows:
+        key = str(row.get("fee_cache_key") or "")
+        if not key or (requested is not None and key not in requested):
+            continue
+        try:
+            value = json.loads(str(row.get("observation_json") or "{}"))
+        except (TypeError, ValueError):
+            malformed_materialized.append(key)
+            continue
+        materialized_valid = True
+        if "payload_schema_version" in row or "payload_sha256" in row:
+            materialized_valid = isinstance(_verified_payload(
+                row.get("observation_json"), row.get("payload_schema_version"),
+                row.get("payload_sha256"),
+            ), dict)
+            if not materialized_valid:
+                unverified_materialized.append(key)
+        semantic = _fee_semantic_payload(value)
+        _, semantic_sha256 = _canonical_payload(semantic)
+        actual[key] = {
+            "fee_cache_key": key,
+            "source_job_id": str(row.get("source_job_id") or ""),
+            "observation_id": str(row.get("observation_id") or ""),
+            "fee_status": str(row.get("fee_status") or value.get("fee_status") or ""),
+            "fee_observed_at": str(row.get("fee_observed_at") or ""),
+            "fee_cache_reused": value.get("fee_cache_reused") is True,
+            "semantic": semantic,
+            "semantic_sha256": semantic_sha256,
+            "materialized_valid": materialized_valid,
+        }
+
+    keys = sorted(requested if requested is not None else set(expected) | set(actual))
+    mismatches = []
+    expected_digest = hashlib.sha256()
+    actual_digest = hashlib.sha256()
+    equivalent_count = 0
+    for key in keys:
+        wanted = expected.get(key)
+        found = actual.get(key)
+        reason = None
+        if wanted is None:
+            reason = "missing_or_ambiguous_source"
+        elif found is None:
+            reason = "missing_materialized_winner"
+        elif not found["materialized_valid"]:
+            reason = "unverified_materialized_payload"
+        elif found["fee_observed_at"] != wanted["fee_observed_at"]:
+            reason = "fee_observed_at_mismatch"
+        elif not wanted["fee_cache_reused"] and found["fee_cache_reused"]:
+            reason = "reused_winner_when_original_exists"
+        elif found["fee_status"] != wanted["fee_status"]:
+            reason = "fee_status_mismatch"
+        elif found["semantic_sha256"] != wanted["semantic_sha256"]:
+            reason = "fee_semantics_mismatch"
+        else:
+            equivalent_count += 1
+        expected_value = None if wanted is None else [
+            key, wanted["fee_observed_at"], wanted["fee_cache_reused"],
+            wanted["fee_status"], wanted["semantic"],
+        ]
+        actual_value = None if found is None else [
+            key, found["fee_observed_at"], found["fee_cache_reused"],
+            found["fee_status"], found["semantic"],
+        ]
+        expected_digest.update(
+            json.dumps(expected_value, sort_keys=True, separators=(",", ":")).encode()
+        )
+        expected_digest.update(b"\n")
+        actual_digest.update(
+            json.dumps(actual_value, sort_keys=True, separators=(",", ":")).encode()
+        )
+        actual_digest.update(b"\n")
+        if reason:
+            mismatches.append({
+                "fee_cache_key": key,
+                "reason": reason,
+                "expected_source_job_id": wanted and wanted["source_job_id"],
+                "actual_source_job_id": found and found["source_job_id"],
+                "expected_observation_id": wanted and wanted["observation_id"],
+                "actual_observation_id": found and found["observation_id"],
+            })
+    return {
+        "equivalent": (
+            not mismatches and not source_ambiguities
+            and not malformed_materialized and not unverified_materialized
+        ),
+        "total": len(keys),
+        "equivalent_count": equivalent_count,
+        "mismatch_count": len(mismatches),
+        "source_ambiguity_count": len(source_ambiguities),
+        "malformed_materialized_count": len(malformed_materialized),
+        "unverified_materialized_count": len(unverified_materialized),
+        "expected_digest": expected_digest.hexdigest(),
+        "actual_digest": actual_digest.hexdigest(),
+        "mismatches": mismatches,
+        "source_ambiguities": source_ambiguities,
+        "malformed_materialized": malformed_materialized,
+        "unverified_materialized": unverified_materialized,
+    }
+
+
 class PlanAction(str, Enum):
     CACHE_REUSE = "CACHE_REUSE"
     REFRESH_CATALOG = "REFRESH_CATALOG"
@@ -560,6 +758,37 @@ class DiscoveryAmazonCache:
             progress("preparing_cache", total, total)
         return indexed
 
+    def verify_fee_materialization(
+        self, fee_keys: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Verify cache winners against completed immutable source history."""
+        self.initialize()
+        requested = sorted(set(fee_keys)) if fee_keys is not None else None
+        with self.store._connect() as connection:
+            source_rows = [
+                dict(row) for row in connection.execute(
+                    """SELECT observation.job_id AS source_job_id,
+                              observation.observation_id,
+                              observation.observation_json,
+                              observation.updated_at
+                       FROM discovery_observations observation
+                       JOIN discovery_incremental_jobs job
+                         ON job.job_id=observation.job_id
+                      WHERE job.status='completed'"""
+                )
+            ]
+            materialized_rows = [
+                dict(row) for row in connection.execute(
+                    """SELECT fee_cache_key,source_job_id,observation_id,
+                              fee_status,fee_observed_at,observation_json,
+                              payload_schema_version,payload_sha256
+                       FROM discovery_amazon_fee_cache"""
+                )
+            ]
+        return verify_canonical_fee_rows(
+            source_rows, materialized_rows, fee_keys=requested,
+        )
+
     def get(self, identifier: str) -> dict[str, Any] | None:
         self.initialize()
         with self.store._connect() as connection:
@@ -864,6 +1093,6 @@ class DiscoveryAmazonCache:
 __all__ = [
     "AmazonFreshnessPolicy", "DiscoveryAmazonCache", "PlanAction",
     "CACHE_PAYLOAD_SCHEMA_VERSION", "POLICY_VERSION", "fee_cache_key",
-    "plan_cached_product", "planning_counts",
+    "plan_cached_product", "planning_counts", "verify_canonical_fee_rows",
     "reusable_fee",
 ]

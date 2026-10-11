@@ -18,6 +18,7 @@ from discovery_freshness import (
     plan_cached_product,
     planning_counts,
     reusable_fee,
+    verify_canonical_fee_rows,
 )
 from discovery_incremental import DiscoveryIncrementalStore, prepare_incremental_job
 from discovery_incremental import LightweightCheckpointStore
@@ -300,6 +301,130 @@ class PlannerIntegrationTests(unittest.TestCase):
         self.assertEqual(cache_events, [
             ("preparing_cache", 0, 1), ("preparing_cache", 1, 1),
         ])
+
+
+class CanonicalFeeVerificationTests(unittest.TestCase):
+    KEY = "B000VERIFY|EUR|20.00"
+    AT = "2026-08-01T10:00:00Z"
+
+    @classmethod
+    def row(
+        cls, job_id, *, reused=False, fee_estimate=5, observed_at=None,
+        bsr=100, source=True,
+    ):
+        value = {
+            "observation_id": f"observation-{job_id}",
+            "asin": "B000VERIFY", "reference_price": 20, "currency": "EUR",
+            "fee_status": "valid", "fee_last_attempt_at": observed_at or cls.AT,
+            "fee_estimate": {"total_fees": fee_estimate},
+            "fba_fee_net": fee_estimate, "bsr_beauty": bsr,
+            "fba_sellers": bsr % 5, "total_sellers": bsr % 7,
+        }
+        if reused:
+            value["fee_cache_reused"] = True
+        row = {
+            "fee_cache_key": cls.KEY,
+            "source_job_id": job_id,
+            "observation_id": value["observation_id"],
+            "fee_status": "valid",
+            "fee_observed_at": observed_at or cls.AT,
+            "observation_json": json.dumps(value),
+            "updated_at": observed_at or cls.AT,
+        }
+        if source:
+            row["job_id"] = job_id
+        return row
+
+    def test_legacy_reused_pre_state_does_not_block_canonical_original(self):
+        reused = self.row("legacy", reused=True)
+        original = self.row("bc4", bsr=999)
+        result = verify_canonical_fee_rows(
+            [reused, original], [original], fee_keys=[self.KEY],
+        )
+        self.assertTrue(result["equivalent"])
+        self.assertEqual(result["equivalent_count"], 1)
+
+    def test_original_beats_reused_in_either_source_order(self):
+        original = self.row("original")
+        reused = self.row("reused", reused=True, bsr=999)
+        first = verify_canonical_fee_rows([original, reused], [original])
+        second = verify_canonical_fee_rows([reused, original], [original])
+        self.assertTrue(first["equivalent"])
+        self.assertEqual(first["expected_digest"], second["expected_digest"])
+
+    def test_reused_winner_fails_when_original_exists(self):
+        original = self.row("original")
+        reused = self.row("reused", reused=True)
+        result = verify_canonical_fee_rows([original, reused], [reused])
+        self.assertFalse(result["equivalent"])
+        self.assertEqual(
+            result["mismatches"][0]["reason"],
+            "reused_winner_when_original_exists",
+        )
+
+    def test_real_fee_difference_at_equal_rank_is_ambiguous(self):
+        first = self.row("original-a", fee_estimate=5)
+        second = self.row("original-b", fee_estimate=6)
+        result = verify_canonical_fee_rows([first, second], [first])
+        self.assertFalse(result["equivalent"])
+        self.assertEqual(result["source_ambiguity_count"], 1)
+
+    def test_materialized_fee_estimate_difference_fails(self):
+        source = self.row("source", fee_estimate=5)
+        actual = self.row("source", fee_estimate=6)
+        result = verify_canonical_fee_rows([source], [actual])
+        self.assertFalse(result["equivalent"])
+        self.assertEqual(
+            result["mismatches"][0]["reason"], "fee_semantics_mismatch",
+        )
+
+    def test_incoherent_fee_observed_at_fails(self):
+        source = self.row("source")
+        actual = self.row("source", observed_at="2026-08-02T10:00:00Z")
+        result = verify_canonical_fee_rows([source], [actual])
+        self.assertFalse(result["equivalent"])
+        self.assertEqual(
+            result["mismatches"][0]["reason"], "fee_observed_at_mismatch",
+        )
+
+    def test_non_fee_differences_do_not_block_reused_equivalence(self):
+        first = self.row("reused-a", reused=True, bsr=100)
+        second = self.row("reused-b", reused=True, bsr=999)
+        result = verify_canonical_fee_rows([first, second], [second])
+        self.assertTrue(result["equivalent"])
+        self.assertEqual(result["source_ambiguity_count"], 0)
+
+    def test_bc4_original_reproduction_is_canonical(self):
+        original = self.row("bc4", bsr=250)
+        reused_jobs = [
+            self.row(job, reused=True, bsr=bsr)
+            for job, bsr in (("6b4", 300), ("090", 400), ("1584", 500), ("d79", 600))
+        ]
+        result = verify_canonical_fee_rows(
+            reused_jobs + [original], [original], fee_keys=[self.KEY],
+        )
+        self.assertTrue(result["equivalent"])
+
+    def test_a809_reused_copy_preserves_recovered_original(self):
+        original = self.row("b4", bsr=100)
+        reused = self.row("a809", reused=True, bsr=900)
+        forward = verify_canonical_fee_rows([original, reused], [original])
+        reverse = verify_canonical_fee_rows([reused, original], [original])
+        self.assertTrue(forward["equivalent"])
+        self.assertTrue(reverse["equivalent"])
+        self.assertEqual(forward["expected_digest"], reverse["expected_digest"])
+
+    def test_unverified_materialized_payload_remains_blocking(self):
+        source = self.row("source")
+        actual = self.row("source")
+        actual["payload_schema_version"] = CACHE_PAYLOAD_SCHEMA_VERSION
+        actual["payload_sha256"] = "not-the-payload-hash"
+        result = verify_canonical_fee_rows([source], [actual])
+        self.assertFalse(result["equivalent"])
+        self.assertEqual(
+            result["mismatches"][0]["reason"],
+            "unverified_materialized_payload",
+        )
 
 
 class CacheIndexRegressionTests(unittest.TestCase):
